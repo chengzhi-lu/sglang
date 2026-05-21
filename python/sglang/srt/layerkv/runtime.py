@@ -71,6 +71,13 @@ class LayerKVStats:
     policy_expert_fraction: float = 0.0
     full_policy_semantics_supported: bool = True
     policy_semantics_reason: str = ""
+    planner_version: str = ""
+    planner_used_hotness: bool = False
+    planner_fallback_reason: str = ""
+    planner_estimated_kvc_cost: float = 0.0
+    planner_estimated_expert_cost: float = 0.0
+    planner_selected_kvc_reclaim_mb: float = 0.0
+    planner_selected_expert_reclaim_mb: float = 0.0
     planned_kvc_reclaim_mb: float = 0.0
     physical_kvc_reclaim_mb: float = 0.0
     planned_expert_reclaim_mb: float = 0.0
@@ -385,6 +392,8 @@ class LayerKVRuntime:
         self._residency: Dict[Tuple[int, int], _LayerKVResidencyEntry] = {}
         self._expert_layers: Dict[int, _LayerKVExpertLayerState] = {}
         self._expert_modules: List[Tuple[int, Any]] = []
+        self._expert_hotness_prefill: Dict[int, Dict[int, int]] = {}
+        self._expert_hotness_decode: Dict[int, Dict[int, int]] = {}
         self._expert_plan_applied: bool = False
         self._pending_expert_copy_events: List[Tuple[Any, Any]] = []
         self._current_forward_mode: str = ""
@@ -536,6 +545,32 @@ class LayerKVRuntime:
                 self.unsupported_reason = self.stats.expert_guard_reason
             return
         self.physical_expert_supported = True
+        for layer_id, module in supported:
+            self._install_expert_hotness_probe(module, layer_id)
+
+    def _install_expert_hotness_probe(self, module: Any, layer_id: int) -> None:
+        if getattr(module, "_layerkv_expert_wrapped", False):
+            return
+        if getattr(module, "_layerkv_hotness_wrapped", False):
+            return
+        full_num_experts = int(module.w13_weight.data.shape[0])
+        orig_run_moe_core = module.run_moe_core
+
+        @functools.wraps(orig_run_moe_core)
+        def wrapped_run_moe_core(dispatch_output: Any, *args, **kwargs):
+            topk_output = getattr(dispatch_output, "topk_output", None)
+            topk_ids = getattr(topk_output, "topk_ids", None)
+            if topk_ids is not None:
+                self._record_expert_hotness_for_layer(
+                    layer_id=layer_id,
+                    full_num_experts=full_num_experts,
+                    topk_ids=topk_ids,
+                )
+            return orig_run_moe_core(dispatch_output, *args, **kwargs)
+
+        module._layerkv_hotness_orig_run_moe_core = orig_run_moe_core
+        module._layerkv_hotness_wrapped = True
+        module.run_moe_core = wrapped_run_moe_core
 
     def _is_supported_fused_moe(self, module: Any) -> bool:
         return (
@@ -598,20 +633,144 @@ class LayerKVRuntime:
         if policy == "ratio-25-75":
             return 0.25, 0.75, self.physical_expert_supported, self._expert_support_reason()
         if policy in ("layer-aware-joint", "layer-aware-joint-dp"):
-            avg_prefix = self._avg_prefix_len(forward_batch)
-            if avg_prefix <= 1024:
-                kvc_fraction = 0.75
-            elif avg_prefix <= 4096:
-                kvc_fraction = 0.50
-            else:
-                kvc_fraction = 0.25
-            return (
-                kvc_fraction,
-                1.0 - kvc_fraction,
-                self.physical_expert_supported,
-                self._expert_support_reason(),
-            )
+            return self._joint_policy_fractions(forward_batch)
         return 0.0, 0.0, False, f"unknown LayerKV policy: {policy}"
+
+    def _joint_policy_fractions(self, forward_batch: Any) -> Tuple[float, float, bool, str]:
+        self.stats.planner_apply_count += 1
+        target_mb = max(0.0, self.config.target_reclaim_mb)
+        self.stats.planner_version = "hotness-aware-v1"
+        if not self.physical_expert_supported:
+            reason = self._expert_support_reason()
+            self._set_joint_planner_choice(
+                kvc_fraction=1.0,
+                expert_fraction=0.0,
+                used_hotness=False,
+                fallback_reason=reason,
+                kvc_cost=0.0,
+                expert_cost=1.0e30,
+            )
+            return 1.0, 0.0, False, reason
+
+        has_hotness = self._has_expert_hotness()
+        if not has_hotness:
+            kvc_fraction = self._context_heuristic_kvc_fraction(forward_batch)
+            expert_fraction = 1.0 - kvc_fraction
+            self._set_joint_planner_choice(
+                kvc_fraction=kvc_fraction,
+                expert_fraction=expert_fraction,
+                used_hotness=False,
+                fallback_reason="no_hotness",
+                kvc_cost=self._estimate_kvc_reclaim_cost(target_mb * kvc_fraction, forward_batch),
+                expert_cost=0.0,
+            )
+            return kvc_fraction, expert_fraction, True, "planner_fallback=no_hotness"
+
+        best: Optional[Tuple[float, float, float, float, float]] = None
+        for kvc_fraction in (0.0, 0.25, 0.50, 0.75, 1.0):
+            expert_fraction = 1.0 - kvc_fraction
+            kvc_mb = target_mb * kvc_fraction
+            expert_mb = target_mb * expert_fraction
+            kvc_cost = self._estimate_kvc_reclaim_cost(kvc_mb, forward_batch)
+            expert_cost = self._estimate_expert_reclaim_cost(expert_mb)
+            total_cost = kvc_cost + expert_cost
+            candidate = (total_cost, kvc_fraction, expert_fraction, kvc_cost, expert_cost)
+            if best is None or candidate < best:
+                best = candidate
+
+        assert best is not None
+        _, kvc_fraction, expert_fraction, kvc_cost, expert_cost = best
+        self._set_joint_planner_choice(
+            kvc_fraction=kvc_fraction,
+            expert_fraction=expert_fraction,
+            used_hotness=True,
+            fallback_reason="",
+            kvc_cost=kvc_cost,
+            expert_cost=expert_cost,
+        )
+        return kvc_fraction, expert_fraction, True, ""
+
+    def _context_heuristic_kvc_fraction(self, forward_batch: Any) -> float:
+        avg_prefix = self._avg_prefix_len(forward_batch)
+        if avg_prefix <= 1024:
+            return 0.75
+        if avg_prefix <= 4096:
+            return 0.50
+        return 0.25
+
+    def _set_joint_planner_choice(
+        self,
+        *,
+        kvc_fraction: float,
+        expert_fraction: float,
+        used_hotness: bool,
+        fallback_reason: str,
+        kvc_cost: float,
+        expert_cost: float,
+    ) -> None:
+        target_mb = max(0.0, self.config.target_reclaim_mb)
+        self.stats.planner_used_hotness = used_hotness
+        self.stats.planner_fallback_reason = fallback_reason
+        self.stats.planner_estimated_kvc_cost = float(kvc_cost)
+        self.stats.planner_estimated_expert_cost = float(expert_cost)
+        self.stats.planner_selected_kvc_reclaim_mb = target_mb * kvc_fraction
+        self.stats.planner_selected_expert_reclaim_mb = target_mb * expert_fraction
+
+    def _has_expert_hotness(self) -> bool:
+        for hotness in self._expert_hotness_decode.values():
+            if hotness:
+                return True
+        for hotness in self._expert_hotness_prefill.values():
+            if hotness:
+                return True
+        for state in self._expert_layers.values():
+            if state.hotness_decode or state.hotness_prefill:
+                return True
+        return False
+
+    def _estimate_kvc_reclaim_cost(self, reclaim_mb: float, forward_batch: Any) -> float:
+        if reclaim_mb <= 0.0:
+            return 0.0
+        avg_prefix = self._avg_prefix_len(forward_batch)
+        cost_per_mb = max(0.1, avg_prefix / 1024.0)
+        return reclaim_mb * cost_per_mb
+
+    def _estimate_expert_reclaim_cost(self, reclaim_mb: float) -> float:
+        if reclaim_mb <= 0.0:
+            return 0.0
+        candidates: List[Tuple[float, int]] = []
+        if self._expert_layers:
+            layer_items = [
+                (state.layer_id, state.full_num_experts, state.expert_bytes)
+                for state in self._expert_layers.values()
+            ]
+        else:
+            layer_items = [
+                (
+                    int(layer_id),
+                    int(module.w13_weight.data.shape[0]),
+                    self._expert_bytes(module),
+                )
+                for layer_id, module in self._expert_modules
+            ]
+        for layer_id, full_num_experts, expert_bytes in layer_items:
+            hotness = self._expert_hotness_decode.get(layer_id) or self._expert_hotness_prefill.get(layer_id, {})
+            total_calls = max(1, int(sum(hotness.values())))
+            for expert_id in range(full_num_experts):
+                p = float(hotness.get(expert_id, 0)) / float(total_calls)
+                candidates.append((p, expert_bytes))
+        candidates.sort(key=lambda item: item[0])
+        target_bytes = int(reclaim_mb * 1024 * 1024)
+        reclaimed = 0
+        cost = 0.0
+        for p, expert_bytes in candidates:
+            if reclaimed >= target_bytes:
+                break
+            reclaimed += expert_bytes
+            cost += p * (expert_bytes / float(1024 * 1024))
+        if reclaimed < target_bytes:
+            return 1.0e30
+        return cost
 
     def _expert_support_reason(self) -> str:
         if self.physical_expert_supported:
@@ -629,9 +788,7 @@ class LayerKVRuntime:
         self.stats.policy_expert_fraction = expert_fraction
         self.stats.full_policy_semantics_supported = full_supported
         self.stats.policy_semantics_reason = reason
-        self.stats.planned_kvc_reclaim_mb = max(
-            self.stats.planned_kvc_reclaim_mb, effective
-        )
+        self.stats.planned_kvc_reclaim_mb = effective
         return effective
 
     def _effective_expert_reclaim_mb(self, forward_batch: Any) -> float:
@@ -644,9 +801,7 @@ class LayerKVRuntime:
         self.stats.policy_expert_fraction = expert_fraction
         self.stats.full_policy_semantics_supported = full_supported
         self.stats.policy_semantics_reason = reason
-        self.stats.planned_expert_reclaim_mb = max(
-            self.stats.planned_expert_reclaim_mb, effective
-        )
+        self.stats.planned_expert_reclaim_mb = effective
         return effective
 
     def _apply_expert_plan_once(self, forward_batch: Any) -> None:
@@ -784,7 +939,9 @@ class LayerKVRuntime:
             layer_id=layer_id,
             module=module,
             orig_forward=module.forward,
-            orig_run_moe_core=module.run_moe_core,
+            orig_run_moe_core=getattr(
+                module, "_layerkv_hotness_orig_run_moe_core", module.run_moe_core
+            ),
             full_num_experts=full_num_experts,
             slot_capacity=slot_capacity,
             expert_bytes=expert_bytes,
@@ -795,8 +952,8 @@ class LayerKVRuntime:
             logical_to_slot=logical_to_slot,
             slot_to_logical=slot_to_logical,
             lru=lru,
-            hotness_prefill={},
-            hotness_decode={},
+            hotness_prefill=self._expert_hotness_prefill.setdefault(layer_id, {}),
+            hotness_decode=self._expert_hotness_decode.setdefault(layer_id, {}),
         )
 
         @functools.wraps(module.run_moe_core)
@@ -913,16 +1070,25 @@ class LayerKVRuntime:
     def _record_expert_hotness(
         self, state: _LayerKVExpertLayerState, topk_ids: torch.Tensor
     ) -> None:
+        self._record_expert_hotness_for_layer(
+            layer_id=state.layer_id,
+            full_num_experts=state.full_num_experts,
+            topk_ids=topk_ids,
+        )
+
+    def _record_expert_hotness_for_layer(
+        self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
+    ) -> None:
         if topk_ids.numel() == 0:
             return
         ids = topk_ids.detach()
-        ids = ids[(ids >= 0) & (ids < state.full_num_experts)]
+        ids = ids[(ids >= 0) & (ids < full_num_experts)]
         if ids.numel() == 0:
             return
         target = (
-            state.hotness_decode
+            self._expert_hotness_decode.setdefault(layer_id, {})
             if self._current_forward_mode == "decode"
-            else state.hotness_prefill
+            else self._expert_hotness_prefill.setdefault(layer_id, {})
         )
         values, counts = torch.unique(ids.cpu(), return_counts=True)
         total = 0
