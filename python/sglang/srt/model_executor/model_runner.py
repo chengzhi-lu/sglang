@@ -3154,6 +3154,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        layerkv_runtime = getattr(self, "layerkv_runtime", None)
+        if layerkv_runtime is not None:
+            layerkv_runtime.on_forward_begin(mode="decode", forward_batch=forward_batch)
+
         # Set extra arguments
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
@@ -3176,9 +3180,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device_timer
             else contextlib.nullcontext()
         )
-        layerkv_runtime = getattr(self, "layerkv_runtime", None)
-        if layerkv_runtime is not None:
-            layerkv_runtime.on_forward_begin(mode="decode", forward_batch=forward_batch)
         with ctx:
             try:
                 return self.model.forward(
