@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Validate LayerKV expert-offload hooks without requiring a large MoE model.
+
+This exercises the SGLang-facing expert path:
+
+* policy-to-KV/expert split accounting
+* standard FusedMoE discovery
+* fixed-capacity expert slot rebinding
+* run_moe_core top-k rewrite
+* CPU-backed expert materialization
+* unsupported expert guard reporting
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from argparse import Namespace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, List
+
+import torch
+
+from sglang.srt.layerkv.runtime import LayerKVConfig, LayerKVRuntime
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+
+POLICIES = [
+    "expert-first",
+    "kv-first",
+    "ratio-25-75",
+    "ratio-50-50",
+    "ratio-75-25",
+    "layer-aware-joint-dp",
+]
+
+CSV_FIELDS = [
+    "policy",
+    "target_reclaim_mb",
+    "valid",
+    "validation_reason",
+    "policy_kvc_fraction",
+    "policy_expert_fraction",
+    "planned_expert_reclaim_mb",
+    "physical_expert_reclaim_mb",
+    "expert_host_backing_mb",
+    "expert_resident_count",
+    "expert_offloaded_count",
+    "expert_slot_capacity_total",
+    "expert_slot_rebind_count",
+    "expert_materialize_count",
+    "expert_topk_rewrite_count",
+    "expert_core_hook_count",
+    "expert_materialize_mb_total",
+    "expert_guard_pass",
+    "expert_guard_reason",
+    "layerkv_physical_expert_supported",
+    "layerkv_expert_layer_count",
+    "full_policy_semantics_supported",
+    "policy_semantics_reason",
+    "comparable",
+    "comparability_reason",
+]
+
+
+class UnquantizedFusedMoEMethod:
+    pass
+
+
+class UnsupportedQuantMethod:
+    pass
+
+
+class FakeFusedMoE(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        layer_id: int,
+        num_experts: int = 8,
+        top_k: int = 2,
+        quant_method: Any = None,
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.top_k = top_k
+        self.moe_ep_size = 1
+        self.num_experts = num_experts
+        self.num_local_experts = num_experts
+        self.quant_method = quant_method or UnquantizedFusedMoEMethod()
+        self.moe_runner_config = SimpleNamespace(
+            top_k=top_k,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+        )
+        self.dispatcher = SimpleNamespace(
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            num_local_routed_experts=num_experts,
+        )
+        base = torch.arange(num_experts * 4, dtype=torch.float32).view(
+            num_experts, 2, 2
+        )
+        self.w13_weight = torch.nn.Parameter(base.clone(), requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(base.clone() + 1000, requires_grad=False)
+        self.last_topk_ids = None
+
+    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
+        dispatch_output = StandardDispatchOutput(hidden_states, None, topk_output)
+        return self.run_moe_core(dispatch_output)
+
+    def run_moe_core(self, dispatch_output: StandardDispatchOutput):
+        self.last_topk_ids = dispatch_output.topk_output.topk_ids.detach().clone()
+        return dispatch_output.hidden_states
+
+
+class FakeModel(torch.nn.Module):
+    def __init__(self, layers: Iterable[torch.nn.Module]):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+
+
+class FakeRunner:
+    device = "cpu"
+    token_to_kv_pool = None
+    token_to_kv_pool_allocator = None
+    req_to_token_pool = None
+
+    def __init__(self, layers: Iterable[torch.nn.Module]):
+        self.model = FakeModel(layers)
+
+
+def _runtime(policy: str, target_reclaim_mb: float) -> LayerKVRuntime:
+    args = Namespace(
+        enable_layerkv=True,
+        layerkv_mode="kvc-expert",
+        layerkv_policy=policy,
+        layerkv_target_reclaim_mb=target_reclaim_mb,
+        layerkv_kvc_block_tokens=16,
+        layerkv_kvc_scheduler="async-deadline",
+        layerkv_debug_stats=True,
+        layerkv_disallow_destructive_fallback=True,
+    )
+    return LayerKVRuntime(LayerKVConfig.from_server_args(args))
+
+
+def _exercise_policy(policy: str, target_reclaim_mb: float) -> Dict[str, Any]:
+    runner = FakeRunner(
+        [
+            FakeFusedMoE(layer_id=0),
+            FakeFusedMoE(layer_id=1),
+        ]
+    )
+    rt = _runtime(policy, target_reclaim_mb)
+    rt.install_on_runner(runner)
+    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+
+    topk = StandardTopKOutput(
+        topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[6, 7], [6, 7]], dtype=torch.int32),
+        router_logits=torch.zeros((2, 8), dtype=torch.float32),
+    )
+    for layer in runner.model.layers:
+        layer(torch.zeros((2, 2), dtype=torch.float32), topk)
+
+    summary = rt.summary()
+    reasons: List[str] = []
+    expert_fraction = float(summary["policy_expert_fraction"])
+    if expert_fraction > 0.0:
+        if not bool(summary["layerkv_physical_expert_supported"]):
+            reasons.append("physical_expert_unsupported")
+        if int(summary["layerkv_expert_layer_count"]) != 2:
+            reasons.append("missing_expert_layers")
+        if int(summary["expert_slot_rebind_count"]) != 2:
+            reasons.append("slot_rebind_count_mismatch")
+        if int(summary["expert_materialize_count"]) <= 0:
+            reasons.append("no_expert_materialize")
+        if int(summary["expert_topk_rewrite_count"]) != 2:
+            reasons.append("topk_rewrite_count_mismatch")
+        if int(summary["expert_core_hook_count"]) != 2:
+            reasons.append("core_hook_count_mismatch")
+        if float(summary["physical_expert_reclaim_mb"]) <= 0.0:
+            reasons.append("no_physical_expert_reclaim")
+        for layer in runner.model.layers:
+            if layer.last_topk_ids is None:
+                reasons.append(f"layer{layer.layer_id}_not_called")
+                continue
+            if int(layer.last_topk_ids.max().item()) >= int(layer.w13_weight.shape[0]):
+                reasons.append(f"layer{layer.layer_id}_topk_not_rewritten")
+    else:
+        if int(summary["expert_slot_rebind_count"]) != 0:
+            reasons.append("expert_first_should_not_rebind_slots")
+        if int(summary["expert_materialize_count"]) != 0:
+            reasons.append("expert_first_should_not_materialize")
+
+    if not bool(summary["expert_guard_pass"]):
+        reasons.append(f"expert_guard_failed:{summary['expert_guard_reason']}")
+
+    row = {field: summary.get(field, "") for field in CSV_FIELDS}
+    row.update(
+        {
+            "policy": policy,
+            "target_reclaim_mb": target_reclaim_mb,
+            "valid": not reasons,
+            "validation_reason": ";".join(reasons),
+        }
+    )
+    return row
+
+
+def _exercise_unsupported(target_reclaim_mb: float) -> Dict[str, Any]:
+    runner = FakeRunner(
+        [FakeFusedMoE(layer_id=0, quant_method=UnsupportedQuantMethod())]
+    )
+    rt = _runtime("kv-first", target_reclaim_mb)
+    rt.install_on_runner(runner)
+    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    summary = rt.summary()
+    reasons = []
+    if bool(summary["layerkv_physical_expert_supported"]):
+        reasons.append("unsupported_quant_marked_supported")
+    if bool(summary["full_policy_semantics_supported"]):
+        reasons.append("unsupported_quant_marked_full_semantics")
+    if "unsupported quant_method" not in str(summary["expert_guard_reason"]):
+        reasons.append("missing_unsupported_quant_reason")
+    row = {field: summary.get(field, "") for field in CSV_FIELDS}
+    row.update(
+        {
+            "policy": "kv-first-unsupported-quant",
+            "target_reclaim_mb": target_reclaim_mb,
+            "valid": not reasons,
+            "validation_reason": ";".join(reasons),
+        }
+    )
+    return row
+
+
+def write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default="outputs/layerkv")
+    parser.add_argument("--target-reclaim-mb", type=float, default=0.0004)
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = [
+        _exercise_policy(policy, args.target_reclaim_mb)
+        for policy in POLICIES
+    ]
+    rows.append(_exercise_unsupported(args.target_reclaim_mb))
+
+    csv_path = output_dir / "expert_validation.csv"
+    summary_path = output_dir / "expert_validation_summary.json"
+    write_csv(csv_path, rows)
+
+    invalid = [row for row in rows if str(row.get("valid")) != "True"]
+    summary = {
+        "csv": str(csv_path),
+        "total_runs": len(rows),
+        "valid_runs": len(rows) - len(invalid),
+        "invalid_runs": len(invalid),
+        "all_valid": not invalid,
+        "invalid": [
+            {
+                "policy": row.get("policy"),
+                "reason": row.get("validation_reason"),
+            }
+            for row in invalid
+        ],
+    }
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0 if not invalid else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
