@@ -6370,7 +6370,7 @@ class ServerArgs:
             type=str,
             choices=["off", "kvc-only", "kvc-expert"],
             default=ServerArgs.layerkv_mode,
-            help="LayerKV runtime mode. v1 supports runnable KVC accounting hooks and expert metadata hooks.",
+            help="LayerKV runtime mode. v1 supports physical KVC offload/reload and standard FusedMoE expert offload.",
         )
         parser.add_argument(
             "--layerkv-policy",

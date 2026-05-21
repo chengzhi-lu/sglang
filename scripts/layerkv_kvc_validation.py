@@ -40,12 +40,15 @@ POLICIES = [
 ]
 
 EXPECTED_FRACTIONS = {
+    # In kvc-only mode all enabled policies must exercise the physical KVC
+    # lifecycle.  Mixed KVC/expert split semantics are validated by
+    # layerkv_policy_eval.py, where expert offload is available.
     "expert-first": 1.0,
-    "kv-first": 0.0,
-    "ratio-25-75": 0.25,
-    "ratio-50-50": 0.50,
-    "ratio-75-25": 0.75,
-    "layer-aware-joint-dp": 0.75,
+    "kv-first": 1.0,
+    "ratio-25-75": 1.0,
+    "ratio-50-50": 1.0,
+    "ratio-75-25": 1.0,
+    "layer-aware-joint-dp": 1.0,
 }
 
 CSV_FIELDS = [
@@ -68,6 +71,14 @@ CSV_FIELDS = [
     "policy_kvc_fraction",
     "policy_expert_fraction",
     "full_policy_semantics_supported",
+    "policy_semantics_reason",
+    "planner_version",
+    "planner_used_hotness",
+    "planner_fallback_reason",
+    "planner_estimated_kvc_cost",
+    "planner_estimated_expert_cost",
+    "planner_selected_kvc_reclaim_mb",
+    "planner_selected_expert_reclaim_mb",
     "planned_kvc_reclaim_mb",
     "physical_kvc_reclaim_mb",
     "planned_expert_reclaim_mb",

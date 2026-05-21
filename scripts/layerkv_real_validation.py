@@ -3,7 +3,9 @@
 
 This script is intentionally small and conservative.  It validates that the
 real Qwen3 MoE path can run with LayerKV enabled and that KVC-only runs exercise
-the full evict -> reload -> req_to_token rewrite lifecycle.
+the full evict -> reload -> req_to_token rewrite lifecycle.  Mixed KVC+expert
+scenarios validate that production policy flags install physical expert slots
+and produce comparable physical reclaim rows.
 """
 
 from __future__ import annotations
@@ -106,6 +108,27 @@ def scenario_command(
             target_reclaim_mb=args.expert_target_reclaim_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
+    if scenario == "kvc_expert_expert_first":
+        return cmd + layerkv_flags(
+            mode="kvc-expert",
+            policy="expert-first",
+            target_reclaim_mb=args.expert_target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
+    if scenario == "kvc_expert_ratio_50_50":
+        return cmd + layerkv_flags(
+            mode="kvc-expert",
+            policy="ratio-50-50",
+            target_reclaim_mb=args.expert_target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
+    if scenario == "kvc_expert_joint_dp":
+        return cmd + layerkv_flags(
+            mode="kvc-expert",
+            policy="layer-aware-joint-dp",
+            target_reclaim_mb=args.expert_target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
     raise ValueError(f"unknown scenario: {scenario}")
 
 
@@ -135,17 +158,25 @@ def validate_scenario(
             reasons.append("no_kvc_reload")
         if int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0) <= 0:
             reasons.append("no_req_to_token_rewrite")
-    elif scenario == "kvc_expert_kv_first":
+    elif scenario.startswith("kvc_expert_"):
         if not bool(stats.get("layerkv_physical_expert_supported", False)):
             reasons.append("physical_expert_unsupported")
         if not bool(stats.get("expert_guard_pass", False)):
             reasons.append(f"expert_guard_failed:{stats.get('expert_guard_reason')}")
-        if int(stats.get("expert_slot_rebind_count", 0) or 0) <= 0:
+        planned_expert = float(stats.get("planned_expert_reclaim_mb", 0.0) or 0.0)
+        planned_kvc = float(stats.get("planned_kvc_reclaim_mb", 0.0) or 0.0)
+        if planned_expert > 0 and int(stats.get("expert_slot_rebind_count", 0) or 0) <= 0:
             reasons.append("no_expert_slot_rebind")
-        planned = float(stats.get("planned_expert_reclaim_mb", 0.0) or 0.0)
         physical = float(stats.get("physical_expert_reclaim_mb", 0.0) or 0.0)
-        if planned > 0 and physical + 1e-3 < planned:
+        if planned_expert > 0 and physical + 1e-3 < planned_expert:
             reasons.append("insufficient_expert_reclaim")
+        if planned_kvc > 0:
+            if not bool(stats.get("layerkv_physical_kvc_supported", False)):
+                reasons.append("physical_kvc_unsupported")
+            if int(stats.get("kvc_evict_count_total", 0) or 0) <= 0:
+                reasons.append("no_kvc_evict")
+            if int(stats.get("kvc_reload_count_total", 0) or 0) <= 0:
+                reasons.append("no_kvc_reload")
         if not bool(stats.get("comparable", False)):
             reasons.append(f"not_comparable:{stats.get('comparability_reason')}")
     return not reasons, ";".join(reasons)
@@ -205,8 +236,22 @@ def main() -> int:
     parser.add_argument(
         "--scenarios",
         nargs="+",
-        default=["baseline", "kvc_only_reload", "kvc_expert_kv_first"],
-        choices=["baseline", "kvc_only_reload", "kvc_expert_kv_first"],
+        default=[
+            "baseline",
+            "kvc_only_reload",
+            "kvc_expert_kv_first",
+            "kvc_expert_expert_first",
+            "kvc_expert_ratio_50_50",
+            "kvc_expert_joint_dp",
+        ],
+        choices=[
+            "baseline",
+            "kvc_only_reload",
+            "kvc_expert_kv_first",
+            "kvc_expert_expert_first",
+            "kvc_expert_ratio_50_50",
+            "kvc_expert_joint_dp",
+        ],
     )
     args = parser.parse_args()
 
