@@ -683,6 +683,7 @@ class ServerArgs:
     ] = "none"
     layerkv_target_reclaim_mb: float = 0.0
     layerkv_kvc_block_tokens: int = 16
+    layerkv_kvc_scheduler: Literal["sync", "async-deadline"] = "async-deadline"
     layerkv_debug_stats: bool = False
     layerkv_disallow_destructive_fallback: bool = True
 
@@ -3514,6 +3515,10 @@ class ServerArgs:
 
         if self.layerkv_kvc_block_tokens <= 0:
             raise ValueError("--layerkv-kvc-block-tokens must be positive")
+        if self.layerkv_kvc_scheduler not in ("sync", "async-deadline"):
+            raise ValueError(
+                "--layerkv-kvc-scheduler must be one of: sync, async-deadline"
+            )
 
         # v1 recovery is scheduled outside graph capture.
         if not self.disable_cuda_graph:
@@ -6392,6 +6397,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.layerkv_kvc_block_tokens,
             help="Logical KV block size used by LayerKV residency metadata.",
+        )
+        parser.add_argument(
+            "--layerkv-kvc-scheduler",
+            type=str,
+            choices=["sync", "async-deadline"],
+            default=ServerArgs.layerkv_kvc_scheduler,
+            help="KVC recovery scheduler. async-deadline launches reloads on a copy stream and waits at layer use points.",
         )
         parser.add_argument(
             "--layerkv-debug-stats",

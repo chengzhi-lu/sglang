@@ -51,6 +51,7 @@ EXPECTED_FRACTIONS = {
 CSV_FIELDS = [
     "policy",
     "target_reclaim_mb",
+    "page_size",
     "returncode",
     "valid",
     "validation_reason",
@@ -58,6 +59,7 @@ CSV_FIELDS = [
     "layerkv_mode",
     "layerkv_policy",
     "layerkv_target_reclaim_mb",
+    "layerkv_kvc_scheduler",
     "layerkv_physical_kvc_supported",
     "requested_total_reclaim_mb",
     "effective_kvc_reclaim_mb",
@@ -69,6 +71,12 @@ CSV_FIELDS = [
     "kvc_host_backing_mb",
     "kvc_host_capacity_tokens",
     "kvc_host_used_tokens",
+    "kvc_page_size",
+    "kvc_offloaded_page_count",
+    "kvc_resident_page_count",
+    "kvc_reload_page_count_total",
+    "kvc_evict_page_count_total",
+    "kvc_page_alignment_violation_count",
     "kvc_resident_token_count",
     "kvc_offloaded_token_count",
     "kvc_residency_entry_count",
@@ -86,6 +94,12 @@ CSV_FIELDS = [
     "kvc_physical_cycle_count",
     "kvc_physical_failure_count",
     "kvc_eviction_skipped_count",
+    "kvc_ready_before_use_ratio",
+    "kvc_ready_before_use_count",
+    "kvc_ready_use_check_count",
+    "layerkv_copy_event_record_count",
+    "layerkv_copy_event_wait_count",
+    "layerkv_deadline_miss_count",
     "kvc_guard_pass",
     "kvc_guard_reason",
     "comparable",
@@ -120,7 +134,9 @@ def parse_layerkv_stats(text: str) -> List[Dict[str, Any]]:
     return stats
 
 
-def validate_run(policy: str, target: float, stats: Dict[str, Any], returncode: int) -> Tuple[bool, str]:
+def validate_run(
+    policy: str, target: float, page_size: int, stats: Dict[str, Any], returncode: int
+) -> Tuple[bool, str]:
     reasons: List[str] = []
     if returncode != 0:
         reasons.append(f"process_returncode={returncode}")
@@ -148,6 +164,10 @@ def validate_run(policy: str, target: float, stats: Dict[str, Any], returncode: 
         reasons.append("kvc_physical_failure_count_nonzero")
     if int(stats.get("kvc_stale_entry_count", 0) or 0) != 0:
         reasons.append("kvc_stale_entry_count_nonzero")
+    if int(stats.get("kvc_page_alignment_violation_count", 0) or 0) != 0:
+        reasons.append("kvc_page_alignment_violation_count_nonzero")
+    if int(stats.get("kvc_page_size", 1) or 1) != page_size:
+        reasons.append(f"kvc_page_size_mismatch expected={page_size} got={stats.get('kvc_page_size')}")
     if int(stats.get("kvc_host_used_tokens", 0) or 0) != int(
         stats.get("kvc_offloaded_token_count", 0) or 0
     ):
@@ -170,16 +190,24 @@ def validate_run(policy: str, target: float, stats: Dict[str, Any], returncode: 
             reasons.append("positive_policy_has_no_physical_evict")
         if reload_count <= 0:
             reasons.append("positive_policy_has_no_reload")
+        if evict_count % page_size != 0:
+            reasons.append("evict_count_not_page_aligned")
+        if reload_count % page_size != 0:
+            reasons.append("reload_count_not_page_aligned")
         if int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0) <= 0:
             reasons.append("positive_policy_has_no_req_to_token_rewrite")
+        if int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0) % page_size != 0:
+            reasons.append("req_to_token_rewrite_not_page_aligned")
         if float(stats.get("physical_kvc_reclaim_mb", 0.0) or 0.0) <= 0.0:
             reasons.append("positive_policy_has_no_physical_reclaim")
 
     return not reasons, ";".join(reasons)
 
 
-def run_one(args: argparse.Namespace, policy: str, target: float, output_dir: Path) -> Dict[str, Any]:
-    stamp = f"{policy.replace('-', '_')}_{str(target).replace('.', 'p')}_{int(time.time() * 1000)}"
+def run_one(
+    args: argparse.Namespace, policy: str, target: float, page_size: int, output_dir: Path
+) -> Dict[str, Any]:
+    stamp = f"{policy.replace('-', '_')}_p{page_size}_{str(target).replace('.', 'p')}_{int(time.time() * 1000)}"
     result_path = output_dir / f"{stamp}.bench.jsonl"
     stdout_path = output_dir / f"{stamp}.stdout.log"
     stderr_path = output_dir / f"{stamp}.stderr.log"
@@ -198,6 +226,8 @@ def run_one(args: argparse.Namespace, policy: str, target: float, output_dir: Pa
         str(args.input_len),
         "--output-len",
         str(args.output_len),
+        "--page-size",
+        str(page_size),
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
         "--enable-layerkv",
@@ -209,6 +239,8 @@ def run_one(args: argparse.Namespace, policy: str, target: float, output_dir: Pa
         str(target),
         "--layerkv-kvc-block-tokens",
         str(args.kvc_block_tokens),
+        "--layerkv-kvc-scheduler",
+        args.scheduler,
         "--layerkv-debug-stats",
         "--result-filename",
         str(result_path),
@@ -237,7 +269,7 @@ def run_one(args: argparse.Namespace, policy: str, target: float, output_dir: Pa
 
     all_stats = parse_layerkv_stats(proc.stdout + "\n" + proc.stderr)
     final_stats = all_stats[-1] if all_stats else {}
-    valid, reason = validate_run(policy, target, final_stats, proc.returncode)
+    valid, reason = validate_run(policy, target, page_size, final_stats, proc.returncode)
 
     row: Dict[str, Any] = {field: "" for field in CSV_FIELDS}
     row.update(final_stats)
@@ -245,6 +277,7 @@ def run_one(args: argparse.Namespace, policy: str, target: float, output_dir: Pa
         {
             "policy": policy,
             "target_reclaim_mb": target,
+            "page_size": page_size,
             "returncode": proc.returncode,
             "valid": valid,
             "validation_reason": reason,
@@ -271,11 +304,13 @@ def main() -> int:
     parser.add_argument("--output-dir", default="outputs/layerkv")
     parser.add_argument("--gpu", default="1")
     parser.add_argument("--targets", nargs="+", type=float, default=[0.0, 1.0, 4.0])
+    parser.add_argument("--page-sizes", nargs="+", type=int, default=[1, 16])
     parser.add_argument("--policies", nargs="+", default=POLICIES)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--input-len", type=int, default=16)
+    parser.add_argument("--input-len", type=int, default=64)
     parser.add_argument("--output-len", type=int, default=3)
     parser.add_argument("--kvc-block-tokens", type=int, default=4)
+    parser.add_argument("--scheduler", choices=["sync", "async-deadline"], default="async-deadline")
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--timeout-s", type=int, default=300)
@@ -285,17 +320,21 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows: List[Dict[str, Any]] = []
-    for target in args.targets:
-        for policy in args.policies:
-            print(f"[layerkv-kvc-validation] policy={policy} target={target}MB", flush=True)
-            row = run_one(args, policy, target, output_dir)
-            rows.append(row)
-            print(
-                "[layerkv-kvc-validation] "
-                f"valid={row['valid']} evict={row.get('kvc_evict_count_total')} "
-                f"reload={row.get('kvc_reload_count_total')} reason={row['validation_reason']}",
-                flush=True,
-            )
+    for page_size in args.page_sizes:
+        for target in args.targets:
+            for policy in args.policies:
+                print(
+                    f"[layerkv-kvc-validation] policy={policy} page_size={page_size} target={target}MB",
+                    flush=True,
+                )
+                row = run_one(args, policy, target, page_size, output_dir)
+                rows.append(row)
+                print(
+                    "[layerkv-kvc-validation] "
+                    f"valid={row['valid']} evict={row.get('kvc_evict_count_total')} "
+                    f"reload={row.get('kvc_reload_count_total')} reason={row['validation_reason']}",
+                    flush=True,
+                )
 
     csv_path = output_dir / "kvc_validation.csv"
     summary_path = output_dir / "kvc_validation_summary.json"

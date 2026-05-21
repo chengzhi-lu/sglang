@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import math
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -27,6 +28,7 @@ class LayerKVConfig:
     policy: str = "none"
     target_reclaim_mb: float = 0.0
     kvc_block_tokens: int = 16
+    kvc_scheduler: str = "async-deadline"
     debug_stats: bool = False
     disallow_destructive_fallback: bool = True
 
@@ -41,6 +43,9 @@ class LayerKVConfig:
             ),
             kvc_block_tokens=max(
                 1, int(getattr(server_args, "layerkv_kvc_block_tokens", 16) or 16)
+            ),
+            kvc_scheduler=str(
+                getattr(server_args, "layerkv_kvc_scheduler", "async-deadline")
             ),
             debug_stats=bool(getattr(server_args, "layerkv_debug_stats", False)),
             disallow_destructive_fallback=bool(
@@ -70,6 +75,12 @@ class LayerKVStats:
     kvc_host_backing_mb: float = 0.0
     kvc_host_capacity_tokens: int = 0
     kvc_host_used_tokens: int = 0
+    kvc_page_size: int = 1
+    kvc_offloaded_page_count: int = 0
+    kvc_resident_page_count: int = 0
+    kvc_reload_page_count_total: int = 0
+    kvc_evict_page_count_total: int = 0
+    kvc_page_alignment_violation_count: int = 0
     kvc_resident_token_count: int = 0
     kvc_offloaded_token_count: int = 0
     kvc_evict_count_total: int = 0
@@ -96,6 +107,11 @@ class LayerKVStats:
     layerkv_kvc_reload_started: int = 0
     layerkv_expert_materialize_started: int = 0
     layerkv_deadline_miss_count: int = 0
+    layerkv_copy_event_record_count: int = 0
+    layerkv_copy_event_wait_count: int = 0
+    kvc_ready_before_use_count: int = 0
+    kvc_ready_use_check_count: int = 0
+    kvc_ready_before_use_ratio: float = 1.0
     layerkv_main_stream_wait_ms: float = 0.0
     layerkv_copy_stream_busy_ms: float = 0.0
     layerkv_python_overhead_ms: float = 0.0
@@ -113,7 +129,34 @@ class _LayerKVResidencyEntry:
     state: str
     device_loc: Optional[int] = None
     host_slot: Optional[int] = None
+    device_locs: Optional[List[int]] = None
+    host_slots: Optional[List[int]] = None
+    page_size: int = 1
+    ready_start_event: Optional[Any] = None
+    ready_event: Optional[Any] = None
+    ready_waited: bool = False
     last_access_step: int = 0
+
+    @property
+    def token_count(self) -> int:
+        return max(1, int(self.page_size))
+
+    def logical_positions(self) -> List[int]:
+        return list(range(self.pos, self.pos + self.token_count))
+
+    def device_loc_list(self) -> List[int]:
+        if self.device_locs is not None:
+            return [int(x) for x in self.device_locs]
+        if self.device_loc is None:
+            return []
+        return [int(self.device_loc)]
+
+    def host_slot_list(self) -> List[int]:
+        if self.host_slots is not None:
+            return [int(x) for x in self.host_slots]
+        if self.host_slot is None:
+            return []
+        return [int(self.host_slot)]
 
 
 class _LayerKVHostKVStore:
@@ -207,27 +250,49 @@ class _LayerKVHostKVStore:
         end.synchronize()
         return float(start.elapsed_time(end))
 
-    def reload(self, host_slots: List[int], device_locs: torch.Tensor) -> float:
+    def reload(
+        self,
+        host_slots: List[int],
+        device_locs: torch.Tensor,
+        stream: Optional[torch.cuda.Stream] = None,
+        async_copy: bool = False,
+    ) -> Tuple[float, Optional[Any], Optional[Any]]:
         if device_locs.numel() == 0:
-            return 0.0
+            return 0.0, None, None
         host_index = torch.tensor(host_slots, dtype=torch.int64, device="cpu")
         device_module = torch.get_device_module(self.device)
         start = device_module.Event(enable_timing=True)
         end = device_module.Event(enable_timing=True)
-        start.record()
-        for layer_offset in range(self.layer_num):
-            layer_id = self.start_layer + layer_offset
-            k_src = self.k_buffers[layer_offset].index_select(0, host_index).to(
-                self.device, non_blocking=True
-            )
-            v_src = self.v_buffers[layer_offset].index_select(0, host_index).to(
-                self.device, non_blocking=True
-            )
-            self.kv_pool._get_key_buffer(layer_id).index_copy_(0, device_locs, k_src)
-            self.kv_pool._get_value_buffer(layer_id).index_copy_(0, device_locs, v_src)
-        end.record()
+        active_stream = stream if async_copy and stream is not None else None
+
+        def issue_copy() -> None:
+            if active_stream is not None:
+                start.record(active_stream)
+            else:
+                start.record()
+            for layer_offset in range(self.layer_num):
+                layer_id = self.start_layer + layer_offset
+                k_src = self.k_buffers[layer_offset].index_select(0, host_index).to(
+                    self.device, non_blocking=True
+                )
+                v_src = self.v_buffers[layer_offset].index_select(0, host_index).to(
+                    self.device, non_blocking=True
+                )
+                self.kv_pool._get_key_buffer(layer_id).index_copy_(0, device_locs, k_src)
+                self.kv_pool._get_value_buffer(layer_id).index_copy_(0, device_locs, v_src)
+            if active_stream is not None:
+                end.record(active_stream)
+            else:
+                end.record()
+
+        if active_stream is not None:
+            with torch.cuda.stream(active_stream):
+                issue_copy()
+            return 0.0, start, end
+
+        issue_copy()
         end.synchronize()
-        return float(start.elapsed_time(end))
+        return float(start.elapsed_time(end)), start, end
 
 
 class LayerKVRuntime:
@@ -253,6 +318,7 @@ class LayerKVRuntime:
         self._allocator: Any = None
         self._req_to_token_pool: Any = None
         self._bytes_per_token_all_layers: int = 0
+        self._page_size: int = 1
         self._host_store: Optional[_LayerKVHostKVStore] = None
         self._residency: Dict[Tuple[int, int], _LayerKVResidencyEntry] = {}
         self._decode_step: int = 0
@@ -331,16 +397,10 @@ class LayerKVRuntime:
             return False
 
         page_size = int(getattr(kv_pool, "page_size", 1) or 1)
-        if not isinstance(kv_pool, MHATokenToKVPool):
+        if type(kv_pool) is not MHATokenToKVPool:
             self.unsupported_reason = (
-                f"KVC physical offload supports MHATokenToKVPool only, got "
+                f"KVC physical offload supports non-FP4 MHATokenToKVPool only, got "
                 f"{type(kv_pool).__name__}"
-            )
-            return False
-        if page_size != 1:
-            self.unsupported_reason = (
-                "KVC physical offload v1 supports page_size=1 only; "
-                f"got page_size={page_size}"
             )
             return False
         if self._allocator is None or self._req_to_token_pool is None:
@@ -348,6 +408,8 @@ class LayerKVRuntime:
             return False
 
         try:
+            self._page_size = max(1, page_size)
+            self.stats.kvc_page_size = self._page_size
             one_k = kv_pool._get_key_buffer(kv_pool.start_layer)[0].nbytes
             one_v = kv_pool._get_value_buffer(kv_pool.start_layer)[0].nbytes
             self._bytes_per_token_all_layers = int(
@@ -367,8 +429,9 @@ class LayerKVRuntime:
         # policy fractions can vary without reallocating CPU backing.
         target_bytes = max(1, int(self.config.target_reclaim_mb * 1024 * 1024))
         target_tokens = max(1, target_bytes // self._bytes_per_token_all_layers)
+        target_tokens = self._align_tokens_up(target_tokens)
         capacity_tokens = target_tokens + max(
-            target_tokens, self.config.kvc_block_tokens
+            target_tokens, self._align_tokens_up(self.config.kvc_block_tokens)
         )
         self._host_store = _LayerKVHostKVStore(self._kv_pool, capacity_tokens)
         self.stats.kvc_host_capacity_tokens = self._host_store.capacity_tokens
@@ -445,6 +508,16 @@ class LayerKVRuntime:
         except Exception:
             return -1
 
+    def _align_tokens_down(self, token_count: int) -> int:
+        page_size = max(1, int(self._page_size))
+        return max(0, int(token_count) // page_size * page_size)
+
+    def _align_tokens_up(self, token_count: int) -> int:
+        page_size = max(1, int(self._page_size))
+        if token_count <= 0:
+            return 0
+        return int(math.ceil(float(token_count) / float(page_size)) * page_size)
+
     def _wrap_set_kv_buffer(self, orig: Callable) -> Callable:
         @functools.wraps(orig)
         def wrapped(layer: Any, loc: Any, cache_k: Any, cache_v: Any, *args, **kwargs):
@@ -468,6 +541,7 @@ class LayerKVRuntime:
         @functools.wraps(orig)
         def wrapped(layer_id: int, *args, **kwargs):
             self.stats.kvc_get_key_count += 1
+            self._wait_for_kvc_layer_ready(layer_id)
             return orig(layer_id, *args, **kwargs)
 
         return wrapped
@@ -476,6 +550,7 @@ class LayerKVRuntime:
         @functools.wraps(orig)
         def wrapped(layer_id: int, *args, **kwargs):
             self.stats.kvc_get_value_count += 1
+            self._wait_for_kvc_layer_ready(layer_id)
             return orig(layer_id, *args, **kwargs)
 
         return wrapped
@@ -484,12 +559,91 @@ class LayerKVRuntime:
         @functools.wraps(orig)
         def wrapped(layer_id: int, *args, **kwargs):
             self.stats.kvc_get_kv_count += 1
+            self._wait_for_kvc_layer_ready(layer_id)
             return orig(layer_id, *args, **kwargs)
 
         return wrapped
 
+    def _wait_for_kvc_layer_ready(self, layer_id: int) -> None:
+        pending = [
+            entry
+            for entry in self._residency.values()
+            if entry.state == "reloading" and entry.ready_event is not None
+        ]
+        if not pending:
+            return
+        seen_events = set()
+        for entry in pending:
+            event = entry.ready_event
+            event_id = id(event)
+            if event_id in seen_events:
+                continue
+            seen_events.add(event_id)
+            self.stats.kvc_ready_use_check_count += 1
+            ready = bool(event.query())
+            if ready:
+                self.stats.kvc_ready_before_use_count += 1
+            else:
+                self.stats.layerkv_deadline_miss_count += 1
+            stream = torch.cuda.current_stream(device=self._kv_pool.device)
+            stream.wait_event(event)
+            self.stats.layerkv_copy_event_wait_count += 1
+        self._refresh_ready_before_use_ratio()
+
+    def _refresh_ready_before_use_ratio(self) -> None:
+        total = self.stats.kvc_ready_use_check_count
+        if total <= 0:
+            self.stats.kvc_ready_before_use_ratio = 1.0
+        else:
+            self.stats.kvc_ready_before_use_ratio = (
+                self.stats.kvc_ready_before_use_count / float(total)
+            )
+
+    def _finalize_reloaded_entries(self, *, block: bool = False) -> None:
+        if self._host_store is None:
+            return
+        pending = [
+            entry for entry in self._residency.values() if entry.state == "reloading"
+        ]
+        if not pending:
+            return
+        elapsed_events = set()
+        for entry in pending:
+            event = entry.ready_event
+            if event is not None:
+                if block:
+                    event.synchronize()
+                elif not event.query():
+                    continue
+            event_id = id(entry.ready_event) if entry.ready_event is not None else None
+            if (
+                event_id not in elapsed_events
+                and entry.ready_start_event is not None
+                and entry.ready_event is not None
+            ):
+                try:
+                    elapsed_ms = float(
+                        entry.ready_start_event.elapsed_time(entry.ready_event)
+                    )
+                    self.stats.kvc_reload_ms += elapsed_ms
+                    self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
+                    elapsed_events.add(event_id)
+                except Exception:
+                    pass
+            host_slots = entry.host_slot_list()
+            if host_slots:
+                self._host_store.free(host_slots)
+            entry.host_slots = None
+            entry.host_slot = None
+            entry.state = "resident"
+            entry.ready_start_event = None
+            entry.ready_event = None
+            entry.ready_waited = False
+        self._refresh_kvc_residency_stats()
+
     def on_forward_begin(self, *, mode: str, forward_batch: Any) -> None:
         t0 = time.perf_counter()
+        self._finalize_reloaded_entries(block=False)
         if mode == "decode":
             self.stats.forward_decode_count += 1
             self._decode_step += 1
@@ -517,7 +671,7 @@ class LayerKVRuntime:
             self._refresh_kvc_residency_stats()
             return
 
-        token_count = len(selected)
+        token_count = sum(entry.token_count for entry in selected)
         self.stats.kvc_reload_required_count += token_count
         self.stats.kvc_allocator_available_before = self._allocator_available_size()
         new_locs = self._allocator.alloc(token_count)
@@ -528,24 +682,39 @@ class LayerKVRuntime:
             raise RuntimeError("allocator failed to reload offloaded KVC")
         self.stats.kvc_allocator_available_after = self._allocator_available_size()
 
-        host_slots = [int(entry.host_slot) for entry in selected]
+        host_slots = [slot for entry in selected for slot in entry.host_slot_list()]
         try:
             self._ensure_host_store()
-            elapsed_ms = self._host_store.reload(host_slots, new_locs)
-            self._rewrite_req_to_token(
-                [
-                    (entry.req_idx, entry.pos, entry.device_loc or 0)
-                    for entry in selected
-                ],
+            async_copy = self.config.kvc_scheduler == "async-deadline"
+            elapsed_ms, start_event, ready_event = self._host_store.reload(
+                host_slots,
                 new_locs,
+                stream=self._copy_stream,
+                async_copy=async_copy,
             )
-            for entry, new_loc in zip(selected, new_locs.detach().cpu().tolist()):
-                entry.state = "resident"
-                entry.device_loc = int(new_loc)
+            self.stats.layerkv_copy_event_record_count += 1
+            self._rewrite_req_to_token_for_entries(selected, new_locs)
+            new_locs_cpu = [int(x) for x in new_locs.detach().cpu().tolist()]
+            offset = 0
+            for entry in selected:
+                page_locs = new_locs_cpu[offset : offset + entry.token_count]
+                offset += entry.token_count
+                entry.device_locs = page_locs
+                entry.device_loc = page_locs[0] if page_locs else None
                 entry.last_access_step = self._decode_step
-                if entry.host_slot is not None:
-                    self._host_store.free([int(entry.host_slot)])
-                entry.host_slot = None
+                if async_copy and ready_event is not None:
+                    entry.state = "reloading"
+                    entry.ready_start_event = start_event
+                    entry.ready_event = ready_event
+                    entry.ready_waited = False
+                else:
+                    entry.state = "resident"
+                    if entry.host_slots is not None:
+                        self._host_store.free(entry.host_slots)
+                    elif entry.host_slot is not None:
+                        self._host_store.free([int(entry.host_slot)])
+                    entry.host_slots = None
+                    entry.host_slot = None
         except Exception:
             self.stats.kvc_physical_failure_count += 1
             self.stats.comparable = False
@@ -554,6 +723,7 @@ class LayerKVRuntime:
 
         reload_mb = token_count * self._bytes_per_token_all_layers / float(1024 * 1024)
         self.stats.kvc_reload_count_total += token_count
+        self.stats.kvc_reload_page_count_total += len(selected)
         self.stats.kvc_reload_mb_total += reload_mb
         self.stats.kvc_reload_ms += elapsed_ms
         self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
@@ -590,7 +760,8 @@ class LayerKVRuntime:
             self._refresh_kvc_residency_stats()
             return
 
-        host_slots = self._host_store.alloc(len(selected))
+        token_count = sum(entry.token_count for entry in selected)
+        host_slots = self._host_store.alloc(token_count)
         if host_slots is None:
             self.stats.kvc_physical_failure_count += 1
             self.stats.comparable = False
@@ -600,21 +771,28 @@ class LayerKVRuntime:
             return
 
         old_locs = torch.tensor(
-            [int(entry.device_loc) for entry in selected],
+            [loc for entry in selected for loc in entry.device_loc_list()],
             dtype=torch.int64,
             device=self._kv_pool.device,
         )
-        token_count = len(selected)
         try:
             elapsed_ms = self._host_store.backup(old_locs, host_slots)
             self.stats.kvc_allocator_available_before = self._allocator_available_size()
             self._allocator.free(old_locs)
             self.stats.kvc_allocator_available_after = self._allocator_available_size()
             self.stats.kvc_allocator_free_count += 1
-            for entry, host_slot in zip(selected, host_slots):
+            offset = 0
+            for entry in selected:
+                page_host_slots = host_slots[offset : offset + entry.token_count]
+                offset += entry.token_count
                 entry.state = "offloaded"
-                entry.host_slot = int(host_slot)
+                entry.host_slots = [int(x) for x in page_host_slots]
+                entry.host_slot = int(page_host_slots[0]) if page_host_slots else None
                 entry.device_loc = None
+                entry.device_locs = None
+                entry.ready_event = None
+                entry.ready_start_event = None
+                entry.ready_waited = False
                 entry.last_access_step = self._decode_step
         except Exception:
             self._host_store.free(host_slots)
@@ -624,6 +802,7 @@ class LayerKVRuntime:
             raise
 
         self.stats.kvc_evict_count_total += token_count
+        self.stats.kvc_evict_page_count_total += len(selected)
         self.stats.kvc_backup_ms += elapsed_ms
         self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
         self.stats.kvc_physical_cycle_count += 1
@@ -632,13 +811,22 @@ class LayerKVRuntime:
 
     def _target_offloaded_tokens(self, target_reclaim_mb: float) -> int:
         target_bytes = int(target_reclaim_mb * 1024 * 1024)
-        return max(1, target_bytes // self._bytes_per_token_all_layers)
+        raw_tokens = max(1, target_bytes // self._bytes_per_token_all_layers)
+        return max(self._page_size, self._align_tokens_up(raw_tokens))
 
     def _offloaded_token_count(self) -> int:
-        return sum(1 for entry in self._residency.values() if entry.state == "offloaded")
+        return sum(
+            entry.token_count
+            for entry in self._residency.values()
+            if entry.state == "offloaded"
+        )
 
     def _resident_token_count(self) -> int:
-        return sum(1 for entry in self._residency.values() if entry.state == "resident")
+        return sum(
+            entry.token_count
+            for entry in self._residency.values()
+            if entry.state == "resident"
+        )
 
     def _refresh_kvc_residency_stats(self) -> None:
         offloaded = self._offloaded_token_count()
@@ -646,6 +834,13 @@ class LayerKVRuntime:
         self.stats.kvc_offloaded_token_count = offloaded
         self.stats.kvc_resident_token_count = resident
         self.stats.kvc_residency_entry_count = len(self._residency)
+        self.stats.kvc_offloaded_page_count = sum(
+            1 for entry in self._residency.values() if entry.state == "offloaded"
+        )
+        self.stats.kvc_resident_page_count = sum(
+            1 for entry in self._residency.values() if entry.state == "resident"
+        )
+        self.stats.kvc_page_size = self._page_size
         self.stats.physical_kvc_reclaim_mb = (
             offloaded * self._bytes_per_token_all_layers / float(1024 * 1024)
         )
@@ -667,6 +862,7 @@ class LayerKVRuntime:
         seen_host_slots = set()
         offloaded_count = 0
         resident_count = 0
+        host_owned_count = 0
 
         active_lens = None
         if forward_batch is not None:
@@ -684,46 +880,68 @@ class LayerKVRuntime:
             if key != (entry.req_idx, entry.pos):
                 stale_count += 1
                 reasons.append("entry_key_mismatch")
-            if active_lens is not None and req_idx in active_lens and pos >= active_lens[req_idx]:
+            if (
+                active_lens is not None
+                and req_idx in active_lens
+                and pos + entry.token_count > active_lens[req_idx]
+            ):
                 stale_count += 1
                 reasons.append("entry_beyond_active_length")
 
             if entry.state == "offloaded":
-                offloaded_count += 1
-                if entry.host_slot is None:
+                offloaded_count += entry.token_count
+                host_slots = entry.host_slot_list()
+                host_owned_count += len(host_slots)
+                if not host_slots:
                     stale_count += 1
                     reasons.append("offloaded_missing_host_slot")
-                elif entry.host_slot in seen_host_slots:
-                    stale_count += 1
-                    reasons.append("duplicate_host_slot")
-                elif self._host_store is not None and int(entry.host_slot) not in host_used_slots:
-                    stale_count += 1
-                    reasons.append("host_slot_not_marked_used")
-                if entry.host_slot is not None:
-                    seen_host_slots.add(int(entry.host_slot))
+                for host_slot in host_slots:
+                    if host_slot in seen_host_slots:
+                        stale_count += 1
+                        reasons.append("duplicate_host_slot")
+                    elif self._host_store is not None and int(host_slot) not in host_used_slots:
+                        stale_count += 1
+                        reasons.append("host_slot_not_marked_used")
+                    seen_host_slots.add(int(host_slot))
                 if entry.device_loc is not None:
                     stale_count += 1
                     reasons.append("offloaded_has_device_loc")
-            elif entry.state == "resident":
-                resident_count += 1
-                if entry.device_loc is None:
+                if len(host_slots) != entry.token_count:
+                    stale_count += 1
+                    reasons.append("offloaded_host_slot_count_mismatch")
+            elif entry.state in ("resident", "reloading"):
+                if entry.state == "reloading":
+                    host_owned_count += len(entry.host_slot_list())
+                if entry.state == "resident":
+                    resident_count += entry.token_count
+                device_locs = entry.device_loc_list()
+                if not device_locs:
                     stale_count += 1
                     reasons.append("resident_missing_device_loc")
-                if entry.host_slot is not None:
+                if entry.state == "resident" and entry.host_slot is not None:
                     stale_count += 1
                     reasons.append("resident_has_host_slot")
+                if len(device_locs) != entry.token_count:
+                    stale_count += 1
+                    reasons.append("resident_device_loc_count_mismatch")
                 if (
                     active_lens is not None
                     and req_idx in active_lens
                     and self._req_to_token_pool is not None
-                    and entry.device_loc is not None
-                    and pos < active_lens[req_idx]
+                    and device_locs
+                    and pos + entry.token_count <= active_lens[req_idx]
                 ):
                     try:
-                        table_loc = int(
-                            self._req_to_token_pool.req_to_token[req_idx, pos].item()
-                        )
-                        if table_loc != int(entry.device_loc):
+                        table_locs = [
+                            int(x)
+                            for x in self._req_to_token_pool.req_to_token[
+                                req_idx, entry.logical_positions()
+                            ]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        ]
+                        if table_locs != device_locs:
                             stale_count += 1
                             reasons.append("resident_req_to_token_mismatch")
                     except Exception:
@@ -733,8 +951,8 @@ class LayerKVRuntime:
                 stale_count += 1
                 reasons.append("unknown_entry_state")
 
-        if self._host_store is not None and self._host_store.used_count != offloaded_count:
-            stale_count += abs(self._host_store.used_count - offloaded_count)
+        if self._host_store is not None and self._host_store.used_count != host_owned_count:
+            stale_count += abs(self._host_store.used_count - host_owned_count)
             reasons.append("host_used_count_mismatch")
 
         self.stats.kvc_residency_entry_count = len(self._residency)
@@ -792,7 +1010,7 @@ class LayerKVRuntime:
         to_drop = []
         for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch):
             for key, entry in self._residency.items():
-                if key[0] == req_idx and entry.pos >= seq_len:
+                if key[0] == req_idx and entry.pos + entry.token_count > seq_len:
                     to_drop.append(key)
         self._drop_residency_keys(to_drop)
 
@@ -802,8 +1020,10 @@ class LayerKVRuntime:
         host_slots = []
         for key in keys:
             entry = self._residency.pop(key, None)
-            if entry is not None and entry.host_slot is not None:
-                host_slots.append(int(entry.host_slot))
+            if entry is not None:
+                if entry.ready_event is not None and not entry.ready_event.query():
+                    entry.ready_event.synchronize()
+                host_slots.extend(entry.host_slot_list())
         if host_slots and self._host_store is not None:
             self._host_store.free(host_slots)
         self._refresh_kvc_residency_stats()
@@ -816,7 +1036,8 @@ class LayerKVRuntime:
         for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch):
             # Decode writes the current token at seq_len - 1 inside the forward.
             required_prefix_len = max(0, seq_len - 1)
-            for pos in range(required_prefix_len):
+            required_prefix_len = self._align_tokens_down(required_prefix_len)
+            for pos in range(0, required_prefix_len, self._page_size):
                 key = (req_idx, pos)
                 entry = self._residency.get(key)
                 if entry is None or entry.state != "offloaded":
@@ -833,44 +1054,67 @@ class LayerKVRuntime:
         table = self._req_to_token_pool.req_to_token
         candidates: List[_LayerKVResidencyEntry] = []
         seen_locs = set()
+        page_size = max(1, int(self._page_size))
         for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch):
             prefix_len = max(0, seq_len - 1)
             if prefix_len <= 0:
                 continue
-            positions = torch.arange(prefix_len, dtype=torch.int64, device=table.device)
-            locs = table[req_idx, positions].detach().to("cpu", non_blocking=False)
-            for pos, loc in zip(range(prefix_len), locs.tolist()):
+            evictable_len = self._align_tokens_down(prefix_len)
+            if evictable_len <= 0:
+                continue
+            for pos in range(0, evictable_len, page_size):
+                positions = torch.arange(
+                    pos, pos + page_size, dtype=torch.int64, device=table.device
+                )
+                locs = [
+                    int(x)
+                    for x in table[req_idx, positions]
+                    .detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist()
+                ]
                 key = (req_idx, pos)
                 existing = self._residency.get(key)
-                if existing is not None and existing.state == "offloaded":
+                if existing is not None and existing.state in ("offloaded", "reloading"):
                     continue
-                loc = int(loc)
-                if loc <= 0 or loc in seen_locs:
+                if any(loc <= 0 for loc in locs) or any(loc in seen_locs for loc in locs):
                     continue
-                seen_locs.add(loc)
+                if page_size > 1:
+                    base = locs[0]
+                    expected = list(range(base, base + page_size))
+                    if locs != expected or base % page_size != 0:
+                        self.stats.kvc_page_alignment_violation_count += 1
+                        continue
+                seen_locs.update(locs)
                 if existing is None:
                     existing = _LayerKVResidencyEntry(
                         req_idx=req_idx,
                         pos=pos,
                         state="resident",
-                        device_loc=loc,
+                        device_loc=locs[0],
+                        device_locs=locs,
+                        page_size=page_size,
                         last_access_step=self._decode_step,
                     )
                     self._residency[key] = existing
                 else:
                     existing.state = "resident"
-                    existing.device_loc = loc
+                    existing.device_loc = locs[0]
+                    existing.device_locs = locs
+                    existing.page_size = page_size
                     existing.last_access_step = self._decode_step
                 candidates.append(existing)
         candidates.sort(key=lambda x: (x.pos, x.req_idx))
-        block_tokens = max(1, int(self.config.kvc_block_tokens))
-        take = min(max_tokens, len(candidates))
-        if take <= 0:
+        max_tokens = self._align_tokens_down(max_tokens)
+        take_pages = min(max_tokens // page_size, len(candidates))
+        if take_pages <= 0:
             return []
-        if take > block_tokens:
-            take -= take % block_tokens
-            take = max(block_tokens, take)
-        return candidates[:take]
+        block_tokens = max(page_size, self._align_tokens_up(self.config.kvc_block_tokens))
+        block_pages = max(1, block_tokens // page_size)
+        if take_pages > block_pages:
+            take_pages -= take_pages % block_pages
+            take_pages = max(block_pages, take_pages)
+        return candidates[:take_pages]
 
     def _rewrite_req_to_token(
         self, selected: List[Tuple[int, int, int]], new_locs: torch.Tensor
@@ -890,9 +1134,40 @@ class LayerKVRuntime:
         self._req_to_token_pool.req_to_token[req_idx, pos] = new_locs.to(torch.int32)
         self.stats.kvc_req_to_token_rewrite_count += int(new_locs.numel())
 
+    def _rewrite_req_to_token_for_entries(
+        self, selected: List[_LayerKVResidencyEntry], new_locs: torch.Tensor
+    ) -> None:
+        if not selected:
+            return
+        req_indices: List[int] = []
+        positions: List[int] = []
+        offset = 0
+        for entry in selected:
+            req_indices.extend([entry.req_idx] * entry.token_count)
+            positions.extend(entry.logical_positions())
+            offset += entry.token_count
+        if offset != int(new_locs.numel()):
+            self.stats.kvc_page_alignment_violation_count += 1
+            raise RuntimeError(
+                f"LayerKV KVC reload loc count mismatch: expected={offset} got={int(new_locs.numel())}"
+            )
+        req_idx = torch.tensor(
+            req_indices,
+            dtype=torch.int64,
+            device=self._req_to_token_pool.req_to_token.device,
+        )
+        pos = torch.tensor(
+            positions,
+            dtype=torch.int64,
+            device=self._req_to_token_pool.req_to_token.device,
+        )
+        self._req_to_token_pool.req_to_token[req_idx, pos] = new_locs.to(torch.int32)
+        self.stats.kvc_req_to_token_rewrite_count += int(new_locs.numel())
+
     def on_forward_end(self, *, mode: str, forward_batch: Any) -> None:
         if mode == "decode":
             t0 = time.perf_counter()
+            self._finalize_reloaded_entries(block=True)
             self._evict_kvc_to_target(forward_batch)
             self.validate_kvc_state(forward_batch)
             self.stats.layerkv_python_overhead_ms += (
@@ -912,6 +1187,7 @@ class LayerKVRuntime:
                 "layerkv_mode": self.config.mode,
                 "layerkv_policy": self.config.policy,
                 "layerkv_target_reclaim_mb": self.config.target_reclaim_mb,
+                "layerkv_kvc_scheduler": self.config.kvc_scheduler,
                 "layerkv_physical_kvc_supported": self.physical_kvc_supported,
                 "layerkv_physical_expert_supported": self.physical_expert_supported,
                 "layerkv_unsupported_reason": self.unsupported_reason,

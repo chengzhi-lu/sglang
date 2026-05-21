@@ -32,6 +32,7 @@ def main() -> int:
         layerkv_policy="layer-aware-joint-dp",
         layerkv_target_reclaim_mb=64.0,
         layerkv_kvc_block_tokens=16,
+        layerkv_kvc_scheduler="async-deadline",
         layerkv_debug_stats=True,
         layerkv_disallow_destructive_fallback=True,
     )
