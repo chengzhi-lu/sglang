@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Run real-model LayerKV validation on SGLang.
+"""Run Fig4-aligned real-model LayerKV validation on SGLang.
 
 This script is intentionally small and conservative.  It validates that the
-real Qwen3 MoE path can run with LayerKV enabled and that KVC-only runs exercise
-the full evict -> reload -> req_to_token rewrite lifecycle.  Mixed KVC+expert
-scenarios validate that production policy flags install physical expert slots
-and produce comparable physical reclaim rows.
+real Qwen3 MoE path can run with KVC+expert LayerKV enabled under the same
+workload shapes used by Fig4 policy comparison.
 """
 
 from __future__ import annotations
@@ -17,6 +15,9 @@ from typing import Any, Dict, List
 
 from layerkv_eval_common import (
     DEFAULT_MODEL_PATH,
+    FIG4_TARGET_RECLAIM_MB,
+    FIG4_WORKLOADS,
+    apply_fig4_workload,
     base_command,
     layerkv_flags,
     run_bench_command,
@@ -25,6 +26,16 @@ from layerkv_eval_common import (
 
 
 CSV_FIELDS = [
+    "workload",
+    "fig4_aligned",
+    "batch_size",
+    "input_len",
+    "output_len",
+    "fig4_dataset_name",
+    "fig4_dataset_path",
+    "max_total_tokens",
+    "max_running_requests",
+    "mem_fraction_static",
     "scenario",
     "returncode",
     "valid",
@@ -45,6 +56,8 @@ CSV_FIELDS = [
     "kvc_req_to_token_rewrite_count",
     "kvc_physical_failure_count",
     "kvc_stale_entry_count",
+    "kvc_finished_req_cleanup_count",
+    "kvc_finished_req_cleanup_token_count",
     "kvc_guard_pass",
     "kvc_guard_reason",
     "planned_expert_reclaim_mb",
@@ -92,41 +105,46 @@ def scenario_command(
     args: argparse.Namespace, scenario: str, result_path: Path
 ) -> List[str]:
     cmd = base_command(args, result_path)
-    if scenario == "baseline":
-        return cmd
-    if scenario == "kvc_only_reload":
-        return cmd + layerkv_flags(
-            mode="kvc-only",
-            policy="layer-aware-joint-dp",
-            target_reclaim_mb=args.kvc_target_reclaim_mb,
-            kvc_block_tokens=args.kvc_block_tokens,
-        )
     if scenario == "kvc_expert_kv_first":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="kv-first",
-            target_reclaim_mb=args.expert_target_reclaim_mb,
+            target_reclaim_mb=args.target_reclaim_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_expert_first":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="expert-first",
-            target_reclaim_mb=args.expert_target_reclaim_mb,
+            target_reclaim_mb=args.target_reclaim_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_ratio_50_50":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="ratio-50-50",
-            target_reclaim_mb=args.expert_target_reclaim_mb,
+            target_reclaim_mb=args.target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
+    if scenario == "kvc_expert_ratio_25_75":
+        return cmd + layerkv_flags(
+            mode="kvc-expert",
+            policy="ratio-25-75",
+            target_reclaim_mb=args.target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
+    if scenario == "kvc_expert_ratio_75_25":
+        return cmd + layerkv_flags(
+            mode="kvc-expert",
+            policy="ratio-75-25",
+            target_reclaim_mb=args.target_reclaim_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_joint_dp":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="layer-aware-joint-dp",
-            target_reclaim_mb=args.expert_target_reclaim_mb,
+            target_reclaim_mb=args.target_reclaim_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     raise ValueError(f"unknown scenario: {scenario}")
@@ -138,8 +156,6 @@ def validate_scenario(
     reasons: List[str] = []
     if returncode != 0:
         reasons.append(f"process_returncode={returncode}")
-    if scenario == "baseline":
-        return not reasons, ";".join(reasons)
     if not stats:
         reasons.append("missing_layerkv_stats")
         return False, ";".join(reasons)
@@ -149,16 +165,7 @@ def validate_scenario(
         reasons.append("kvc_physical_failure_count_nonzero")
     if int(stats.get("kvc_stale_entry_count", 0) or 0) != 0:
         reasons.append("kvc_stale_entry_count_nonzero")
-    if scenario == "kvc_only_reload":
-        if not bool(stats.get("layerkv_physical_kvc_supported", False)):
-            reasons.append("physical_kvc_unsupported")
-        if int(stats.get("kvc_evict_count_total", 0) or 0) <= 0:
-            reasons.append("no_kvc_evict")
-        if int(stats.get("kvc_reload_count_total", 0) or 0) <= 0:
-            reasons.append("no_kvc_reload")
-        if int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0) <= 0:
-            reasons.append("no_req_to_token_rewrite")
-    elif scenario.startswith("kvc_expert_"):
+    if scenario.startswith("kvc_expert_"):
         if not bool(stats.get("layerkv_physical_expert_supported", False)):
             reasons.append("physical_expert_unsupported")
         if not bool(stats.get("expert_guard_pass", False)):
@@ -206,6 +213,16 @@ def run_scenario(
     row.update(final_stats)
     row.update(
         {
+            "workload": args.workload,
+            "fig4_aligned": bool(args.fig4_aligned),
+            "batch_size": args.batch_size,
+            "input_len": args.input_len,
+            "output_len": args.output_len,
+            "fig4_dataset_name": args.fig4_dataset_name,
+            "fig4_dataset_path": args.fig4_dataset_path,
+            "max_total_tokens": args.max_total_tokens,
+            "max_running_requests": args.max_running_requests,
+            "mem_fraction_static": args.mem_fraction_static,
             "scenario": scenario,
             "returncode": result["returncode"],
             "valid": valid,
@@ -224,11 +241,19 @@ def main() -> int:
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output-dir", default="outputs/layerkv/real_qwen3_30b_a3b_validation")
     parser.add_argument("--gpu", default="1")
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--input-len", type=int, default=128)
-    parser.add_argument("--output-len", type=int, default=4)
-    parser.add_argument("--kvc-target-reclaim-mb", type=float, default=64.0)
-    parser.add_argument("--expert-target-reclaim-mb", type=float, default=512.0)
+    parser.add_argument(
+        "--workload",
+        default="batch-heavy",
+        choices=sorted(FIG4_WORKLOADS),
+        help="Fig4-aligned workload preset.",
+    )
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--input-len", type=int, default=1024)
+    parser.add_argument("--output-len", type=int, default=16)
+    parser.add_argument("--max-total-tokens", type=int, default=0)
+    parser.add_argument("--max-running-requests", type=int, default=0)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.0)
+    parser.add_argument("--target-reclaim-mb", type=float, default=FIG4_TARGET_RECLAIM_MB)
     parser.add_argument("--kvc-block-tokens", type=int, default=16)
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
@@ -237,23 +262,24 @@ def main() -> int:
         "--scenarios",
         nargs="+",
         default=[
-            "baseline",
-            "kvc_only_reload",
             "kvc_expert_kv_first",
             "kvc_expert_expert_first",
+            "kvc_expert_ratio_25_75",
             "kvc_expert_ratio_50_50",
+            "kvc_expert_ratio_75_25",
             "kvc_expert_joint_dp",
         ],
         choices=[
-            "baseline",
-            "kvc_only_reload",
             "kvc_expert_kv_first",
             "kvc_expert_expert_first",
+            "kvc_expert_ratio_25_75",
             "kvc_expert_ratio_50_50",
+            "kvc_expert_ratio_75_25",
             "kvc_expert_joint_dp",
         ],
     )
     args = parser.parse_args()
+    apply_fig4_workload(args)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -275,6 +301,17 @@ def main() -> int:
     invalid = [row for row in rows if str(row.get("valid")) != "True"]
     summary = {
         "csv": str(csv_path),
+        "workload": args.workload,
+        "fig4_aligned": bool(args.fig4_aligned),
+        "batch_size": args.batch_size,
+        "input_len": args.input_len,
+        "output_len": args.output_len,
+        "fig4_target_reclaim_mb": args.target_reclaim_mb,
+        "fig4_dataset_name": args.fig4_dataset_name,
+        "fig4_dataset_path": args.fig4_dataset_path,
+        "max_total_tokens": args.max_total_tokens,
+        "max_running_requests": args.max_running_requests,
+        "mem_fraction_static": args.mem_fraction_static,
         "total_runs": len(rows),
         "valid_runs": len(rows) - len(invalid),
         "invalid_runs": len(invalid),

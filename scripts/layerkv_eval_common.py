@@ -19,6 +19,63 @@ DEFAULT_MODEL_PATH = (
     "snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
 )
 
+FIG4_TARGET_RECLAIM_MB = 4096.0
+
+FIG4_WORKLOADS = {
+    "batch-heavy": {
+        "batch_size": 256,
+        "input_len": 1024,
+        "output_len": 16,
+        "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
+        "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
+    },
+    "batch_heavy": {
+        "batch_size": 256,
+        "input_len": 1024,
+        "output_len": 16,
+        "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
+        "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
+    },
+    "context-heavy": {
+        "batch_size": 8,
+        "input_len": 32768,
+        "output_len": 16,
+        "dataset_name": "WildChat-1M",
+        "dataset_path": "/data/wenyan/.cache/huggingface/allenai___wild_chat-1_m",
+    },
+    "context_heavy": {
+        "batch_size": 8,
+        "input_len": 32768,
+        "output_len": 16,
+        "dataset_name": "WildChat-1M",
+        "dataset_path": "/data/wenyan/.cache/huggingface/allenai___wild_chat-1_m",
+    },
+}
+
+
+def apply_fig4_workload(args: Any) -> None:
+    preset = FIG4_WORKLOADS.get(args.workload)
+    args.fig4_aligned = preset is not None
+    if preset is None:
+        args.fig4_dataset_name = ""
+        args.fig4_dataset_path = ""
+        return
+    args.batch_size = int(preset["batch_size"])
+    args.input_len = int(preset["input_len"])
+    args.output_len = int(preset["output_len"])
+    args.fig4_dataset_name = str(preset["dataset_name"])
+    args.fig4_dataset_path = str(preset["dataset_path"])
+    # bench_one_batch skips rows whose batch size exceeds
+    # max_total_tokens / (input_len + output_len). Keep the Fig4 workload fixed
+    # and only enlarge the static pool enough for that workload shape.
+    min_total_tokens = args.batch_size * (args.input_len + args.output_len)
+    if getattr(args, "max_total_tokens", 0) <= 0:
+        args.max_total_tokens = min_total_tokens + args.output_len
+    if getattr(args, "max_running_requests", 0) <= 0:
+        args.max_running_requests = args.batch_size
+    if getattr(args, "mem_fraction_static", 0.0) <= 0.0:
+        args.mem_fraction_static = 0.90
+
 
 def parse_layerkv_stats(text: str) -> List[Dict[str, Any]]:
     stats: List[Dict[str, Any]] = []
@@ -52,7 +109,7 @@ def parse_benchmark_latencies(text: str) -> Dict[str, float]:
 
 
 def base_command(args: Any, result_path: Path) -> List[str]:
-    return [
+    cmd = [
         sys.executable,
         "-m",
         "sglang.bench_one_batch",
@@ -75,6 +132,13 @@ def base_command(args: Any, result_path: Path) -> List[str]:
         "--log-level",
         args.log_level,
     ]
+    if getattr(args, "max_total_tokens", 0) > 0:
+        cmd.extend(["--max-total-tokens", str(args.max_total_tokens)])
+    if getattr(args, "max_running_requests", 0) > 0:
+        cmd.extend(["--max-running-requests", str(args.max_running_requests)])
+    if getattr(args, "mem_fraction_static", 0.0) > 0.0:
+        cmd.extend(["--mem-fraction-static", str(args.mem_fraction_static)])
+    return cmd
 
 
 def layerkv_flags(
