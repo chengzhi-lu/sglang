@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
 import logging
 import math
 import time
@@ -86,6 +87,10 @@ class LayerKVStats:
     expert_materialize_ms: float = 0.0
     expert_materialize_async_count: int = 0
     expert_materialize_host_sync_count: int = 0
+    expert_call_count_total: int = 0
+    expert_prefill_call_count_total: int = 0
+    expert_decode_call_count_total: int = 0
+    expert_hotness_observed: bool = False
     expert_guard_pass: bool = True
     expert_guard_reason: str = ""
     kvc_host_backing_mb: float = 0.0
@@ -131,6 +136,10 @@ class LayerKVStats:
     layerkv_main_stream_wait_ms: float = 0.0
     layerkv_copy_stream_busy_ms: float = 0.0
     layerkv_python_overhead_ms: float = 0.0
+    observed_batch_size: int = 0
+    avg_prefix_len: float = 0.0
+    decode_steps: int = 0
+    kvc_bytes_per_token_all_layers: int = 0
     comparable: bool = True
     comparability_reason: str = ""
 
@@ -191,6 +200,8 @@ class _LayerKVExpertLayerState:
     logical_to_slot: Dict[int, int]
     slot_to_logical: Dict[int, int]
     lru: Dict[int, int]
+    hotness_prefill: Dict[int, int]
+    hotness_decode: Dict[int, int]
     materialize_step: int = 0
 
     @property
@@ -376,6 +387,8 @@ class LayerKVRuntime:
         self._expert_modules: List[Tuple[int, Any]] = []
         self._expert_plan_applied: bool = False
         self._pending_expert_copy_events: List[Tuple[Any, Any]] = []
+        self._current_forward_mode: str = ""
+        self._last_forward_batch: Any = None
         self._decode_step: int = 0
 
     @classmethod
@@ -782,6 +795,8 @@ class LayerKVRuntime:
             logical_to_slot=logical_to_slot,
             slot_to_logical=slot_to_logical,
             lru=lru,
+            hotness_prefill={},
+            hotness_decode={},
         )
 
         @functools.wraps(module.run_moe_core)
@@ -863,6 +878,7 @@ class LayerKVRuntime:
             self.stats.expert_guard_pass = False
             self.stats.expert_guard_reason = reason
             raise RuntimeError(reason)
+        self._record_expert_hotness(state, topk_ids)
         logical_ids = self._unique_expert_ids(topk_ids, state.full_num_experts)
         if len(logical_ids) > state.slot_capacity:
             reason = (
@@ -893,6 +909,34 @@ class LayerKVRuntime:
             raise RuntimeError(reason)
         self.stats.expert_topk_rewrite_count += 1
         return topk_output._replace(topk_ids=rewritten_ids)
+
+    def _record_expert_hotness(
+        self, state: _LayerKVExpertLayerState, topk_ids: torch.Tensor
+    ) -> None:
+        if topk_ids.numel() == 0:
+            return
+        ids = topk_ids.detach()
+        ids = ids[(ids >= 0) & (ids < state.full_num_experts)]
+        if ids.numel() == 0:
+            return
+        target = (
+            state.hotness_decode
+            if self._current_forward_mode == "decode"
+            else state.hotness_prefill
+        )
+        values, counts = torch.unique(ids.cpu(), return_counts=True)
+        total = 0
+        for expert_id, count in zip(values.tolist(), counts.tolist()):
+            expert_id = int(expert_id)
+            count = int(count)
+            target[expert_id] = target.get(expert_id, 0) + count
+            total += count
+        self.stats.expert_call_count_total += total
+        if self._current_forward_mode == "decode":
+            self.stats.expert_decode_call_count_total += total
+        else:
+            self.stats.expert_prefill_call_count_total += total
+        self.stats.expert_hotness_observed = True
 
     def _finalize_expert_materialize_events(self, *, block: bool = False) -> None:
         if not self._pending_expert_copy_events:
@@ -1186,18 +1230,33 @@ class LayerKVRuntime:
 
     def on_forward_begin(self, *, mode: str, forward_batch: Any) -> None:
         t0 = time.perf_counter()
+        self._current_forward_mode = mode
+        self._last_forward_batch = forward_batch
+        self._refresh_workload_stats(forward_batch)
         self._finalize_expert_materialize_events(block=False)
         self._finalize_reloaded_entries(block=False)
         if mode == "decode":
             self._apply_expert_plan_once(forward_batch)
             self.stats.forward_decode_count += 1
             self._decode_step += 1
+            self.stats.decode_steps = self._decode_step
             self._reload_required_kvc(forward_batch)
         else:
             self.stats.forward_extend_count += 1
             self._drop_entries_for_reqs(forward_batch)
         self.stats.scheduler_invocation_count += 1
         self.stats.layerkv_python_overhead_ms += (time.perf_counter() - t0) * 1000.0
+
+    def _refresh_workload_stats(self, forward_batch: Any) -> None:
+        pairs = self._batch_req_indices_and_lens(forward_batch)
+        self.stats.observed_batch_size = len(pairs)
+        if pairs:
+            self.stats.avg_prefix_len = sum(
+                max(0, seq_len - 1) for _, seq_len in pairs
+            ) / float(len(pairs))
+        self.stats.kvc_bytes_per_token_all_layers = int(
+            self._bytes_per_token_all_layers
+        )
 
     def _reload_required_kvc(self, forward_batch: Any) -> None:
         if self.config.mode not in ("kvc-only", "kvc-expert"):
@@ -1727,6 +1786,7 @@ class LayerKVRuntime:
     def summary(self) -> Dict[str, Any]:
         self.validate_kvc_state()
         out = self.stats.as_dict()
+        out.update(self._planner_input_summary())
         out.update(
             {
                 "layerkv_enabled": self.config.enabled,
@@ -1741,3 +1801,54 @@ class LayerKVRuntime:
             }
         )
         return out
+
+    def _planner_input_summary(self) -> Dict[str, Any]:
+        call_by_layer: Dict[str, Dict[str, int]] = {}
+        unique_by_layer: Dict[str, Dict[str, int]] = {}
+        topk_by_layer: Dict[str, int] = {}
+        hotness_topk_by_layer: Dict[str, Dict[str, List[List[int]]]] = {}
+        num_experts_by_layer: Dict[str, int] = {}
+
+        for layer_id, state in sorted(self._expert_layers.items()):
+            layer_key = str(layer_id)
+            prefill_total = int(sum(state.hotness_prefill.values()))
+            decode_total = int(sum(state.hotness_decode.values()))
+            call_by_layer[layer_key] = {
+                "prefill": prefill_total,
+                "decode": decode_total,
+                "total": prefill_total + decode_total,
+            }
+            unique_by_layer[layer_key] = {
+                "prefill": len(state.hotness_prefill),
+                "decode": len(state.hotness_decode),
+                "total": len(set(state.hotness_prefill) | set(state.hotness_decode)),
+            }
+            top_k = int(getattr(state.module, "top_k", 0) or 0)
+            if top_k <= 0:
+                top_k = int(getattr(state.module.moe_runner_config, "top_k", 0) or 0)
+            topk_by_layer[layer_key] = top_k
+            num_experts_by_layer[layer_key] = int(state.full_num_experts)
+            hotness_topk_by_layer[layer_key] = {
+                "prefill": self._hotness_top_items(state.hotness_prefill),
+                "decode": self._hotness_top_items(state.hotness_decode),
+            }
+
+        return {
+            "num_expert_layers": len(self._expert_layers),
+            "num_experts_by_layer": json.dumps(num_experts_by_layer, sort_keys=True),
+            "topk_by_layer": json.dumps(topk_by_layer, sort_keys=True),
+            "expert_call_count_by_layer": json.dumps(call_by_layer, sort_keys=True),
+            "expert_unique_count_by_layer": json.dumps(unique_by_layer, sort_keys=True),
+            "expert_hotness_topk_by_layer": json.dumps(
+                hotness_topk_by_layer, sort_keys=True
+            ),
+        }
+
+    @staticmethod
+    def _hotness_top_items(hotness: Dict[int, int], limit: int = 8) -> List[List[int]]:
+        return [
+            [int(expert_id), int(count)]
+            for expert_id, count in sorted(
+                hotness.items(), key=lambda item: (-item[1], item[0])
+            )[:limit]
+        ]

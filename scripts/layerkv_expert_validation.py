@@ -37,6 +37,19 @@ POLICIES = [
     "layer-aware-joint-dp",
 ]
 
+
+def _hotness_contains_expert(summary: Dict[str, Any], expert_id: int) -> bool:
+    try:
+        hotness = json.loads(str(summary["expert_hotness_topk_by_layer"]))
+    except Exception:
+        return False
+    for layer_hotness in hotness.values():
+        for mode in ("prefill", "decode"):
+            for item in layer_hotness.get(mode, []):
+                if item and int(item[0]) == int(expert_id):
+                    return True
+    return False
+
 CSV_FIELDS = [
     "policy",
     "target_reclaim_mb",
@@ -55,6 +68,20 @@ CSV_FIELDS = [
     "expert_topk_rewrite_count",
     "expert_core_hook_count",
     "expert_materialize_mb_total",
+    "expert_call_count_total",
+    "expert_prefill_call_count_total",
+    "expert_decode_call_count_total",
+    "expert_hotness_observed",
+    "expert_call_count_by_layer",
+    "expert_unique_count_by_layer",
+    "expert_hotness_topk_by_layer",
+    "num_expert_layers",
+    "num_experts_by_layer",
+    "topk_by_layer",
+    "observed_batch_size",
+    "avg_prefix_len",
+    "decode_steps",
+    "kvc_bytes_per_token_all_layers",
     "expert_guard_pass",
     "expert_guard_reason",
     "layerkv_physical_expert_supported",
@@ -181,6 +208,14 @@ def _exercise_policy(policy: str, target_reclaim_mb: float) -> Dict[str, Any]:
             reasons.append("topk_rewrite_count_mismatch")
         if int(summary["expert_core_hook_count"]) != 2:
             reasons.append("core_hook_count_mismatch")
+        if int(summary["expert_call_count_total"]) != 8:
+            reasons.append("expert_hotness_count_mismatch")
+        if int(summary["expert_decode_call_count_total"]) != 8:
+            reasons.append("expert_decode_hotness_count_mismatch")
+        if not bool(summary["expert_hotness_observed"]):
+            reasons.append("expert_hotness_not_observed")
+        if not _hotness_contains_expert(summary, 6):
+            reasons.append("expert_hotness_missing_logical_id")
         if float(summary["physical_expert_reclaim_mb"]) <= 0.0:
             reasons.append("no_physical_expert_reclaim")
         if float(summary["physical_expert_reclaim_mb"]) + 1e-9 < float(
