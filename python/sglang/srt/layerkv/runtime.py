@@ -184,7 +184,7 @@ class _LayerKVExpertLayerState:
     expert_bytes: int
     device: torch.device
     dtype: torch.dtype
-    cpu_params: Dict[str, torch.Tensor]
+    cpu_params: Dict[int, Dict[str, torch.Tensor]]
     param_names: List[str]
     logical_to_slot: Dict[int, int]
     slot_to_logical: Dict[int, int]
@@ -646,20 +646,51 @@ class LayerKVRuntime:
             self.stats.expert_guard_reason = "failed to inspect expert bytes"
             return
 
-        target_bytes = int(target_mb * 1024 * 1024)
-        resident_fraction = 1.0 - min(1.0, max(0.0, target_bytes / float(full_bytes)))
+        slot_capacities = self._plan_expert_slot_capacities(target_mb)
         for layer_id, module in self._expert_modules:
-            full_num_experts = int(module.w13_weight.data.shape[0])
-            top_k = int(getattr(module, "top_k", None) or getattr(module, "top_k", 0) or 0)
-            if top_k <= 0:
-                top_k = int(getattr(module.moe_runner_config, "top_k", 1) or 1)
-            slot_capacity = int(math.ceil(full_num_experts * resident_fraction))
-            slot_capacity = max(1, min(full_num_experts, max(slot_capacity, top_k)))
+            slot_capacity = slot_capacities[layer_id]
             state = self._install_expert_layer_slots(module, layer_id, slot_capacity)
             self._expert_layers[layer_id] = state
         self._expert_plan_applied = True
         self.stats.expert_slot_rebind_count += len(self._expert_layers)
         self._refresh_expert_stats()
+
+    def _plan_expert_slot_capacities(self, target_mb: float) -> Dict[int, int]:
+        target_bytes = max(0, int(target_mb * 1024 * 1024))
+        layer_infos: List[Dict[str, int]] = []
+        for layer_id, module in self._expert_modules:
+            full_num_experts = int(module.w13_weight.data.shape[0])
+            top_k = int(getattr(module, "top_k", 0) or 0)
+            if top_k <= 0:
+                top_k = int(getattr(module.moe_runner_config, "top_k", 1) or 1)
+            min_capacity = max(1, min(full_num_experts, top_k))
+            layer_infos.append(
+                {
+                    "layer_id": int(layer_id),
+                    "capacity": full_num_experts,
+                    "min_capacity": min_capacity,
+                    "expert_bytes": self._expert_bytes(module),
+                }
+            )
+
+        reclaimed = 0
+        # Spread removals across layers while still preferring larger expert slots
+        # for heterogeneous MoE variants.
+        layer_infos.sort(key=lambda x: (-x["expert_bytes"], x["layer_id"]))
+        while reclaimed < target_bytes:
+            progressed = False
+            for info in layer_infos:
+                if reclaimed >= target_bytes:
+                    break
+                if info["capacity"] <= info["min_capacity"]:
+                    continue
+                info["capacity"] -= 1
+                reclaimed += info["expert_bytes"]
+                progressed = True
+            if not progressed:
+                break
+
+        return {info["layer_id"]: info["capacity"] for info in layer_infos}
 
     def _expert_param_names(self, module: Any) -> List[str]:
         names = ["w13_weight", "w2_weight"]
@@ -675,6 +706,13 @@ class LayerKVRuntime:
             total += int(tensor.nbytes)
         return total
 
+    def _expert_bytes(self, module: Any) -> int:
+        total = 0
+        for name in self._expert_param_names(module):
+            tensor = getattr(module, name).data
+            total += int(tensor[0].nbytes)
+        return total
+
     def _install_expert_layer_slots(
         self, module: Any, layer_id: int, slot_capacity: int
     ) -> _LayerKVExpertLayerState:
@@ -685,19 +723,22 @@ class LayerKVRuntime:
         full_num_experts = int(module.w13_weight.data.shape[0])
         device = module.w13_weight.data.device
         dtype = module.w13_weight.data.dtype
-        cpu_params: Dict[str, torch.Tensor] = {}
+        cpu_params: Dict[int, Dict[str, torch.Tensor]] = {}
         expert_bytes = 0
 
         with torch.no_grad():
             for name in param_names:
                 param = getattr(module, name)
-                cpu_params[name] = param.data.detach().to("cpu", copy=True)
                 expert_bytes += int(param.data[0].nbytes)
 
             initial_resident = list(range(slot_capacity))
             logical_to_slot = {expert_id: expert_id for expert_id in initial_resident}
             slot_to_logical = {expert_id: expert_id for expert_id in initial_resident}
             lru = {expert_id: self._decode_step for expert_id in initial_resident}
+            for expert_id in range(slot_capacity, full_num_experts):
+                cpu_params[expert_id] = self._copy_expert_to_cpu(
+                    module, param_names, expert_id
+                )
 
             for name in param_names:
                 param = getattr(module, name)
@@ -750,6 +791,24 @@ class LayerKVRuntime:
         except Exception:
             pass
         return state
+
+    def _copy_expert_to_cpu(
+        self, module: Any, param_names: List[str], expert_id: int
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            name: getattr(module, name).data[expert_id].detach().to("cpu", copy=True)
+            for name in param_names
+        }
+
+    def _copy_slot_to_cpu(
+        self, state: _LayerKVExpertLayerState, slot_id: int
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            name: getattr(state.module, name).data[slot_id].detach().to(
+                "cpu", copy=True
+            )
+            for name in state.param_names
+        }
 
     def _prepare_expert_dispatch_for_core(
         self, state: _LayerKVExpertLayerState, dispatch_output: Any
@@ -832,8 +891,17 @@ class LayerKVRuntime:
             slot_id = self._choose_expert_slot_for_materialize(state, protected)
             evicted = state.slot_to_logical.get(slot_id)
             if evicted is not None:
+                state.cpu_params[int(evicted)] = self._copy_slot_to_cpu(state, slot_id)
                 state.logical_to_slot.pop(evicted, None)
                 state.lru.pop(evicted, None)
+            source_params = state.cpu_params.get(int(logical_id))
+            if source_params is None:
+                reason = (
+                    f"layer {state.layer_id} missing CPU backing for expert {logical_id}"
+                )
+                self.stats.expert_guard_pass = False
+                self.stats.expert_guard_reason = reason
+                raise RuntimeError(reason)
             start = None
             end = None
             if state.device.type == "cuda":
@@ -843,7 +911,8 @@ class LayerKVRuntime:
             with torch.no_grad():
                 for name in state.param_names:
                     dst = getattr(state.module, name).data[slot_id]
-                    dst.copy_(state.cpu_params[name][logical_id], non_blocking=True)
+                    dst.copy_(source_params[name], non_blocking=True)
+            state.cpu_params.pop(int(logical_id), None)
             if end is not None:
                 end.record()
                 end.synchronize()
@@ -892,7 +961,11 @@ class LayerKVRuntime:
             state.physical_reclaim_bytes for state in self._expert_layers.values()
         )
         host_bytes = sum(
-            sum(int(t.nbytes) for t in state.cpu_params.values())
+            sum(
+                int(t.nbytes)
+                for expert_params in state.cpu_params.values()
+                for t in expert_params.values()
+            )
             for state in self._expert_layers.values()
         )
         self.stats.physical_expert_reclaim_mb = reclaim_bytes / float(1024 * 1024)
@@ -912,6 +985,9 @@ class LayerKVRuntime:
             ):
                 self.stats.comparable = False
                 self.stats.comparability_reason = "INSUFFICIENT_EXPERT_RECLAIM"
+            elif self.stats.comparability_reason == "INSUFFICIENT_EXPERT_RECLAIM":
+                self.stats.comparable = True
+                self.stats.comparability_reason = ""
 
     def _allocator_available_size(self) -> int:
         if self._allocator is None:

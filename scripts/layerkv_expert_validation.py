@@ -183,6 +183,12 @@ def _exercise_policy(policy: str, target_reclaim_mb: float) -> Dict[str, Any]:
             reasons.append("core_hook_count_mismatch")
         if float(summary["physical_expert_reclaim_mb"]) <= 0.0:
             reasons.append("no_physical_expert_reclaim")
+        if float(summary["physical_expert_reclaim_mb"]) + 1e-9 < float(
+            summary["planned_expert_reclaim_mb"]
+        ):
+            reasons.append("insufficient_physical_expert_reclaim")
+        if float(summary["expert_host_backing_mb"]) >= 0.000488:
+            reasons.append("cpu_backing_should_be_sparse")
         for layer in runner.model.layers:
             if layer.last_topk_ids is None:
                 reasons.append(f"layer{layer.layer_id}_not_called")
@@ -248,7 +254,7 @@ def write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="outputs/layerkv")
-    parser.add_argument("--target-reclaim-mb", type=float, default=0.0004)
+    parser.add_argument("--target-reclaim-mb", type=float, default=0.00035)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
