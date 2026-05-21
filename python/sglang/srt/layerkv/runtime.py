@@ -14,7 +14,7 @@ import functools
 import logging
 import math
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -72,6 +72,20 @@ class LayerKVStats:
     policy_semantics_reason: str = ""
     planned_kvc_reclaim_mb: float = 0.0
     physical_kvc_reclaim_mb: float = 0.0
+    planned_expert_reclaim_mb: float = 0.0
+    physical_expert_reclaim_mb: float = 0.0
+    expert_host_backing_mb: float = 0.0
+    expert_resident_count: int = 0
+    expert_offloaded_count: int = 0
+    expert_slot_capacity_total: int = 0
+    expert_slot_rebind_count: int = 0
+    expert_materialize_count: int = 0
+    expert_topk_rewrite_count: int = 0
+    expert_core_hook_count: int = 0
+    expert_materialize_mb_total: float = 0.0
+    expert_materialize_ms: float = 0.0
+    expert_guard_pass: bool = True
+    expert_guard_reason: str = ""
     kvc_host_backing_mb: float = 0.0
     kvc_host_capacity_tokens: int = 0
     kvc_host_used_tokens: int = 0
@@ -157,6 +171,41 @@ class _LayerKVResidencyEntry:
         if self.host_slot is None:
             return []
         return [int(self.host_slot)]
+
+
+@dataclasses.dataclass
+class _LayerKVExpertLayerState:
+    layer_id: int
+    module: Any
+    orig_forward: Callable
+    orig_run_moe_core: Callable
+    full_num_experts: int
+    slot_capacity: int
+    expert_bytes: int
+    device: torch.device
+    dtype: torch.dtype
+    cpu_params: Dict[str, torch.Tensor]
+    param_names: List[str]
+    logical_to_slot: Dict[int, int]
+    slot_to_logical: Dict[int, int]
+    lru: Dict[int, int]
+    materialize_step: int = 0
+
+    @property
+    def full_bytes(self) -> int:
+        return int(self.full_num_experts * self.expert_bytes)
+
+    @property
+    def resident_count(self) -> int:
+        return len(self.logical_to_slot)
+
+    @property
+    def offloaded_count(self) -> int:
+        return max(0, self.full_num_experts - self.resident_count)
+
+    @property
+    def physical_reclaim_bytes(self) -> int:
+        return max(0, (self.full_num_experts - self.slot_capacity) * self.expert_bytes)
 
 
 class _LayerKVHostKVStore:
@@ -321,6 +370,9 @@ class LayerKVRuntime:
         self._page_size: int = 1
         self._host_store: Optional[_LayerKVHostKVStore] = None
         self._residency: Dict[Tuple[int, int], _LayerKVResidencyEntry] = {}
+        self._expert_layers: Dict[int, _LayerKVExpertLayerState] = {}
+        self._expert_modules: List[Tuple[int, Any]] = []
+        self._expert_plan_applied: bool = False
         self._decode_step: int = 0
 
     @classmethod
@@ -441,9 +493,61 @@ class LayerKVRuntime:
         model = getattr(runner, "model", None)
         if model is None:
             return
-        # v1 intentionally avoids changing SGLang MoE runner layouts.  The
-        # metadata hook is present so later fixed-slot backends can attach here.
-        self.physical_expert_supported = False
+        if self.config.mode != "kvc-expert":
+            return
+        supported = []
+        unsupported_reasons = []
+        for module in model.modules():
+            if not self._is_supported_fused_moe(module):
+                continue
+            layer_id = int(getattr(module, "layer_id", len(supported)))
+            supported.append((layer_id, module))
+        self._expert_modules = supported
+        if not supported:
+            self.physical_expert_supported = False
+            if not self.unsupported_reason:
+                self.unsupported_reason = "no supported standard FusedMoE layers found"
+            return
+        for layer_id, module in supported:
+            reason = self._expert_layer_unsupported_reason(module)
+            if reason:
+                unsupported_reasons.append(f"layer{layer_id}:{reason}")
+        if unsupported_reasons:
+            self.physical_expert_supported = False
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = ";".join(unsupported_reasons[:8])
+            if not self.unsupported_reason:
+                self.unsupported_reason = self.stats.expert_guard_reason
+            return
+        self.physical_expert_supported = True
+
+    def _is_supported_fused_moe(self, module: Any) -> bool:
+        return (
+            hasattr(module, "w13_weight")
+            and hasattr(module, "w2_weight")
+            and hasattr(module, "forward")
+            and hasattr(module, "run_moe_core")
+            and hasattr(module, "num_local_experts")
+            and hasattr(module, "moe_runner_config")
+        )
+
+    def _expert_layer_unsupported_reason(self, module: Any) -> str:
+        if int(getattr(module, "moe_ep_size", 1) or 1) != 1:
+            return "expert offload v1 supports moe_ep_size=1 only"
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            return "missing quant_method"
+        if quant_method.__class__.__name__ != "UnquantizedFusedMoEMethod":
+            return f"unsupported quant_method={quant_method.__class__.__name__}"
+        w13 = getattr(module, "w13_weight", None)
+        w2 = getattr(module, "w2_weight", None)
+        if w13 is None or w2 is None or w13.data.dim() != 3 or w2.data.dim() != 3:
+            return "expected 3D w13_weight/w2_weight"
+        if int(w13.data.shape[0]) != int(w2.data.shape[0]):
+            return "w13/w2 expert count mismatch"
+        if not w13.data.is_cuda and getattr(self._runner, "device", None) == "cuda":
+            return "expert weights are not on CUDA"
+        return ""
 
     def _avg_prefix_len(self, forward_batch: Any) -> float:
         pairs = self._batch_req_indices_and_lens(forward_batch)
@@ -458,13 +562,13 @@ class LayerKVRuntime:
         if policy == "expert-first":
             return 1.0, 0.0, True, ""
         if policy == "kv-first":
-            return 0.0, 1.0, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+            return 0.0, 1.0, self.physical_expert_supported, self._expert_support_reason()
         if policy == "ratio-75-25":
-            return 0.75, 0.25, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+            return 0.75, 0.25, self.physical_expert_supported, self._expert_support_reason()
         if policy == "ratio-50-50":
-            return 0.50, 0.50, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+            return 0.50, 0.50, self.physical_expert_supported, self._expert_support_reason()
         if policy == "ratio-25-75":
-            return 0.25, 0.75, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+            return 0.25, 0.75, self.physical_expert_supported, self._expert_support_reason()
         if policy == "layer-aware-joint-dp":
             avg_prefix = self._avg_prefix_len(forward_batch)
             if avg_prefix <= 1024:
@@ -476,10 +580,15 @@ class LayerKVRuntime:
             return (
                 kvc_fraction,
                 1.0 - kvc_fraction,
-                False,
-                "layer-aware-joint-dp uses KVC-only heuristic; expert reclaim is not implemented",
+                self.physical_expert_supported,
+                self._expert_support_reason(),
             )
         return 0.0, 0.0, False, f"unknown LayerKV policy: {policy}"
+
+    def _expert_support_reason(self) -> str:
+        if self.physical_expert_supported:
+            return ""
+        return self.stats.expert_guard_reason or self.unsupported_reason or "expert offload unsupported"
 
     def _effective_kvc_reclaim_mb(self, forward_batch: Any) -> float:
         kvc_fraction, expert_fraction, full_supported, reason = self._policy_fractions(
@@ -496,6 +605,313 @@ class LayerKVRuntime:
             self.stats.planned_kvc_reclaim_mb, effective
         )
         return effective
+
+    def _effective_expert_reclaim_mb(self, forward_batch: Any) -> float:
+        kvc_fraction, expert_fraction, full_supported, reason = self._policy_fractions(
+            forward_batch
+        )
+        effective = max(0.0, self.config.target_reclaim_mb * expert_fraction)
+        self.stats.requested_total_reclaim_mb = self.config.target_reclaim_mb
+        self.stats.policy_kvc_fraction = kvc_fraction
+        self.stats.policy_expert_fraction = expert_fraction
+        self.stats.full_policy_semantics_supported = full_supported
+        self.stats.policy_semantics_reason = reason
+        self.stats.planned_expert_reclaim_mb = max(
+            self.stats.planned_expert_reclaim_mb, effective
+        )
+        return effective
+
+    def _apply_expert_plan_once(self, forward_batch: Any) -> None:
+        if self._expert_plan_applied or self.config.mode != "kvc-expert":
+            return
+        target_mb = self._effective_expert_reclaim_mb(forward_batch)
+        if target_mb <= 0:
+            self._expert_plan_applied = True
+            self._refresh_expert_stats()
+            return
+        if not self.physical_expert_supported:
+            self.stats.comparable = False
+            self.stats.comparability_reason = self._expert_support_reason()
+            return
+        if not self._expert_modules:
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = "no supported expert modules discovered"
+            self.stats.comparable = False
+            self.stats.comparability_reason = self.stats.expert_guard_reason
+            return
+
+        full_bytes = sum(self._expert_full_bytes(module) for _, module in self._expert_modules)
+        if full_bytes <= 0:
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = "failed to inspect expert bytes"
+            return
+
+        target_bytes = int(target_mb * 1024 * 1024)
+        resident_fraction = 1.0 - min(1.0, max(0.0, target_bytes / float(full_bytes)))
+        for layer_id, module in self._expert_modules:
+            full_num_experts = int(module.w13_weight.data.shape[0])
+            top_k = int(getattr(module, "top_k", None) or getattr(module, "top_k", 0) or 0)
+            if top_k <= 0:
+                top_k = int(getattr(module.moe_runner_config, "top_k", 1) or 1)
+            slot_capacity = int(math.ceil(full_num_experts * resident_fraction))
+            slot_capacity = max(1, min(full_num_experts, max(slot_capacity, top_k)))
+            state = self._install_expert_layer_slots(module, layer_id, slot_capacity)
+            self._expert_layers[layer_id] = state
+        self._expert_plan_applied = True
+        self.stats.expert_slot_rebind_count += len(self._expert_layers)
+        self._refresh_expert_stats()
+
+    def _expert_param_names(self, module: Any) -> List[str]:
+        names = ["w13_weight", "w2_weight"]
+        for optional in ("w13_weight_bias", "w2_weight_bias"):
+            if hasattr(module, optional):
+                names.append(optional)
+        return names
+
+    def _expert_full_bytes(self, module: Any) -> int:
+        total = 0
+        for name in self._expert_param_names(module):
+            tensor = getattr(module, name).data
+            total += int(tensor.nbytes)
+        return total
+
+    def _install_expert_layer_slots(
+        self, module: Any, layer_id: int, slot_capacity: int
+    ) -> _LayerKVExpertLayerState:
+        if getattr(module, "_layerkv_expert_wrapped", False):
+            return self._expert_layers[layer_id]
+
+        param_names = self._expert_param_names(module)
+        full_num_experts = int(module.w13_weight.data.shape[0])
+        device = module.w13_weight.data.device
+        dtype = module.w13_weight.data.dtype
+        cpu_params: Dict[str, torch.Tensor] = {}
+        expert_bytes = 0
+
+        with torch.no_grad():
+            for name in param_names:
+                param = getattr(module, name)
+                cpu_params[name] = param.data.detach().to("cpu", copy=True)
+                expert_bytes += int(param.data[0].nbytes)
+
+            initial_resident = list(range(slot_capacity))
+            logical_to_slot = {expert_id: expert_id for expert_id in initial_resident}
+            slot_to_logical = {expert_id: expert_id for expert_id in initial_resident}
+            lru = {expert_id: self._decode_step for expert_id in initial_resident}
+
+            for name in param_names:
+                param = getattr(module, name)
+                old = param.data
+                new_data = torch.empty(
+                    (slot_capacity,) + tuple(old.shape[1:]),
+                    dtype=old.dtype,
+                    device=old.device,
+                )
+                if slot_capacity > 0:
+                    new_data.copy_(old[:slot_capacity])
+                param.data = new_data
+
+        state = _LayerKVExpertLayerState(
+            layer_id=layer_id,
+            module=module,
+            orig_forward=module.forward,
+            orig_run_moe_core=module.run_moe_core,
+            full_num_experts=full_num_experts,
+            slot_capacity=slot_capacity,
+            expert_bytes=expert_bytes,
+            device=device,
+            dtype=dtype,
+            cpu_params=cpu_params,
+            param_names=param_names,
+            logical_to_slot=logical_to_slot,
+            slot_to_logical=slot_to_logical,
+            lru=lru,
+        )
+
+        @functools.wraps(module.run_moe_core)
+        def wrapped_run_moe_core(dispatch_output: Any, *args, **kwargs):
+            rewritten_dispatch = self._prepare_expert_dispatch_for_core(
+                state, dispatch_output
+            )
+            return state.orig_run_moe_core(rewritten_dispatch, *args, **kwargs)
+
+        module.run_moe_core = wrapped_run_moe_core
+        module._layerkv_expert_wrapped = True
+        module._layerkv_expert_state = state
+
+        try:
+            module.num_experts = slot_capacity
+            module.num_local_experts = slot_capacity
+            module.moe_runner_config.num_experts = slot_capacity
+            module.moe_runner_config.num_local_experts = slot_capacity
+            module.dispatcher.num_experts = slot_capacity
+            module.dispatcher.num_local_experts = slot_capacity
+            module.dispatcher.num_local_routed_experts = slot_capacity
+        except Exception:
+            pass
+        return state
+
+    def _prepare_expert_dispatch_for_core(
+        self, state: _LayerKVExpertLayerState, dispatch_output: Any
+    ) -> Any:
+        topk_output = getattr(dispatch_output, "topk_output", None)
+        if topk_output is None:
+            return dispatch_output
+        rewritten_topk = self._prepare_expert_layer_for_topk(state, topk_output)
+        self.stats.expert_core_hook_count += 1
+        if rewritten_topk is topk_output:
+            return dispatch_output
+        if hasattr(dispatch_output, "_replace"):
+            return dispatch_output._replace(topk_output=rewritten_topk)
+        reason = (
+            f"layer {state.layer_id} dispatch output does not support topk rewrite"
+        )
+        self.stats.expert_guard_pass = False
+        self.stats.expert_guard_reason = reason
+        raise RuntimeError(reason)
+
+    def _prepare_expert_layer_for_topk(self, state: _LayerKVExpertLayerState, topk_output: Any) -> Any:
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        if topk_ids is None:
+            return topk_output
+        if bool((topk_ids >= state.full_num_experts).any().item()):
+            reason = f"layer {state.layer_id} produced out-of-range expert id"
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = reason
+            raise RuntimeError(reason)
+        logical_ids = self._unique_expert_ids(topk_ids, state.full_num_experts)
+        if len(logical_ids) > state.slot_capacity:
+            reason = (
+                f"layer {state.layer_id} needs {len(logical_ids)} unique experts "
+                f"but slot capacity is {state.slot_capacity}"
+            )
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = reason
+            self.stats.comparable = False
+            self.stats.comparability_reason = reason
+            raise RuntimeError(reason)
+        self._materialize_experts(state, logical_ids)
+        remap = torch.full(
+            (state.full_num_experts,),
+            -1,
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        for logical_id, slot_id in state.logical_to_slot.items():
+            remap[int(logical_id)] = int(slot_id)
+        valid = (topk_ids >= 0) & (topk_ids < state.full_num_experts)
+        safe_ids = topk_ids.clamp(min=0, max=state.full_num_experts - 1).long()
+        rewritten_ids = torch.where(valid, remap[safe_ids], topk_ids)
+        if bool((rewritten_ids < 0).any().item()):
+            reason = f"layer {state.layer_id} produced unmapped expert id"
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = reason
+            raise RuntimeError(reason)
+        self.stats.expert_topk_rewrite_count += 1
+        return topk_output._replace(topk_ids=rewritten_ids)
+
+    def _unique_expert_ids(self, topk_ids: torch.Tensor, full_num_experts: int) -> List[int]:
+        if topk_ids.numel() == 0:
+            return []
+        ids = topk_ids.detach()
+        ids = ids[(ids >= 0) & (ids < full_num_experts)]
+        if ids.numel() == 0:
+            return []
+        return [int(x) for x in torch.unique(ids).detach().cpu().tolist()]
+
+    def _materialize_experts(
+        self, state: _LayerKVExpertLayerState, logical_ids: List[int]
+    ) -> None:
+        if not logical_ids:
+            return
+        protected = set(int(x) for x in logical_ids)
+        for logical_id in logical_ids:
+            if logical_id in state.logical_to_slot:
+                state.lru[logical_id] = self._decode_step
+                continue
+            slot_id = self._choose_expert_slot_for_materialize(state, protected)
+            evicted = state.slot_to_logical.get(slot_id)
+            if evicted is not None:
+                state.logical_to_slot.pop(evicted, None)
+                state.lru.pop(evicted, None)
+            start = None
+            end = None
+            if state.device.type == "cuda":
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+            with torch.no_grad():
+                for name in state.param_names:
+                    dst = getattr(state.module, name).data[slot_id]
+                    dst.copy_(state.cpu_params[name][logical_id], non_blocking=True)
+            if end is not None:
+                end.record()
+                end.synchronize()
+                try:
+                    elapsed = float(start.elapsed_time(end))
+                    self.stats.expert_materialize_ms += elapsed
+                    self.stats.layerkv_copy_stream_busy_ms += elapsed
+                except Exception:
+                    pass
+            state.logical_to_slot[logical_id] = slot_id
+            state.slot_to_logical[slot_id] = logical_id
+            state.lru[logical_id] = self._decode_step
+            state.materialize_step += 1
+            self.stats.expert_materialize_count += 1
+            self.stats.layerkv_expert_materialize_started += 1
+            self.stats.layerkv_tasks_built += 1
+            self.stats.expert_materialize_mb_total += state.expert_bytes / float(1024 * 1024)
+
+    def _choose_expert_slot_for_materialize(
+        self, state: _LayerKVExpertLayerState, protected: Set[int]
+    ) -> int:
+        free = [
+            slot_id
+            for slot_id in range(state.slot_capacity)
+            if slot_id not in state.slot_to_logical
+        ]
+        if free:
+            return free[0]
+        candidates = [
+            (state.lru.get(logical_id, -1), slot_id, logical_id)
+            for slot_id, logical_id in state.slot_to_logical.items()
+            if logical_id not in protected
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"layer {state.layer_id} has no evictable expert slot for materialization"
+            )
+        candidates.sort()
+        return int(candidates[0][1])
+
+    def _refresh_expert_stats(self) -> None:
+        if not self._expert_layers:
+            return
+        full_bytes = sum(state.full_bytes for state in self._expert_layers.values())
+        reclaim_bytes = sum(
+            state.physical_reclaim_bytes for state in self._expert_layers.values()
+        )
+        host_bytes = sum(
+            sum(int(t.nbytes) for t in state.cpu_params.values())
+            for state in self._expert_layers.values()
+        )
+        self.stats.physical_expert_reclaim_mb = reclaim_bytes / float(1024 * 1024)
+        self.stats.expert_host_backing_mb = host_bytes / float(1024 * 1024)
+        self.stats.expert_slot_capacity_total = sum(
+            state.slot_capacity for state in self._expert_layers.values()
+        )
+        self.stats.expert_resident_count = sum(
+            state.resident_count for state in self._expert_layers.values()
+        )
+        self.stats.expert_offloaded_count = sum(
+            state.offloaded_count for state in self._expert_layers.values()
+        )
+        if full_bytes > 0 and self.stats.planned_expert_reclaim_mb > 0:
+            if self.stats.physical_expert_reclaim_mb + 1e-3 < min(
+                self.stats.planned_expert_reclaim_mb, full_bytes / float(1024 * 1024)
+            ):
+                self.stats.comparable = False
+                self.stats.comparability_reason = "INSUFFICIENT_EXPERT_RECLAIM"
 
     def _allocator_available_size(self) -> int:
         if self._allocator is None:
@@ -645,6 +1061,7 @@ class LayerKVRuntime:
         t0 = time.perf_counter()
         self._finalize_reloaded_entries(block=False)
         if mode == "decode":
+            self._apply_expert_plan_once(forward_batch)
             self.stats.forward_decode_count += 1
             self._decode_step += 1
             self._reload_required_kvc(forward_batch)
@@ -1190,6 +1607,7 @@ class LayerKVRuntime:
                 "layerkv_kvc_scheduler": self.config.kvc_scheduler,
                 "layerkv_physical_kvc_supported": self.physical_kvc_supported,
                 "layerkv_physical_expert_supported": self.physical_expert_supported,
+                "layerkv_expert_layer_count": len(self._expert_layers),
                 "layerkv_unsupported_reason": self.unsupported_reason,
             }
         )

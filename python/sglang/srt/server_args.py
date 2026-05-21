@@ -6384,7 +6384,7 @@ class ServerArgs:
                 "layer-aware-joint-dp",
             ],
             default=ServerArgs.layerkv_policy,
-            help="LayerKV policy. In the current SGLang v1 integration, this controls the executable KVC reclaim fraction; expert reclaim is reported as unsupported.",
+            help="LayerKV policy. In kvc-expert mode, ratio and joint policies split target reclaim between physical KVC and supported standard FusedMoE expert slots.",
         )
         parser.add_argument(
             "--layerkv-target-reclaim-mb",

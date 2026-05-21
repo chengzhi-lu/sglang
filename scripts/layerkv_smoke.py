@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from collections import namedtuple
 from importlib import util
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -86,6 +88,104 @@ def main() -> int:
     assert summary["kvc_set_kv_count"] == 1
     assert summary["kvc_get_kv_count"] == 1
     assert summary["kvc_tokens_written"] == 2
+
+    class UnquantizedFusedMoEMethod:
+        pass
+
+    TopKOut = namedtuple("TopKOut", ["topk_weights", "topk_ids", "router_logits"])
+    DispatchOut = namedtuple(
+        "DispatchOut", ["hidden_states", "hidden_states_scale", "topk_output"]
+    )
+
+    class FakeFusedMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_id = 0
+            self.top_k = 2
+            self.moe_ep_size = 1
+            self.num_experts = 4
+            self.num_local_experts = 4
+            self.quant_method = UnquantizedFusedMoEMethod()
+            self.moe_runner_config = SimpleNamespace(
+                top_k=2,
+                num_experts=4,
+                num_local_experts=4,
+            )
+            self.dispatcher = SimpleNamespace(
+                num_experts=4,
+                num_local_experts=4,
+                num_local_routed_experts=4,
+            )
+            self.w13_weight = torch.nn.Parameter(
+                torch.arange(16, dtype=torch.float32).view(4, 2, 2),
+                requires_grad=False,
+            )
+            self.w2_weight = torch.nn.Parameter(
+                torch.arange(16, 32, dtype=torch.float32).view(4, 2, 2),
+                requires_grad=False,
+            )
+            self.last_topk_ids = None
+
+        def forward(self, hidden_states, topk_output):
+            dispatch_output = DispatchOut(hidden_states, None, topk_output)
+            return self.run_moe_core(dispatch_output)
+
+        def run_moe_core(self, dispatch_output):
+            topk_output = dispatch_output.topk_output
+            self.last_topk_ids = topk_output.topk_ids.detach().clone()
+            return dispatch_output.hidden_states
+
+    class ExpertRunner:
+        device = "cpu"
+        token_to_kv_pool = None
+        token_to_kv_pool_allocator = None
+        req_to_token_pool = None
+
+        def __init__(self):
+            self.model = torch.nn.Module()
+            self.model.moe = FakeFusedMoE()
+
+    expert_args = Namespace(
+        enable_layerkv=True,
+        layerkv_mode="kvc-expert",
+        layerkv_policy="kv-first",
+        layerkv_target_reclaim_mb=0.00008,
+        layerkv_kvc_block_tokens=16,
+        layerkv_kvc_scheduler="async-deadline",
+        layerkv_debug_stats=True,
+        layerkv_disallow_destructive_fallback=True,
+    )
+    expert_rt = LayerKVRuntime(LayerKVConfig.from_server_args(expert_args))
+    expert_runner = ExpertRunner()
+    expert_rt.install_on_runner(expert_runner)
+    expert_rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    assert expert_runner.model.moe.w13_weight.shape[0] < 4
+    topk = TopKOut(
+        topk_weights=torch.ones((1, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[2, 3]], dtype=torch.int32),
+        router_logits=torch.empty((1, 4), dtype=torch.float32),
+    )
+    expert_runner.model.moe(torch.zeros((1, 2), dtype=torch.float32), topk)
+    assert int(expert_rt.summary()["expert_materialize_count"]) >= 1
+    assert int(expert_rt.summary()["expert_core_hook_count"]) >= 1
+    assert int(expert_rt.summary()["expert_topk_rewrite_count"]) >= 1
+    assert (
+        expert_runner.model.moe.last_topk_ids.max().item()
+        < expert_runner.model.moe.w13_weight.shape[0]
+    )
+    dispatch_topk = TopKOut(
+        topk_weights=torch.ones((1, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+        router_logits=torch.empty((1, 4), dtype=torch.float32),
+    )
+    expert_runner.model.moe.run_moe_core(
+        DispatchOut(torch.zeros((1, 2), dtype=torch.float32), None, dispatch_topk)
+    )
+    assert (
+        expert_runner.model.moe.last_topk_ids.max().item()
+        < expert_runner.model.moe.w13_weight.shape[0]
+    )
+    assert expert_rt.summary()["layerkv_physical_expert_supported"] is True
     print("layerkv smoke ok", rt.summary())
     return 0
 
