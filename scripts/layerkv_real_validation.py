@@ -9,22 +9,18 @@ the full evict -> reload -> req_to_token rewrite lifecycle.
 from __future__ import annotations
 
 import argparse
-import ast
-import csv
 import json
-import os
 from pathlib import Path
-import re
-import subprocess
-import sys
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 
-
-DEFAULT_MODEL_PATH = (
-    "/data/wenyan/.cache/huggingface/hub/"
-    "models--Qwen--Qwen3-30B-A3B/"
-    "snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+from layerkv_eval_common import (
+    DEFAULT_MODEL_PATH,
+    base_command,
+    layerkv_flags,
+    run_bench_command,
+    write_csv,
 )
+
 
 CSV_FIELDS = [
     "scenario",
@@ -69,63 +65,6 @@ CSV_FIELDS = [
 ]
 
 
-def parse_layerkv_stats(text: str) -> List[Dict[str, Any]]:
-    stats: List[Dict[str, Any]] = []
-    marker = "LayerKV stats after "
-    for line in text.splitlines():
-        if marker not in line:
-            continue
-        try:
-            payload = line.split(": ", 1)[1]
-            parsed = ast.literal_eval(payload)
-        except Exception:
-            continue
-        if isinstance(parsed, dict):
-            stats.append(parsed)
-    return stats
-
-
-def parse_benchmark_latencies(text: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    match = re.search(r"Benchmark .*?Prefill\. latency:\s*([0-9.]+) s", text, re.S)
-    if match:
-        out["benchmark_prefill_latency_s"] = float(match.group(1))
-    match = re.search(
-        r"Benchmark .*?Decode 0\. Batch size: \d+, latency:\s*([0-9.]+) s",
-        text,
-        re.S,
-    )
-    if match:
-        out["benchmark_decode0_latency_s"] = float(match.group(1))
-    return out
-
-
-def base_command(args: argparse.Namespace, result_path: Path) -> List[str]:
-    return [
-        sys.executable,
-        "-m",
-        "sglang.bench_one_batch",
-        "--model-path",
-        args.model_path,
-        "--batch-size",
-        str(args.batch_size),
-        "--input-len",
-        str(args.input_len),
-        "--output-len",
-        str(args.output_len),
-        "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
-        "--moe-a2a-backend",
-        "none",
-        "--moe-runner-backend",
-        "triton",
-        "--result-filename",
-        str(result_path),
-        "--log-level",
-        args.log_level,
-    ]
-
-
 def scenario_command(
     args: argparse.Namespace, scenario: str, result_path: Path
 ) -> List[str]:
@@ -133,35 +72,19 @@ def scenario_command(
     if scenario == "baseline":
         return cmd
     if scenario == "kvc_only_reload":
-        return cmd + [
-            "--enable-layerkv",
-            "--layerkv-mode",
-            "kvc-only",
-            "--layerkv-policy",
-            "layer-aware-joint-dp",
-            "--layerkv-target-reclaim-mb",
-            str(args.kvc_target_reclaim_mb),
-            "--layerkv-kvc-block-tokens",
-            str(args.kvc_block_tokens),
-            "--layerkv-kvc-scheduler",
-            "async-deadline",
-            "--layerkv-debug-stats",
-        ]
+        return cmd + layerkv_flags(
+            mode="kvc-only",
+            policy="layer-aware-joint-dp",
+            target_reclaim_mb=args.kvc_target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
     if scenario == "kvc_expert_kv_first":
-        return cmd + [
-            "--enable-layerkv",
-            "--layerkv-mode",
-            "kvc-expert",
-            "--layerkv-policy",
-            "kv-first",
-            "--layerkv-target-reclaim-mb",
-            str(args.expert_target_reclaim_mb),
-            "--layerkv-kvc-block-tokens",
-            str(args.kvc_block_tokens),
-            "--layerkv-kvc-scheduler",
-            "async-deadline",
-            "--layerkv-debug-stats",
-        ]
+        return cmd + layerkv_flags(
+            mode="kvc-expert",
+            policy="kv-first",
+            target_reclaim_mb=args.expert_target_reclaim_mb,
+            kvc_block_tokens=args.kvc_block_tokens,
+        )
     raise ValueError(f"unknown scenario: {scenario}")
 
 
@@ -217,54 +140,31 @@ def run_scenario(
         path.unlink(missing_ok=True)
 
     cmd = scenario_command(args, scenario, result_path)
-    env = os.environ.copy()
-    env["PYTHONNOUSERSITE"] = "1"
-    env["CUDA_VISIBLE_DEVICES"] = args.gpu
-    env["TMPDIR"] = args.tmpdir
-    repo_python = str(Path.cwd() / "python")
-    env["PYTHONPATH"] = (
-        repo_python if not env.get("PYTHONPATH") else repo_python + os.pathsep + env["PYTHONPATH"]
+    result = run_bench_command(
+        cmd=cmd,
+        output_dir=output_dir,
+        run_name=scenario,
+        args=args,
     )
-
-    proc = subprocess.run(
-        cmd,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=args.timeout_s,
-    )
-    stdout_path.write_text(proc.stdout)
-    stderr_path.write_text(proc.stderr)
-
-    text = proc.stdout + "\n" + proc.stderr
-    stats = parse_layerkv_stats(text)
-    final_stats = stats[-1] if stats else {}
-    valid, reason = validate_scenario(scenario, proc.returncode, final_stats)
+    final_stats = result["final_stats"]
+    valid, reason = validate_scenario(scenario, result["returncode"], final_stats)
 
     row: Dict[str, Any] = {field: "" for field in CSV_FIELDS}
-    row.update(parse_benchmark_latencies(text))
+    row.update(result["latencies"])
     row.update(final_stats)
     row.update(
         {
             "scenario": scenario,
-            "returncode": proc.returncode,
+            "returncode": result["returncode"],
             "valid": valid,
             "validation_reason": reason,
-            "stats_line_count": len(stats),
+            "stats_line_count": result["stats_line_count"],
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
             "result_path": str(result_path),
         }
     )
     return row
-
-
-def write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
 
 
 def main() -> int:
@@ -305,7 +205,7 @@ def main() -> int:
 
     csv_path = output_dir / "real_validation.csv"
     summary_path = output_dir / "real_validation_summary.json"
-    write_csv(csv_path, rows)
+    write_csv(csv_path, rows, CSV_FIELDS)
     invalid = [row for row in rows if str(row.get("valid")) != "True"]
     summary = {
         "csv": str(csv_path),
