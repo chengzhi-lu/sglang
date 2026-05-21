@@ -669,6 +669,23 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # LayerKV experimental residency controller
+    enable_layerkv: bool = False
+    layerkv_mode: Literal["off", "kvc-only", "kvc-expert"] = "off"
+    layerkv_policy: Literal[
+        "none",
+        "expert-first",
+        "kv-first",
+        "ratio-25-75",
+        "ratio-50-50",
+        "ratio-75-25",
+        "layer-aware-joint-dp",
+    ] = "none"
+    layerkv_target_reclaim_mb: float = 0.0
+    layerkv_kvc_block_tokens: int = 16
+    layerkv_debug_stats: bool = False
+    layerkv_disallow_destructive_fallback: bool = True
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -955,6 +972,7 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+        self._handle_layerkv()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -3472,6 +3490,38 @@ class ServerArgs:
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
+
+    def _handle_layerkv(self):
+        """Normalize experimental LayerKV residency settings."""
+        if not self.enable_layerkv:
+            self.layerkv_mode = "off"
+            self.layerkv_policy = "none"
+            self.layerkv_target_reclaim_mb = 0.0
+            return
+
+        if self.layerkv_mode == "off":
+            logger.warning("--enable-layerkv is set but --layerkv-mode=off")
+            return
+
+        if self.layerkv_policy == "none":
+            logger.warning(
+                "--enable-layerkv is active with --layerkv-policy=none; "
+                "the runtime will install accounting hooks only."
+            )
+
+        if self.layerkv_target_reclaim_mb < 0:
+            raise ValueError("--layerkv-target-reclaim-mb must be non-negative")
+
+        if self.layerkv_kvc_block_tokens <= 0:
+            raise ValueError("--layerkv-kvc-block-tokens must be positive")
+
+        # v1 recovery is scheduled outside graph capture.
+        if not self.disable_cuda_graph:
+            logger.warning("LayerKV v1 disables CUDA graph for correctness.")
+            self.disable_cuda_graph = True
+        if not self.disable_piecewise_cuda_graph:
+            logger.warning("LayerKV v1 disables piecewise CUDA graph for correctness.")
+            self.disable_piecewise_cuda_graph = True
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -6301,6 +6351,58 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+
+        # LayerKV experimental residency controller
+        parser.add_argument(
+            "--enable-layerkv",
+            action="store_true",
+            help="Enable the experimental layer-aware KV/expert residency controller.",
+        )
+        parser.add_argument(
+            "--layerkv-mode",
+            type=str,
+            choices=["off", "kvc-only", "kvc-expert"],
+            default=ServerArgs.layerkv_mode,
+            help="LayerKV runtime mode. v1 supports runnable KVC accounting hooks and expert metadata hooks.",
+        )
+        parser.add_argument(
+            "--layerkv-policy",
+            type=str,
+            choices=[
+                "none",
+                "expert-first",
+                "kv-first",
+                "ratio-25-75",
+                "ratio-50-50",
+                "ratio-75-25",
+                "layer-aware-joint-dp",
+            ],
+            default=ServerArgs.layerkv_policy,
+            help="LayerKV policy label to install in runtime metadata.",
+        )
+        parser.add_argument(
+            "--layerkv-target-reclaim-mb",
+            type=float,
+            default=ServerArgs.layerkv_target_reclaim_mb,
+            help="Target GPU memory pressure/reclaim in MB for LayerKV planning.",
+        )
+        parser.add_argument(
+            "--layerkv-kvc-block-tokens",
+            type=int,
+            default=ServerArgs.layerkv_kvc_block_tokens,
+            help="Logical KV block size used by LayerKV residency metadata.",
+        )
+        parser.add_argument(
+            "--layerkv-debug-stats",
+            action="store_true",
+            help="Emit verbose LayerKV runtime stats in debug logs.",
+        )
+        parser.add_argument(
+            "--layerkv-disallow-destructive-fallback",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.layerkv_disallow_destructive_fallback,
+            help="Fail future physical LayerKV paths if they attempt destructive KV pointer replacement.",
         )
 
         # Hierarchical sparse attention

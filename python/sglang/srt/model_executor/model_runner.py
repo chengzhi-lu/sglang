@@ -747,6 +747,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+        self.init_layerkv_runtime()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -825,6 +826,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def init_layerkv_runtime(self):
+        self.layerkv_runtime = None
+        try:
+            from sglang.srt.layerkv import LayerKVRuntime
+
+            runtime = LayerKVRuntime.maybe_create(self.server_args)
+            if runtime is not None:
+                runtime.install_on_runner(self)
+                self.layerkv_runtime = runtime
+        except Exception:
+            logger.exception("Failed to initialize LayerKV runtime")
+            raise
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -3162,13 +3176,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device_timer
             else contextlib.nullcontext()
         )
+        layerkv_runtime = getattr(self, "layerkv_runtime", None)
+        if layerkv_runtime is not None:
+            layerkv_runtime.on_forward_begin(mode="decode", forward_batch=forward_batch)
         with ctx:
-            return self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            try:
+                return self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+            finally:
+                if layerkv_runtime is not None:
+                    layerkv_runtime.on_forward_end(
+                        mode="decode", forward_batch=forward_batch
+                    )
 
     def forward_extend(
         self,
@@ -3229,13 +3252,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device_timer
             else contextlib.nullcontext()
         )
+        layerkv_runtime = getattr(self, "layerkv_runtime", None)
+        if layerkv_runtime is not None:
+            layerkv_runtime.on_forward_begin(mode="extend", forward_batch=forward_batch)
         with ctx:
-            ret = self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            try:
+                ret = self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+            finally:
+                if layerkv_runtime is not None:
+                    layerkv_runtime.on_forward_end(
+                        mode="extend", forward_batch=forward_batch
+                    )
         return (ret, can_run_graph)
 
     def forward_idle(
