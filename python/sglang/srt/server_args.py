@@ -679,6 +679,7 @@ class ServerArgs:
         "ratio-25-75",
         "ratio-50-50",
         "ratio-75-25",
+        "layer-aware-joint",
         "layer-aware-joint-dp",
     ] = "none"
     layerkv_target_reclaim_mb: float = 0.0
@@ -6381,6 +6382,7 @@ class ServerArgs:
                 "ratio-25-75",
                 "ratio-50-50",
                 "ratio-75-25",
+                "layer-aware-joint",
                 "layer-aware-joint-dp",
             ],
             default=ServerArgs.layerkv_policy,

@@ -56,6 +56,8 @@ CSV_FIELDS = [
     "expert_materialize_count",
     "expert_topk_rewrite_count",
     "expert_core_hook_count",
+    "expert_materialize_async_count",
+    "expert_materialize_host_sync_count",
     "expert_guard_pass",
     "expert_guard_reason",
     "comparable",

@@ -84,6 +84,8 @@ class LayerKVStats:
     expert_core_hook_count: int = 0
     expert_materialize_mb_total: float = 0.0
     expert_materialize_ms: float = 0.0
+    expert_materialize_async_count: int = 0
+    expert_materialize_host_sync_count: int = 0
     expert_guard_pass: bool = True
     expert_guard_reason: str = ""
     kvc_host_backing_mb: float = 0.0
@@ -373,6 +375,7 @@ class LayerKVRuntime:
         self._expert_layers: Dict[int, _LayerKVExpertLayerState] = {}
         self._expert_modules: List[Tuple[int, Any]] = []
         self._expert_plan_applied: bool = False
+        self._pending_expert_copy_events: List[Tuple[Any, Any]] = []
         self._decode_step: int = 0
 
     @classmethod
@@ -559,6 +562,18 @@ class LayerKVRuntime:
         policy = self.config.policy
         if policy == "none":
             return 0.0, 0.0, True, "policy=none disables LayerKV physical reclaim"
+        if self.config.mode == "kvc-only":
+            if policy in (
+                "expert-first",
+                "kv-first",
+                "ratio-75-25",
+                "ratio-50-50",
+                "ratio-25-75",
+                "layer-aware-joint",
+                "layer-aware-joint-dp",
+            ):
+                return 1.0, 0.0, True, ""
+            return 0.0, 0.0, False, f"unknown LayerKV policy: {policy}"
         if policy == "expert-first":
             return 1.0, 0.0, True, ""
         if policy == "kv-first":
@@ -569,7 +584,7 @@ class LayerKVRuntime:
             return 0.50, 0.50, self.physical_expert_supported, self._expert_support_reason()
         if policy == "ratio-25-75":
             return 0.25, 0.75, self.physical_expert_supported, self._expert_support_reason()
-        if policy == "layer-aware-joint-dp":
+        if policy in ("layer-aware-joint", "layer-aware-joint-dp"):
             avg_prefix = self._avg_prefix_len(forward_batch)
             if avg_prefix <= 1024:
                 kvc_fraction = 0.75
@@ -796,7 +811,9 @@ class LayerKVRuntime:
         self, module: Any, param_names: List[str], expert_id: int
     ) -> Dict[str, torch.Tensor]:
         return {
-            name: getattr(module, name).data[expert_id].detach().to("cpu", copy=True)
+            name: self._cpu_backing_tensor(
+                getattr(module, name).data[expert_id].detach()
+            )
             for name in param_names
         }
 
@@ -804,11 +821,19 @@ class LayerKVRuntime:
         self, state: _LayerKVExpertLayerState, slot_id: int
     ) -> Dict[str, torch.Tensor]:
         return {
-            name: getattr(state.module, name).data[slot_id].detach().to(
-                "cpu", copy=True
+            name: self._cpu_backing_tensor(
+                getattr(state.module, name).data[slot_id].detach()
             )
             for name in state.param_names
         }
+
+    @staticmethod
+    def _cpu_backing_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        cpu = tensor.to("cpu", copy=True)
+        try:
+            return cpu.pin_memory()
+        except Exception:
+            return cpu
 
     def _prepare_expert_dispatch_for_core(
         self, state: _LayerKVExpertLayerState, dispatch_output: Any
@@ -869,6 +894,24 @@ class LayerKVRuntime:
         self.stats.expert_topk_rewrite_count += 1
         return topk_output._replace(topk_ids=rewritten_ids)
 
+    def _finalize_expert_materialize_events(self, *, block: bool = False) -> None:
+        if not self._pending_expert_copy_events:
+            return
+        remaining = []
+        for start, end in self._pending_expert_copy_events:
+            try:
+                if block:
+                    end.synchronize()
+                elif not end.query():
+                    remaining.append((start, end))
+                    continue
+                elapsed = float(start.elapsed_time(end))
+                self.stats.expert_materialize_ms += elapsed
+                self.stats.layerkv_copy_stream_busy_ms += elapsed
+            except Exception:
+                continue
+        self._pending_expert_copy_events = remaining
+
     def _unique_expert_ids(self, topk_ids: torch.Tensor, full_num_experts: int) -> List[int]:
         if topk_ids.numel() == 0:
             return []
@@ -904,24 +947,32 @@ class LayerKVRuntime:
                 raise RuntimeError(reason)
             start = None
             end = None
+            active_stream = None
             if state.device.type == "cuda":
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
-                start.record()
+                active_stream = torch.cuda.current_stream(device=state.device)
             with torch.no_grad():
+                if active_stream is not None:
+                    start.record(active_stream)
                 for name in state.param_names:
                     dst = getattr(state.module, name).data[slot_id]
                     dst.copy_(source_params[name], non_blocking=True)
             state.cpu_params.pop(int(logical_id), None)
             if end is not None:
-                end.record()
-                end.synchronize()
+                end.record(active_stream)
                 try:
-                    elapsed = float(start.elapsed_time(end))
-                    self.stats.expert_materialize_ms += elapsed
-                    self.stats.layerkv_copy_stream_busy_ms += elapsed
+                    if end.query():
+                        elapsed = float(start.elapsed_time(end))
+                        self.stats.expert_materialize_ms += elapsed
+                        self.stats.layerkv_copy_stream_busy_ms += elapsed
+                    else:
+                        self.stats.expert_materialize_async_count += 1
+                        self._pending_expert_copy_events.append((start, end))
                 except Exception:
                     pass
+            else:
+                self.stats.expert_materialize_host_sync_count += 1
             state.logical_to_slot[logical_id] = slot_id
             state.slot_to_logical[slot_id] = logical_id
             state.lru[logical_id] = self._decode_step
@@ -1135,6 +1186,7 @@ class LayerKVRuntime:
 
     def on_forward_begin(self, *, mode: str, forward_batch: Any) -> None:
         t0 = time.perf_counter()
+        self._finalize_expert_materialize_events(block=False)
         self._finalize_reloaded_entries(block=False)
         if mode == "decode":
             self._apply_expert_plan_once(forward_batch)
@@ -1660,6 +1712,7 @@ class LayerKVRuntime:
     def on_forward_end(self, *, mode: str, forward_batch: Any) -> None:
         if mode == "decode":
             t0 = time.perf_counter()
+            self._finalize_expert_materialize_events(block=False)
             self._finalize_reloaded_entries(block=True)
             self._evict_kvc_to_target(forward_batch)
             self.validate_kvc_state(forward_batch)
