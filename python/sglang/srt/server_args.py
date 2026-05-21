@@ -6379,7 +6379,7 @@ class ServerArgs:
                 "layer-aware-joint-dp",
             ],
             default=ServerArgs.layerkv_policy,
-            help="LayerKV policy label to install in runtime metadata.",
+            help="LayerKV policy. In the current SGLang v1 integration, this controls the executable KVC reclaim fraction; expert reclaim is reported as unsupported.",
         )
         parser.add_argument(
             "--layerkv-target-reclaim-mb",

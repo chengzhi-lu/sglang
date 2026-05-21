@@ -59,6 +59,12 @@ class LayerKVStats:
     kvc_get_kv_count: int = 0
     kvc_tokens_written: int = 0
     kvc_bytes_written: int = 0
+    requested_total_reclaim_mb: float = 0.0
+    effective_kvc_reclaim_mb: float = 0.0
+    policy_kvc_fraction: float = 0.0
+    policy_expert_fraction: float = 0.0
+    full_policy_semantics_supported: bool = True
+    policy_semantics_reason: str = ""
     planned_kvc_reclaim_mb: float = 0.0
     physical_kvc_reclaim_mb: float = 0.0
     kvc_host_backing_mb: float = 0.0
@@ -342,6 +348,8 @@ class LayerKVRuntime:
             return
         if self._kv_pool is None or self._bytes_per_token_all_layers <= 0:
             raise RuntimeError("KVC host store cannot initialize without KV pool")
+        # Allocate host capacity against the total reclaim intent so dynamic
+        # policy fractions can vary without reallocating CPU backing.
         target_bytes = max(1, int(self.config.target_reclaim_mb * 1024 * 1024))
         target_tokens = max(1, target_bytes // self._bytes_per_token_all_layers)
         capacity_tokens = target_tokens + max(
@@ -358,6 +366,58 @@ class LayerKVRuntime:
         # v1 intentionally avoids changing SGLang MoE runner layouts.  The
         # metadata hook is present so later fixed-slot backends can attach here.
         self.physical_expert_supported = False
+
+    def _avg_prefix_len(self, forward_batch: Any) -> float:
+        pairs = self._batch_req_indices_and_lens(forward_batch)
+        if not pairs:
+            return 0.0
+        return sum(max(0, seq_len - 1) for _, seq_len in pairs) / float(len(pairs))
+
+    def _policy_fractions(self, forward_batch: Any) -> Tuple[float, float, bool, str]:
+        policy = self.config.policy
+        if policy == "none":
+            return 0.0, 0.0, True, "policy=none disables LayerKV physical reclaim"
+        if policy == "expert-first":
+            return 1.0, 0.0, True, ""
+        if policy == "kv-first":
+            return 0.0, 1.0, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+        if policy == "ratio-75-25":
+            return 0.75, 0.25, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+        if policy == "ratio-50-50":
+            return 0.50, 0.50, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+        if policy == "ratio-25-75":
+            return 0.25, 0.75, False, "expert reclaim is not implemented in LayerKV SGLang v1"
+        if policy == "layer-aware-joint-dp":
+            avg_prefix = self._avg_prefix_len(forward_batch)
+            if avg_prefix <= 1024:
+                kvc_fraction = 0.75
+            elif avg_prefix <= 4096:
+                kvc_fraction = 0.50
+            else:
+                kvc_fraction = 0.25
+            return (
+                kvc_fraction,
+                1.0 - kvc_fraction,
+                False,
+                "layer-aware-joint-dp uses KVC-only heuristic; expert reclaim is not implemented",
+            )
+        return 0.0, 0.0, False, f"unknown LayerKV policy: {policy}"
+
+    def _effective_kvc_reclaim_mb(self, forward_batch: Any) -> float:
+        kvc_fraction, expert_fraction, full_supported, reason = self._policy_fractions(
+            forward_batch
+        )
+        effective = max(0.0, self.config.target_reclaim_mb * kvc_fraction)
+        self.stats.requested_total_reclaim_mb = self.config.target_reclaim_mb
+        self.stats.effective_kvc_reclaim_mb = effective
+        self.stats.policy_kvc_fraction = kvc_fraction
+        self.stats.policy_expert_fraction = expert_fraction
+        self.stats.full_policy_semantics_supported = full_supported
+        self.stats.policy_semantics_reason = reason
+        self.stats.planned_kvc_reclaim_mb = max(
+            self.stats.planned_kvc_reclaim_mb, effective
+        )
+        return effective
 
     def _wrap_set_kv_buffer(self, orig: Callable) -> Callable:
         @functools.wraps(orig)
@@ -417,11 +477,7 @@ class LayerKVRuntime:
     def _reload_required_kvc(self, forward_batch: Any) -> None:
         if self.config.mode not in ("kvc-only", "kvc-expert"):
             return
-        if self.config.target_reclaim_mb <= 0:
-            return
-        self.stats.planned_kvc_reclaim_mb = max(
-            self.stats.planned_kvc_reclaim_mb, self.config.target_reclaim_mb
-        )
+        self._effective_kvc_reclaim_mb(forward_batch)
         if not self.physical_kvc_supported:
             self.stats.comparable = False
             self.stats.comparability_reason = self.unsupported_reason
@@ -479,11 +535,10 @@ class LayerKVRuntime:
     def _evict_kvc_to_target(self, forward_batch: Any) -> None:
         if self.config.mode not in ("kvc-only", "kvc-expert"):
             return
-        if self.config.target_reclaim_mb <= 0:
+        effective_kvc_reclaim_mb = self._effective_kvc_reclaim_mb(forward_batch)
+        if effective_kvc_reclaim_mb <= 0:
+            self._refresh_kvc_residency_stats()
             return
-        self.stats.planned_kvc_reclaim_mb = max(
-            self.stats.planned_kvc_reclaim_mb, self.config.target_reclaim_mb
-        )
         if not self.physical_kvc_supported:
             self.stats.comparable = False
             self.stats.comparability_reason = self.unsupported_reason
@@ -493,7 +548,7 @@ class LayerKVRuntime:
 
         self._ensure_host_store()
         self._prune_entries_for_active_lengths(forward_batch)
-        target_tokens = self._target_offloaded_tokens()
+        target_tokens = self._target_offloaded_tokens(effective_kvc_reclaim_mb)
         need_tokens = max(0, target_tokens - self._offloaded_token_count())
         if need_tokens <= 0:
             self._refresh_kvc_residency_stats()
@@ -542,8 +597,8 @@ class LayerKVRuntime:
         self.stats.layerkv_tasks_built += 1
         self._refresh_kvc_residency_stats()
 
-    def _target_offloaded_tokens(self) -> int:
-        target_bytes = int(self.config.target_reclaim_mb * 1024 * 1024)
+    def _target_offloaded_tokens(self, target_reclaim_mb: float) -> int:
+        target_bytes = int(target_reclaim_mb * 1024 * 1024)
         return max(1, target_bytes // self._bytes_per_token_all_layers)
 
     def _offloaded_token_count(self) -> int:
