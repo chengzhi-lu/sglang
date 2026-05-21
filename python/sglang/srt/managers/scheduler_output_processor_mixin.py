@@ -652,6 +652,13 @@ class SchedulerOutputProcessorMixin:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
+                layerkv_runtime = getattr(
+                    getattr(self.tp_worker, "model_runner", None),
+                    "layerkv_runtime",
+                    None,
+                )
+                if layerkv_runtime is not None:
+                    layerkv_runtime.on_request_finished(req)
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)

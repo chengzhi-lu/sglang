@@ -127,6 +127,8 @@ class LayerKVStats:
     kvc_eviction_skipped_count: int = 0
     kvc_residency_entry_count: int = 0
     kvc_stale_entry_count: int = 0
+    kvc_finished_req_cleanup_count: int = 0
+    kvc_finished_req_cleanup_token_count: int = 0
     kvc_guard_pass: bool = True
     kvc_guard_reason: str = ""
     planner_apply_count: int = 0
@@ -1777,6 +1779,33 @@ class LayerKVRuntime:
             return
         to_drop = [key for key in self._residency if key[0] in req_indices]
         self._drop_residency_keys(to_drop)
+
+    def on_request_finished(self, req: Any) -> None:
+        """Drop LayerKV-owned metadata/backing for a completed request.
+
+        SGLang still owns the canonical req_to_token/KV allocator release. This
+        hook only removes LayerKV's offloaded residency records and CPU backing
+        before the request pool index is cleared by release_kv_cache.
+        """
+
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is None:
+            return
+        try:
+            req_idx = int(req_pool_idx)
+        except (TypeError, ValueError):
+            return
+        to_drop = [key for key in self._residency if key[0] == req_idx]
+        if not to_drop:
+            return
+        token_count = 0
+        for key in to_drop:
+            entry = self._residency.get(key)
+            if entry is not None:
+                token_count += int(entry.token_count)
+        self._drop_residency_keys(to_drop)
+        self.stats.kvc_finished_req_cleanup_count += 1
+        self.stats.kvc_finished_req_cleanup_token_count += token_count
 
     def _prune_entries_for_active_lengths(self, forward_batch: Any) -> None:
         to_drop = []
