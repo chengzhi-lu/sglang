@@ -68,6 +68,11 @@ def main() -> int:
 
     runner = DummyRunner()
     rt.install_on_runner(runner)
+    unsupported_summary = rt.summary()
+    assert unsupported_summary["layerkv_physical_kvc_supported"] is False
+    assert unsupported_summary["comparable"] is False
+    assert "DummyPool" in unsupported_summary["layerkv_unsupported_reason"]
+    assert unsupported_summary["kvc_guard_pass"] is False
     loc = torch.tensor([0, 1], dtype=torch.int64)
     runner.token_to_kv_pool.set_kv_buffer(
         DummyLayer(),

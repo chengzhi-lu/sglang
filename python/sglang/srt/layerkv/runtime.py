@@ -79,9 +79,17 @@ class LayerKVStats:
     kvc_reload_ms: float = 0.0
     kvc_use_point_wait_ms: float = 0.0
     kvc_allocator_free_count: int = 0
+    kvc_allocator_available_before: int = -1
+    kvc_allocator_available_after: int = -1
     kvc_req_to_token_rewrite_count: int = 0
     kvc_physical_cycle_count: int = 0
     kvc_physical_failure_count: int = 0
+    kvc_reload_required_count: int = 0
+    kvc_eviction_skipped_count: int = 0
+    kvc_residency_entry_count: int = 0
+    kvc_stale_entry_count: int = 0
+    kvc_guard_pass: bool = True
+    kvc_guard_reason: str = ""
     planner_apply_count: int = 0
     scheduler_invocation_count: int = 0
     layerkv_tasks_built: int = 0
@@ -308,6 +316,13 @@ class LayerKVRuntime:
                 f"KVC physical offload is not implemented for "
                 f"{type(kv_pool).__name__}; running accounting-only hooks"
             )
+        if (
+            self.config.mode in ("kvc-only", "kvc-expert")
+            and self.config.target_reclaim_mb > 0
+            and not self.physical_kvc_supported
+        ):
+            self.stats.comparable = False
+            self.stats.comparability_reason = self.unsupported_reason
 
     def _can_support_kvc_pool(self, kv_pool: Any) -> bool:
         try:
@@ -419,6 +434,17 @@ class LayerKVRuntime:
         )
         return effective
 
+    def _allocator_available_size(self) -> int:
+        if self._allocator is None:
+            return -1
+        available = getattr(self._allocator, "available_size", None)
+        if available is None or not callable(available):
+            return -1
+        try:
+            return int(available())
+        except Exception:
+            return -1
+
     def _wrap_set_kv_buffer(self, orig: Callable) -> Callable:
         @functools.wraps(orig)
         def wrapped(layer: Any, loc: Any, cache_k: Any, cache_v: Any, *args, **kwargs):
@@ -492,12 +518,15 @@ class LayerKVRuntime:
             return
 
         token_count = len(selected)
+        self.stats.kvc_reload_required_count += token_count
+        self.stats.kvc_allocator_available_before = self._allocator_available_size()
         new_locs = self._allocator.alloc(token_count)
         if new_locs is None:
             self.stats.kvc_physical_failure_count += 1
             self.stats.comparable = False
             self.stats.comparability_reason = "allocator failed to reload offloaded KVC"
             raise RuntimeError("allocator failed to reload offloaded KVC")
+        self.stats.kvc_allocator_available_after = self._allocator_available_size()
 
         host_slots = [int(entry.host_slot) for entry in selected]
         try:
@@ -551,11 +580,13 @@ class LayerKVRuntime:
         target_tokens = self._target_offloaded_tokens(effective_kvc_reclaim_mb)
         need_tokens = max(0, target_tokens - self._offloaded_token_count())
         if need_tokens <= 0:
+            self.stats.kvc_eviction_skipped_count += 1
             self._refresh_kvc_residency_stats()
             return
 
         selected = self._select_resident_entries_for_eviction(forward_batch, need_tokens)
         if not selected:
+            self.stats.kvc_eviction_skipped_count += 1
             self._refresh_kvc_residency_stats()
             return
 
@@ -576,7 +607,9 @@ class LayerKVRuntime:
         token_count = len(selected)
         try:
             elapsed_ms = self._host_store.backup(old_locs, host_slots)
+            self.stats.kvc_allocator_available_before = self._allocator_available_size()
             self._allocator.free(old_locs)
+            self.stats.kvc_allocator_available_after = self._allocator_available_size()
             self.stats.kvc_allocator_free_count += 1
             for entry, host_slot in zip(selected, host_slots):
                 entry.state = "offloaded"
@@ -612,12 +645,126 @@ class LayerKVRuntime:
         resident = self._resident_token_count()
         self.stats.kvc_offloaded_token_count = offloaded
         self.stats.kvc_resident_token_count = resident
+        self.stats.kvc_residency_entry_count = len(self._residency)
         self.stats.physical_kvc_reclaim_mb = (
             offloaded * self._bytes_per_token_all_layers / float(1024 * 1024)
         )
         if self._host_store is not None:
             self.stats.kvc_host_used_tokens = self._host_store.used_count
             self.stats.kvc_host_backing_mb = self._host_store.capacity_mb
+
+    def validate_kvc_state(self, forward_batch: Any = None) -> Dict[str, Any]:
+        """Validate LayerKV-owned KVC residency bookkeeping.
+
+        This is intentionally metadata-only.  It does not compare KV tensor
+        values, but it catches stale host slots, duplicate ownership, req_to_token
+        mismatches, and unsupported physical paths before policy results are
+        treated as comparable.
+        """
+
+        stale_count = 0
+        reasons: List[str] = []
+        seen_host_slots = set()
+        offloaded_count = 0
+        resident_count = 0
+
+        active_lens = None
+        if forward_batch is not None:
+            active_lens = {
+                req_idx: seq_len
+                for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch)
+            }
+
+        host_used_slots = (
+            set(self._host_store.used_slots) if self._host_store is not None else set()
+        )
+
+        for key, entry in self._residency.items():
+            req_idx, pos = key
+            if key != (entry.req_idx, entry.pos):
+                stale_count += 1
+                reasons.append("entry_key_mismatch")
+            if active_lens is not None and req_idx in active_lens and pos >= active_lens[req_idx]:
+                stale_count += 1
+                reasons.append("entry_beyond_active_length")
+
+            if entry.state == "offloaded":
+                offloaded_count += 1
+                if entry.host_slot is None:
+                    stale_count += 1
+                    reasons.append("offloaded_missing_host_slot")
+                elif entry.host_slot in seen_host_slots:
+                    stale_count += 1
+                    reasons.append("duplicate_host_slot")
+                elif self._host_store is not None and int(entry.host_slot) not in host_used_slots:
+                    stale_count += 1
+                    reasons.append("host_slot_not_marked_used")
+                if entry.host_slot is not None:
+                    seen_host_slots.add(int(entry.host_slot))
+                if entry.device_loc is not None:
+                    stale_count += 1
+                    reasons.append("offloaded_has_device_loc")
+            elif entry.state == "resident":
+                resident_count += 1
+                if entry.device_loc is None:
+                    stale_count += 1
+                    reasons.append("resident_missing_device_loc")
+                if entry.host_slot is not None:
+                    stale_count += 1
+                    reasons.append("resident_has_host_slot")
+                if (
+                    active_lens is not None
+                    and req_idx in active_lens
+                    and self._req_to_token_pool is not None
+                    and entry.device_loc is not None
+                    and pos < active_lens[req_idx]
+                ):
+                    try:
+                        table_loc = int(
+                            self._req_to_token_pool.req_to_token[req_idx, pos].item()
+                        )
+                        if table_loc != int(entry.device_loc):
+                            stale_count += 1
+                            reasons.append("resident_req_to_token_mismatch")
+                    except Exception:
+                        stale_count += 1
+                        reasons.append("resident_req_to_token_check_failed")
+            else:
+                stale_count += 1
+                reasons.append("unknown_entry_state")
+
+        if self._host_store is not None and self._host_store.used_count != offloaded_count:
+            stale_count += abs(self._host_store.used_count - offloaded_count)
+            reasons.append("host_used_count_mismatch")
+
+        self.stats.kvc_residency_entry_count = len(self._residency)
+        self.stats.kvc_stale_entry_count = stale_count
+        self.stats.kvc_offloaded_token_count = offloaded_count
+        self.stats.kvc_resident_token_count = resident_count
+        self.stats.kvc_host_used_tokens = (
+            self._host_store.used_count if self._host_store is not None else 0
+        )
+
+        guard_pass = stale_count == 0
+        if (
+            self.config.mode in ("kvc-only", "kvc-expert")
+            and self.config.target_reclaim_mb > 0
+            and not self.physical_kvc_supported
+        ):
+            guard_pass = False
+            reasons.append(self.unsupported_reason or "physical_kvc_unsupported")
+
+        self.stats.kvc_guard_pass = guard_pass
+        self.stats.kvc_guard_reason = ";".join(sorted(set(reasons)))
+        return {
+            "kvc_guard_pass": self.stats.kvc_guard_pass,
+            "kvc_guard_reason": self.stats.kvc_guard_reason,
+            "kvc_stale_entry_count": self.stats.kvc_stale_entry_count,
+            "kvc_residency_entry_count": self.stats.kvc_residency_entry_count,
+            "kvc_host_used_tokens": self.stats.kvc_host_used_tokens,
+            "kvc_offloaded_token_count": self.stats.kvc_offloaded_token_count,
+            "kvc_resident_token_count": self.stats.kvc_resident_token_count,
+        }
 
     def _batch_req_indices_and_lens(self, forward_batch: Any) -> List[Tuple[int, int]]:
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
@@ -747,13 +894,17 @@ class LayerKVRuntime:
         if mode == "decode":
             t0 = time.perf_counter()
             self._evict_kvc_to_target(forward_batch)
+            self.validate_kvc_state(forward_batch)
             self.stats.layerkv_python_overhead_ms += (
                 time.perf_counter() - t0
             ) * 1000.0
+        elif mode == "extend":
+            self.validate_kvc_state(forward_batch)
         if self.config.debug_stats:
             logger.info("LayerKV stats after %s: %s", mode, self.summary())
 
     def summary(self) -> Dict[str, Any]:
+        self.validate_kvc_state()
         out = self.stats.as_dict()
         out.update(
             {
