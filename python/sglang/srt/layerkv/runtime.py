@@ -460,7 +460,7 @@ class LayerKVRuntime:
                 f"{type(kv_pool).__name__}; running accounting-only hooks"
             )
         if (
-            self.config.mode in ("kvc-only", "kvc-expert")
+            self.config.mode == "kvc-only"
             and self.config.target_reclaim_mb > 0
             and not self.physical_kvc_supported
         ):
@@ -1427,7 +1427,10 @@ class LayerKVRuntime:
     def _reload_required_kvc(self, forward_batch: Any) -> None:
         if self.config.mode not in ("kvc-only", "kvc-expert"):
             return
-        self._effective_kvc_reclaim_mb(forward_batch)
+        effective_kvc_reclaim_mb = self._effective_kvc_reclaim_mb(forward_batch)
+        if effective_kvc_reclaim_mb <= 0:
+            self._refresh_kvc_residency_stats()
+            return
         if not self.physical_kvc_supported:
             self.stats.comparable = False
             self.stats.comparability_reason = self.unsupported_reason
@@ -1734,11 +1737,10 @@ class LayerKVRuntime:
         )
 
         guard_pass = stale_count == 0
-        if (
-            self.config.mode in ("kvc-only", "kvc-expert")
-            and self.config.target_reclaim_mb > 0
-            and not self.physical_kvc_supported
-        ):
+        needs_kvc_reclaim = self.config.mode == "kvc-only" and self.config.target_reclaim_mb > 0
+        needs_kvc_reclaim = needs_kvc_reclaim or self.stats.planned_kvc_reclaim_mb > 0
+        needs_kvc_reclaim = needs_kvc_reclaim or self.stats.effective_kvc_reclaim_mb > 0
+        if needs_kvc_reclaim and not self.physical_kvc_supported:
             guard_pass = False
             reasons.append(self.unsupported_reason or "physical_kvc_unsupported")
 

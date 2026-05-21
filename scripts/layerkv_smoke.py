@@ -159,6 +159,11 @@ def main() -> int:
     expert_runner = ExpertRunner()
     expert_rt.install_on_runner(expert_runner)
     expert_rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    expert_summary = expert_rt.summary()
+    assert expert_summary["planned_kvc_reclaim_mb"] == 0.0
+    assert expert_summary["planned_expert_reclaim_mb"] > 0.0
+    assert expert_summary["comparable"] is True
+    assert expert_summary["kvc_guard_pass"] is True
     assert expert_runner.model.moe.w13_weight.shape[0] < 4
     topk = TopKOut(
         topk_weights=torch.ones((1, 2), dtype=torch.float32),
