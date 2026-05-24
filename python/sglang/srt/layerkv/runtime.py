@@ -5143,10 +5143,11 @@ class LayerKVRuntime:
     ) -> List[_LayerKVResidencyEntry]:
         selected: List[_LayerKVResidencyEntry] = []
         seen = set()
+        page_size = self._per_layer_kvc_block_page_size()
         for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch):
             required_prefix_len = self._align_tokens_down(max(0, seq_len - 1))
             for layer_id in self._kvc_layer_ids():
-                for pos in range(0, required_prefix_len, self._page_size):
+                for pos in range(0, required_prefix_len, page_size):
                     key = (int(layer_id), req_idx, pos)
                     entry = self._per_layer_residency.get(key)
                     if entry is None or entry.state != "offloaded":
@@ -5436,13 +5437,15 @@ class LayerKVRuntime:
         by_layer: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
         offset = 0
         for entry in selected:
-            locs = [
-                int(x)
-                for x in new_locs[offset : offset + entry.token_count]
-                .detach()
-                .cpu()
-                .tolist()
-            ]
+            locs = [int(x) for x in entry.device_loc_list()]
+            if len(locs) != int(entry.token_count):
+                locs = [
+                    int(x)
+                    for x in new_locs[offset : offset + entry.token_count]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
             layer_id = int(entry.layer_id)
             if layer_id < 0:
                 # Backward-compatible fallback for old selected entries.
