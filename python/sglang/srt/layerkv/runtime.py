@@ -658,8 +658,9 @@ class _LayerKVHostKVStore:
         for entry in entries:
             layer_offset = int(entry.layer_id) - self.start_layer
             need = int(entry.token_count)
-            slots = self.layer_free_slots[layer_offset][:need]
-            del self.layer_free_slots[layer_offset][:need]
+            free = self.layer_free_slots[layer_offset]
+            slots = free[-need:]
+            del free[-need:]
             self.layer_used_slots[layer_offset].update(slots)
             out.extend(slots)
         return out
@@ -669,8 +670,8 @@ class _LayerKVHostKVStore:
             raise RuntimeError("use alloc_per_layer for per-layer KVC host store")
         if need > len(self.free_slots):
             return None
-        slots = self.free_slots[:need]
-        del self.free_slots[:need]
+        slots = self.free_slots[-need:]
+        del self.free_slots[-need:]
         self.used_slots.update(slots)
         return slots
 
@@ -959,6 +960,7 @@ class LayerKVRuntime:
         self._per_layer_residency: Dict[
             Tuple[int, int, int], _LayerKVResidencyEntry
         ] = {}
+        self._per_layer_offloaded_keys: Set[Tuple[int, int, int]] = set()
         self._resident_groups: Dict[
             _LayerKVResidencyKey, _LayerKVResidentTensorGroup
         ] = {}
@@ -1970,6 +1972,7 @@ class LayerKVRuntime:
         # used only to derive raw copy bytes; it is not the planner objective.
         controller_cost = 0.0
         exposed_stall = 0.0
+        recovery_steps = self._expected_kvc_recovery_steps()
         for layer_id, tokens in token_plan.items():
             if tokens <= 0:
                 continue
@@ -1979,12 +1982,20 @@ class LayerKVRuntime:
             overlap_ms = self._estimate_layer_kvc_overlap_window_ms(
                 int(layer_id), forward_batch
             )
-            exposed_stall += max(0.0, raw_copy_ms - overlap_ms)
+            exposed_stall += max(0.0, raw_copy_ms - overlap_ms) * recovery_steps
             controller_cost += self._estimate_arena_kvc_layer_metadata_ms(
                 int(layer_id), int(tokens)
-            )
+            ) * recovery_steps
         self.stats.planner_estimated_kvc_controller_cost = controller_cost
         return exposed_stall + controller_cost
+
+    def _expected_kvc_recovery_steps(self) -> int:
+        # Fig4-style decode uses 16 generated tokens.  At planning time the
+        # first decode step has just started, so stats.decode_steps is not the
+        # remaining horizon.  Charge KVC by the expected repeated reload/evict
+        # cycles instead of treating it as a one-shot recovery.
+        observed = int(getattr(self.stats, "decode_steps", 0) or 0)
+        return max(1, observed if observed > 1 else 16)
 
     def _arena_kvc_token_plan_for_reclaim(
         self, reclaim_mb: float, forward_batch: Any
@@ -2001,12 +2012,16 @@ class LayerKVRuntime:
         if tokens <= 0:
             return 0.0
         bytes_per_token = max(1, self._bytes_per_kvc_token_per_layer())
-        reload_bytes = float(tokens) * float(bytes_per_token)
-        bandwidth_gbps = 24.0
-        copy_ms = reload_bytes / (bandwidth_gbps * 1.0e9) * 1000.0
-        # Runtime coalesces same-layer blocks, so the planner charges one launch
-        # per active layer instead of one launch per token block.
-        return 0.015 + copy_ms
+        copy_bytes = float(tokens) * float(bytes_per_token)
+        # Per-layer arena recovery uses indexed gather/scatter copies rather
+        # than a single contiguous memcpy.  The runtime must restore missing KV
+        # before attention and evict it again after the step, so charge both
+        # H2D reload and D2H backup.  This is a theoretical hardware/runtime
+        # path estimate, not a trace replay: the effective bandwidth reflects
+        # index_copy/index_select style copies into layer-local KV buffers.
+        effective_bandwidth_gbps = 1.0
+        copy_ms = (2.0 * copy_bytes) / (effective_bandwidth_gbps * 1.0e9) * 1000.0
+        return 0.03 + copy_ms
 
     def _estimate_layer_kvc_overlap_window_ms(
         self, layer_id: int, forward_batch: Any
@@ -2637,7 +2652,8 @@ class LayerKVRuntime:
             top_k = int(getattr(module, "top_k", 0) or 0)
             if top_k <= 0:
                 top_k = int(getattr(module.moe_runner_config, "top_k", 1) or 1)
-            min_capacity = max(1, min(full_num_experts, top_k))
+            decode_unique = len(self._expert_hotness_decode.get(int(layer_id), {}))
+            min_capacity = max(1, min(full_num_experts, max(top_k, decode_unique)))
             layer_infos.append(
                 {
                     "layer_id": int(layer_id),
@@ -2661,7 +2677,7 @@ class LayerKVRuntime:
                 len(eligible),
                 max(1, int(math.ceil(remaining_bytes / float(max_expert_bytes)))),
             )
-            for info in self._evenly_spaced_layer_infos(eligible, take_count):
+            for info in eligible[:take_count]:
                 info["capacity"] -= 1
                 reclaimed += info["expert_bytes"]
                 if reclaimed >= target_bytes:
@@ -3204,12 +3220,9 @@ class LayerKVRuntime:
     def _maybe_prepare_expert_plan_during_extend(self, forward_batch: Any) -> None:
         if self._simple_profile_enabled():
             return
-        # In memory-constrained policy evaluation, prebuilding expert CPU
-        # backing during extend can transiently duplicate a large fraction of
-        # MoE weights on host before the decode-side slot shrink has released
-        # GPU residency.  Keep the steady-state policy unchanged, but defer
-        # backing creation to the layer-by-layer install path unless the user
-        # explicitly requested persistent expert CPU backing/cache.
+        # Avoid duplicating several GB of expert backing during prefill by
+        # default.  The decode install path remains bounded and avoids the
+        # CPU-memory spikes seen in large-batch runs.
         if (
             str(self.config.expert_cpu_backing_mode) == "none"
             and self._effective_expert_backing_cache_mb() <= 0.0
@@ -3228,6 +3241,10 @@ class LayerKVRuntime:
             # decode apply time but moved more copy work into prefill/extend and
             # regressed end-to-end latency. Keep long-context prepare disabled.
             return
+        # Short-context/batch-heavy runs benefit from preparing the CPU backing
+        # while prefill is still progressing.  Keep this bounded to avoid the
+        # earlier host-memory blowups: long-context is disabled above, and the
+        # target is capped by actual expert reclaim capacity below.
         if is_long_context:
             target_mb = min(
                 max(0.0, self.config.target_reclaim_mb),
@@ -4228,6 +4245,10 @@ class LayerKVRuntime:
                 entry.host_slots = None
                 entry.host_slot = None
                 entry.state = "resident"
+                if self.config.kvc_backend == "per-layer-arena":
+                    self._per_layer_offloaded_keys.discard(
+                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                    )
                 entry.ready_start_event = None
                 entry.ready_event = None
                 entry.ready_waited = False
@@ -4341,6 +4362,16 @@ class LayerKVRuntime:
             # reclaim.  Look-behind expert prefetch can duplicate the normal
             # on-demand materialization path for these tiny plans; skip it and
             # keep the DP fast path equivalent to the simple expert baseline.
+            return tasks
+        if (
+            self.stats.effective_kvc_reclaim_mb <= 0.0
+            and self.stats.avg_prefix_len <= 1024.0
+        ):
+            # Batch-heavy short-context decode has high expert reuse pressure
+            # but little per-layer copy slack.  The earlier Fig4 DP fast path
+            # was faster with on-demand expert materialization only; expert
+            # prefetch adds scheduler/controller work without reducing exposed
+            # stall in this regime.
             return tasks
         if not self._expert_plan_applied or not self._expert_layers:
             return tasks
@@ -4515,12 +4546,9 @@ class LayerKVRuntime:
         token_count = sum(entry.token_count for entry in selected)
         self.stats.kvc_reload_required_count += token_count
         if self.config.kvc_backend == "per-layer-arena":
-            flat_locs = [loc for entry in selected for loc in entry.device_loc_list()]
-            new_locs = torch.tensor(
-                flat_locs, dtype=torch.int64, device=self._kv_pool.device
-            )
             self.stats.kvc_allocator_available_before = self._allocator_available_size()
             self.stats.kvc_allocator_available_after = self._allocator_available_size()
+            new_locs = None
         else:
             self.stats.kvc_allocator_available_before = self._allocator_available_size()
             new_locs = self._allocator.alloc(token_count)
@@ -4531,7 +4559,11 @@ class LayerKVRuntime:
                 raise RuntimeError("allocator failed to reload offloaded KVC")
             self.stats.kvc_allocator_available_after = self._allocator_available_size()
 
-        host_slots = [slot for entry in selected for slot in entry.host_slot_list()]
+        host_slots = (
+            []
+            if self.config.kvc_backend == "per-layer-arena"
+            else [slot for entry in selected for slot in entry.host_slot_list()]
+        )
         try:
             self._ensure_host_store()
             async_copy = (
@@ -4554,18 +4586,27 @@ class LayerKVRuntime:
             self.stats.layerkv_copy_event_record_count += 1
             with self._profile("profile_req_to_token_rewrite_ms"):
                 if self.config.kvc_backend == "per-layer-arena":
-                    self._rewrite_per_layer_req_to_token_for_entries(
-                        selected, new_locs
-                    )
+                    # Per-layer arena reload restores each logical block to its
+                    # existing layer-local device locations.  The attention
+                    # metadata override is already keyed by those locations, so
+                    # rebuilding a multi-million element new_locs tensor and
+                    # rewriting req_to_token every decode step is pure
+                    # controller overhead.
+                    pass
                 else:
                     self._rewrite_req_to_token_for_entries(selected, new_locs)
-            new_locs_cpu = [int(x) for x in new_locs.detach().cpu().tolist()]
+            new_locs_cpu = (
+                []
+                if self.config.kvc_backend == "per-layer-arena"
+                else [int(x) for x in new_locs.detach().cpu().tolist()]
+            )
             offset = 0
             for entry in selected:
-                page_locs = new_locs_cpu[offset : offset + entry.token_count]
+                if self.config.kvc_backend != "per-layer-arena":
+                    page_locs = new_locs_cpu[offset : offset + entry.token_count]
+                    entry.device_locs = page_locs
+                    entry.device_loc = page_locs[0] if page_locs else None
                 offset += entry.token_count
-                entry.device_locs = page_locs
-                entry.device_loc = page_locs[0] if page_locs else None
                 entry.last_access_step = self._decode_step
                 if async_copy and ready_event is not None:
                     entry.state = "reloading"
@@ -4574,6 +4615,10 @@ class LayerKVRuntime:
                     entry.ready_waited = False
                 else:
                     entry.state = "resident"
+                    if self.config.kvc_backend == "per-layer-arena":
+                        self._per_layer_offloaded_keys.discard(
+                            (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                        )
                     if entry.host_slots is not None:
                         if self.config.kvc_backend == "per-layer-arena":
                             self._host_store.free_per_layer(entry.layer_id, entry.host_slots)
@@ -4716,6 +4761,10 @@ class LayerKVRuntime:
                 page_host_slots = host_slots[offset : offset + entry.token_count]
                 offset += entry.token_count
                 entry.state = "offloaded"
+                if self.config.kvc_backend == "per-layer-arena":
+                    self._per_layer_offloaded_keys.add(
+                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                    )
                 entry.host_slots = [int(x) for x in page_host_slots]
                 entry.host_slot = int(page_host_slots[0]) if page_host_slots else None
                 if self.config.kvc_backend != "per-layer-arena":
@@ -4919,7 +4968,10 @@ class LayerKVRuntime:
                         stale_count += 1
                         reasons.append("host_slot_not_marked_used")
                     seen_host_slots.add(host_key)
-                if entry.device_loc is not None:
+                if (
+                    self.config.kvc_backend != "per-layer-arena"
+                    and entry.device_loc is not None
+                ):
                     stale_count += 1
                     reasons.append("offloaded_has_device_loc")
                 if len(host_slots) != entry.token_count:
@@ -5119,6 +5171,7 @@ class LayerKVRuntime:
         if not keys:
             return
         for key in keys:
+            self._per_layer_offloaded_keys.discard(key)
             entry = self._per_layer_residency.pop(key, None)
             if entry is not None:
                 if entry.ready_event is not None and not entry.ready_event.query():
@@ -5159,20 +5212,24 @@ class LayerKVRuntime:
         self, forward_batch: Any
     ) -> List[_LayerKVResidencyEntry]:
         selected: List[_LayerKVResidencyEntry] = []
-        seen = set()
-        page_size = self._per_layer_kvc_block_page_size()
-        for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch):
-            required_prefix_len = self._align_tokens_down(max(0, seq_len - 1))
-            for layer_id in self._kvc_layer_ids():
-                for pos in range(0, required_prefix_len, page_size):
-                    key = (int(layer_id), req_idx, pos)
-                    entry = self._per_layer_residency.get(key)
-                    if entry is None or entry.state != "offloaded":
-                        continue
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    selected.append(entry)
+        if not self._per_layer_offloaded_keys:
+            return selected
+        active_lens = {
+            int(req_idx): self._align_tokens_down(max(0, int(seq_len) - 1))
+            for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch)
+        }
+        stale: List[Tuple[int, int, int]] = []
+        for key in list(self._per_layer_offloaded_keys):
+            entry = self._per_layer_residency.get(key)
+            if entry is None or entry.state != "offloaded":
+                stale.append(key)
+                continue
+            required_prefix_len = active_lens.get(int(entry.req_idx), 0)
+            if entry.pos + entry.token_count > required_prefix_len:
+                continue
+            selected.append(entry)
+        for key in stale:
+            self._per_layer_offloaded_keys.discard(key)
         return selected
 
     def _select_resident_entries_for_eviction(
@@ -5315,7 +5372,7 @@ class LayerKVRuntime:
     ) -> List[_LayerKVResidencyEntry]:
         table = self._req_to_token_pool.req_to_token
         pairs = self._batch_req_indices_and_lens(forward_batch)
-        page_size = self._per_layer_kvc_block_page_size()
+        block_size = self._per_layer_kvc_block_page_size()
         plan = dict(self._planned_kvc_tokens_by_layer)
         if not plan and self._planned_kvc_token_target > 0:
             plan = self._build_layer_aware_kvc_token_plan(
@@ -5333,38 +5390,40 @@ class LayerKVRuntime:
             need_tokens = self._align_tokens_down(max(0, int(target_tokens) - current))
             if need_tokens <= 0:
                 continue
-            target_pages = need_tokens // page_size
-            if target_pages <= 0:
+            if need_tokens < block_size:
                 continue
-            page_meta: List[Tuple[int, int]] = []
+            segments: List[Tuple[int, int, int]] = []
+            remaining = need_tokens
             for req_idx, seq_len in pairs:
                 evictable_len = self._align_tokens_down(max(0, seq_len - 1))
-                for pos in range(0, evictable_len, page_size):
-                    page_meta.append((req_idx, pos))
-                    if len(page_meta) >= target_pages:
-                        break
-                if len(page_meta) >= target_pages:
+                take = min(evictable_len, remaining)
+                take = (take // block_size) * block_size
+                if take <= 0:
+                    continue
+                segments.append((req_idx, 0, take))
+                remaining -= take
+                if remaining < block_size:
                     break
-            if not page_meta:
+            if not segments:
                 continue
             flat_req_indices: List[int] = []
             flat_positions: List[int] = []
-            for req_idx, pos in page_meta:
-                for page_pos in range(pos, pos + page_size):
+            for req_idx, pos, count in segments:
+                for page_pos in range(pos, pos + count):
                     flat_req_indices.append(req_idx)
                     flat_positions.append(page_pos)
             req_tensor = torch.tensor(flat_req_indices, dtype=torch.int64, device=table.device)
             pos_tensor = torch.tensor(flat_positions, dtype=torch.int64, device=table.device)
             flat_locs = table[req_tensor, pos_tensor].detach().cpu().tolist()
             loc_offset = 0
-            for req_idx, pos in page_meta:
+            for req_idx, pos, count in segments:
                 key = (int(layer_id), req_idx, pos)
                 existing = self._per_layer_residency.get(key)
                 if existing is not None and existing.state in ("offloaded", "reloading"):
-                    loc_offset += page_size
+                    loc_offset += count
                     continue
-                locs = [int(x) for x in flat_locs[loc_offset : loc_offset + page_size]]
-                loc_offset += page_size
+                locs = [int(x) for x in flat_locs[loc_offset : loc_offset + count]]
+                loc_offset += count
                 if any(loc <= 0 for loc in locs):
                     continue
                 # Per-layer arena blocks are logical token ranges, not physical
@@ -5379,7 +5438,7 @@ class LayerKVRuntime:
                         layer_id=int(layer_id),
                         device_loc=locs[0],
                         device_locs=locs,
-                        page_size=page_size,
+                        page_size=count,
                         last_access_step=self._decode_step,
                     )
                     self._per_layer_residency[key] = existing
@@ -5388,7 +5447,7 @@ class LayerKVRuntime:
                     existing.layer_id = int(layer_id)
                     existing.device_loc = locs[0]
                     existing.device_locs = locs
-                    existing.page_size = page_size
+                    existing.page_size = count
                     existing.last_access_step = self._decode_step
                 self._sync_kvc_group_if_needed(existing)
                 selected.append(existing)
