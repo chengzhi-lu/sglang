@@ -732,6 +732,7 @@ class _LayerKVHostKVStore:
         start = device_module.Event(enable_timing=True)
         end = device_module.Event(enable_timing=True)
         start.record()
+        by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
         offset = 0
         for entry in entries:
             layer_offset = int(entry.layer_id) - self.start_layer
@@ -740,14 +741,23 @@ class _LayerKVHostKVStore:
             count = entry.token_count
             slots = host_slots[offset : offset + count]
             offset += count
-            host_index = torch.tensor(slots, dtype=torch.int64, device="cpu")
-            device_locs = torch.tensor(
-                entry.device_loc_list(), dtype=torch.int64, device=self.device
+            layer_device_locs, layer_host_slots = by_layer.setdefault(
+                layer_offset, ([], [])
             )
-            k_src = self.kv_pool._get_key_buffer(entry.layer_id)[device_locs].detach().to(
+            layer_device_locs.extend(entry.device_loc_list())
+            layer_host_slots.extend(int(slot) for slot in slots)
+        for layer_offset, (device_loc_list, host_slot_list) in by_layer.items():
+            if not device_loc_list or not host_slot_list:
+                continue
+            layer_id = self.start_layer + layer_offset
+            host_index = torch.tensor(host_slot_list, dtype=torch.int64, device="cpu")
+            device_locs = torch.tensor(
+                device_loc_list, dtype=torch.int64, device=self.device
+            )
+            k_src = self.kv_pool._get_key_buffer(layer_id)[device_locs].detach().to(
                 "cpu", non_blocking=True
             )
-            v_src = self.kv_pool._get_value_buffer(entry.layer_id)[device_locs].detach().to(
+            v_src = self.kv_pool._get_value_buffer(layer_id)[device_locs].detach().to(
                 "cpu", non_blocking=True
             )
             self.k_buffers[layer_offset].index_copy_(0, host_index, k_src)
@@ -818,6 +828,7 @@ class _LayerKVHostKVStore:
                 start.record(active_stream)
             else:
                 start.record()
+            by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
             for entry in entries:
                 layer_offset = int(entry.layer_id) - self.start_layer
                 if layer_offset < 0 or layer_offset >= self.layer_num:
@@ -826,9 +837,18 @@ class _LayerKVHostKVStore:
                 device_locs_list = entry.device_loc_list()
                 if not host_slots or not device_locs_list:
                     continue
-                host_index = torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+                layer_host_slots, layer_device_locs = by_layer.setdefault(
+                    layer_offset, ([], [])
+                )
+                layer_host_slots.extend(int(slot) for slot in host_slots)
+                layer_device_locs.extend(int(loc) for loc in device_locs_list)
+            for layer_offset, (host_slot_list, device_loc_list) in by_layer.items():
+                if not host_slot_list or not device_loc_list:
+                    continue
+                layer_id = self.start_layer + layer_offset
+                host_index = torch.tensor(host_slot_list, dtype=torch.int64, device="cpu")
                 device_locs = torch.tensor(
-                    device_locs_list, dtype=torch.int64, device=self.device
+                    device_loc_list, dtype=torch.int64, device=self.device
                 )
                 k_src = self.k_buffers[layer_offset].index_select(0, host_index).to(
                     self.device, non_blocking=True
@@ -836,8 +856,8 @@ class _LayerKVHostKVStore:
                 v_src = self.v_buffers[layer_offset].index_select(0, host_index).to(
                     self.device, non_blocking=True
                 )
-                self.kv_pool._get_key_buffer(entry.layer_id).index_copy_(0, device_locs, k_src)
-                self.kv_pool._get_value_buffer(entry.layer_id).index_copy_(0, device_locs, v_src)
+                self.kv_pool._get_key_buffer(layer_id).index_copy_(0, device_locs, k_src)
+                self.kv_pool._get_value_buffer(layer_id).index_copy_(0, device_locs, v_src)
             if active_stream is not None:
                 end.record(active_stream)
             else:
@@ -3887,6 +3907,13 @@ class LayerKVRuntime:
             return 0
         return int(math.ceil(float(token_count) / float(page_size)) * page_size)
 
+    def _per_layer_kvc_block_page_size(self) -> int:
+        base_page = max(1, int(self._page_size))
+        block_tokens = int(getattr(self.config, "kvc_block_tokens", 0) or 0)
+        if block_tokens <= base_page:
+            return base_page
+        return max(base_page, self._align_tokens_up(block_tokens))
+
     def _wrap_set_kv_buffer(self, orig: Callable) -> Callable:
         @functools.wraps(orig)
         def wrapped(layer: Any, loc: Any, cache_k: Any, cache_v: Any, *args, **kwargs):
@@ -5270,7 +5297,7 @@ class LayerKVRuntime:
     ) -> List[_LayerKVResidencyEntry]:
         table = self._req_to_token_pool.req_to_token
         pairs = self._batch_req_indices_and_lens(forward_batch)
-        page_size = max(1, int(self._page_size))
+        page_size = self._per_layer_kvc_block_page_size()
         plan = dict(self._planned_kvc_tokens_by_layer)
         if not plan and self._planned_kvc_token_target > 0:
             plan = self._build_layer_aware_kvc_token_plan(
