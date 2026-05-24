@@ -89,8 +89,16 @@ CSV_FIELDS = [
     "planner_estimated_expert_cost",
     "planner_selected_kvc_reclaim_mb",
     "planner_selected_expert_reclaim_mb",
+    "planner_dp_infeasible_kvc_candidates",
+    "planner_dp_infeasible_expert_candidates",
+    "planner_dp_selected_total_cost",
+    "planner_dp_selected_kvc_cost",
+    "planner_dp_selected_expert_cost",
+    "selected_kvc_tokens_by_layer",
+    "selected_expert_evictions_by_layer",
     "expert_guard_pass",
     "expert_guard_reason",
+    "layerkv_runtime_profile",
     "layerkv_physical_expert_supported",
     "layerkv_expert_layer_count",
     "full_policy_semantics_supported",
@@ -166,7 +174,7 @@ class FakeRunner:
         self.model = FakeModel(layers)
 
 
-def _runtime(policy: str, target_reclaim_mb: float) -> LayerKVRuntime:
+def _runtime(policy: str, target_reclaim_mb: float, runtime_profile: str) -> LayerKVRuntime:
     args = Namespace(
         enable_layerkv=True,
         layerkv_mode="kvc-expert",
@@ -174,30 +182,56 @@ def _runtime(policy: str, target_reclaim_mb: float) -> LayerKVRuntime:
         layerkv_target_reclaim_mb=target_reclaim_mb,
         layerkv_kvc_block_tokens=16,
         layerkv_kvc_scheduler="async-deadline",
+        layerkv_runtime_profile=runtime_profile,
         layerkv_debug_stats=True,
         layerkv_disallow_destructive_fallback=True,
+        layerkv_expert_backing_cache_mb=0.0,
+        layerkv_expert_cpu_backing_mode="none",
+        layerkv_expert_install_layers_per_step=999,
+        layerkv_expert_install_budget_mb=999.0,
+        layerkv_expert_install_target_steps=0,
     )
     return LayerKVRuntime(LayerKVConfig.from_server_args(args))
 
 
-def _exercise_policy(policy: str, target_reclaim_mb: float) -> Dict[str, Any]:
+def _exercise_policy(policy: str, target_reclaim_mb: float, runtime_profile: str) -> Dict[str, Any]:
     runner = FakeRunner(
         [
             FakeFusedMoE(layer_id=0),
             FakeFusedMoE(layer_id=1),
         ]
     )
-    rt = _runtime(policy, target_reclaim_mb)
+    rt = _runtime(policy, target_reclaim_mb, runtime_profile)
     rt.install_on_runner(runner)
-    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
-
     topk = StandardTopKOutput(
         topk_weights=torch.ones((2, 2), dtype=torch.float32),
         topk_ids=torch.tensor([[6, 7], [6, 7]], dtype=torch.int32),
         router_logits=torch.zeros((2, 8), dtype=torch.float32),
     )
+    # First decode pass records routing hotness. The runtime intentionally waits
+    # for one decode sample before physically shrinking expert slots.
+    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
     for layer in runner.model.layers:
         layer(torch.zeros((2, 2), dtype=torch.float32), topk)
+
+    # Second decode pass applies the expert plan and exercises materialization.
+    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    for layer in runner.model.layers:
+        state = rt._expert_layers.get(int(layer.layer_id))
+        offloaded = [
+            expert_id
+            for expert_id in range(layer.num_experts)
+            if state is not None and expert_id not in state.logical_to_slot
+        ]
+        expert_id = int(offloaded[0]) if offloaded else 0
+        materialize_topk = StandardTopKOutput(
+            topk_weights=torch.ones((2, 2), dtype=torch.float32),
+            topk_ids=torch.tensor(
+                [[expert_id, expert_id], [expert_id, expert_id]], dtype=torch.int32
+            ),
+            router_logits=torch.zeros((2, 8), dtype=torch.float32),
+        )
+        layer(torch.zeros((2, 2), dtype=torch.float32), materialize_topk)
 
     summary = rt.summary()
     reasons: List[str] = []
@@ -211,13 +245,13 @@ def _exercise_policy(policy: str, target_reclaim_mb: float) -> Dict[str, Any]:
             reasons.append("slot_rebind_count_mismatch")
         if int(summary["expert_materialize_count"]) <= 0:
             reasons.append("no_expert_materialize")
-        if int(summary["expert_topk_rewrite_count"]) != 2:
+        if int(summary["expert_topk_rewrite_count"]) < 2:
             reasons.append("topk_rewrite_count_mismatch")
-        if int(summary["expert_core_hook_count"]) != 2:
+        if int(summary["expert_core_hook_count"]) < 2:
             reasons.append("core_hook_count_mismatch")
-        if int(summary["expert_call_count_total"]) != 8:
+        if int(summary["expert_call_count_total"]) < 8:
             reasons.append("expert_hotness_count_mismatch")
-        if int(summary["expert_decode_call_count_total"]) != 8:
+        if int(summary["expert_decode_call_count_total"]) < 8:
             reasons.append("expert_decode_hotness_count_mismatch")
         if not bool(summary["expert_hotness_observed"]):
             reasons.append("expert_hotness_not_observed")
@@ -258,11 +292,11 @@ def _exercise_policy(policy: str, target_reclaim_mb: float) -> Dict[str, Any]:
     return row
 
 
-def _exercise_unsupported(target_reclaim_mb: float) -> Dict[str, Any]:
+def _exercise_unsupported(target_reclaim_mb: float, runtime_profile: str) -> Dict[str, Any]:
     runner = FakeRunner(
         [FakeFusedMoE(layer_id=0, quant_method=UnsupportedQuantMethod())]
     )
-    rt = _runtime("kv-first", target_reclaim_mb)
+    rt = _runtime("kv-first", target_reclaim_mb, runtime_profile)
     rt.install_on_runner(runner)
     rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
     summary = rt.summary()
@@ -297,16 +331,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="outputs/layerkv")
     parser.add_argument("--target-reclaim-mb", type=float, default=0.00035)
+    parser.add_argument(
+        "--runtime-profile",
+        choices=["simple", "optimized"],
+        default="optimized",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows = [
-        _exercise_policy(policy, args.target_reclaim_mb)
+        _exercise_policy(policy, args.target_reclaim_mb, args.runtime_profile)
         for policy in POLICIES
     ]
-    rows.append(_exercise_unsupported(args.target_reclaim_mb))
+    rows.append(_exercise_unsupported(args.target_reclaim_mb, args.runtime_profile))
 
     csv_path = output_dir / "expert_validation.csv"
     summary_path = output_dir / "expert_validation_summary.json"

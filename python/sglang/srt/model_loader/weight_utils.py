@@ -1059,7 +1059,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 result = {k: f.get_tensor(k) for k in f.keys()}
-        return result
+        return st_file, result
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
@@ -1081,7 +1081,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
         ) as pbar:
             while pending:
                 future = pending.popleft()
-                state_dict = future.result()
+                st_file, state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
                 # Replenish: submit the next file to keep the buffer full.
@@ -1092,6 +1092,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]
                 del state_dict
+                if drop_cache_after_load:
+                    _drop_file_cache_after_load(st_file)
                 pbar.update(1)
 
 

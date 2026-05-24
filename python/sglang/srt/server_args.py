@@ -681,12 +681,22 @@ class ServerArgs:
         "ratio-75-25",
         "layer-aware-joint",
         "layer-aware-joint-dp",
+        "coresid",
     ] = "none"
     layerkv_target_reclaim_mb: float = 0.0
+    layerkv_dynamic_pressure_from_kvc: bool = False
     layerkv_kvc_block_tokens: int = 16
+    layerkv_kvc_backend: Literal["token-slot", "per-layer-arena"] = "token-slot"
     layerkv_kvc_scheduler: Literal["sync", "async-deadline"] = "async-deadline"
+    layerkv_runtime_profile: Literal["simple", "optimized"] = "optimized"
     layerkv_debug_stats: bool = False
+    layerkv_profile_detail: bool = False
     layerkv_disallow_destructive_fallback: bool = True
+    layerkv_expert_backing_cache_mb: float = 0.0
+    layerkv_expert_cpu_backing_mode: Literal["none", "all"] = "none"
+    layerkv_expert_install_layers_per_step: int = 1
+    layerkv_expert_install_budget_mb: float = 128.0
+    layerkv_expert_install_target_steps: int = 0
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3516,10 +3526,26 @@ class ServerArgs:
 
         if self.layerkv_kvc_block_tokens <= 0:
             raise ValueError("--layerkv-kvc-block-tokens must be positive")
+        if self.layerkv_kvc_backend not in ("token-slot", "per-layer-arena"):
+            raise ValueError(
+                "--layerkv-kvc-backend must be one of: token-slot, per-layer-arena"
+            )
         if self.layerkv_kvc_scheduler not in ("sync", "async-deadline"):
             raise ValueError(
                 "--layerkv-kvc-scheduler must be one of: sync, async-deadline"
             )
+        if self.layerkv_runtime_profile not in ("simple", "optimized"):
+            raise ValueError(
+                "--layerkv-runtime-profile must be one of: simple, optimized"
+            )
+        if self.layerkv_expert_install_layers_per_step <= 0:
+            raise ValueError("--layerkv-expert-install-layers-per-step must be positive")
+        if self.layerkv_expert_install_budget_mb < 0:
+            raise ValueError("--layerkv-expert-install-budget-mb must be non-negative")
+        if self.layerkv_expert_install_target_steps < 0:
+            raise ValueError("--layerkv-expert-install-target-steps must be non-negative")
+        if self.layerkv_expert_cpu_backing_mode not in ("none", "all"):
+            raise ValueError("--layerkv-expert-cpu-backing-mode must be one of: none, all")
 
         # v1 recovery is scheduled outside graph capture.
         if not self.disable_cuda_graph:
@@ -6384,6 +6410,7 @@ class ServerArgs:
                 "ratio-75-25",
                 "layer-aware-joint",
                 "layer-aware-joint-dp",
+                "coresid",
             ],
             default=ServerArgs.layerkv_policy,
             help="LayerKV policy. In kvc-expert mode, ratio and joint policies split target reclaim between physical KVC and supported standard FusedMoE expert slots.",
@@ -6395,10 +6422,30 @@ class ServerArgs:
             help="Target GPU memory pressure/reclaim in MB for LayerKV planning.",
         )
         parser.add_argument(
+            "--layerkv-dynamic-pressure-from-kvc",
+            action="store_true",
+            help=(
+                "Use current live KV demand as the LayerKV pressure estimate, "
+                "capped by --layerkv-target-reclaim-mb. This is intended for "
+                "end-to-end trace replay where pressure should grow with workload."
+            ),
+        )
+        parser.add_argument(
             "--layerkv-kvc-block-tokens",
             type=int,
             default=ServerArgs.layerkv_kvc_block_tokens,
             help="Logical KV block size used by LayerKV residency metadata.",
+        )
+        parser.add_argument(
+            "--layerkv-kvc-backend",
+            type=str,
+            choices=["token-slot", "per-layer-arena"],
+            default=ServerArgs.layerkv_kvc_backend,
+            help=(
+                "Physical KVC residency backend. token-slot uses SGLang's global "
+                "token KV slots and can only realize layer-average KVC eviction; "
+                "per-layer-arena is reserved for true layer-wise KVC residency."
+            ),
         )
         parser.add_argument(
             "--layerkv-kvc-scheduler",
@@ -6408,15 +6455,58 @@ class ServerArgs:
             help="KVC recovery scheduler. async-deadline launches reloads on a copy stream and waits at layer use points.",
         )
         parser.add_argument(
+            "--layerkv-runtime-profile",
+            type=str,
+            choices=["simple", "optimized"],
+            default=ServerArgs.layerkv_runtime_profile,
+            help="LayerKV runtime behavior profile. simple keeps baseline offload semantics; optimized enables LayerKV scheduler/prefetch/cache optimizations.",
+        )
+        parser.add_argument(
             "--layerkv-debug-stats",
             action="store_true",
             help="Emit verbose LayerKV runtime stats in debug logs.",
+        )
+        parser.add_argument(
+            "--layerkv-profile-detail",
+            action="store_true",
+            help="Collect lightweight aggregated LayerKV controller profiling buckets.",
         )
         parser.add_argument(
             "--layerkv-disallow-destructive-fallback",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.layerkv_disallow_destructive_fallback,
             help="Fail future physical LayerKV paths if they attempt destructive KV pointer replacement.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-backing-cache-mb",
+            type=float,
+            default=ServerArgs.layerkv_expert_backing_cache_mb,
+            help="Extra resident-expert CPU backing cache budget in MB. Offloaded expert backing is never dropped.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-cpu-backing-mode",
+            type=str,
+            choices=["none", "all"],
+            default=ServerArgs.layerkv_expert_cpu_backing_mode,
+            help="Preload expert CPU backing. 'all' keeps one CPU copy of every supported expert to avoid decode-time D2H install backup.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-install-layers-per-step",
+            type=int,
+            default=ServerArgs.layerkv_expert_install_layers_per_step,
+            help="Maximum expert layers to convert to LayerKV slots at each decode safe point.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-install-budget-mb",
+            type=float,
+            default=ServerArgs.layerkv_expert_install_budget_mb,
+            help="Approximate expert reclaim MB budget for each incremental install safe point. A single layer may exceed it to ensure progress.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-install-target-steps",
+            type=int,
+            default=ServerArgs.layerkv_expert_install_target_steps,
+            help="If positive, dynamically raises per-step expert install layers so the queued install completes within this many decode steps.",
         )
 
         # Hierarchical sparse attention

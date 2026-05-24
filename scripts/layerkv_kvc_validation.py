@@ -63,6 +63,7 @@ CSV_FIELDS = [
     "layerkv_policy",
     "layerkv_target_reclaim_mb",
     "layerkv_kvc_scheduler",
+    "layerkv_runtime_profile",
     "layerkv_physical_kvc_supported",
     "layerkv_physical_expert_supported",
     "layerkv_expert_layer_count",
@@ -79,6 +80,13 @@ CSV_FIELDS = [
     "planner_estimated_expert_cost",
     "planner_selected_kvc_reclaim_mb",
     "planner_selected_expert_reclaim_mb",
+    "planner_dp_infeasible_kvc_candidates",
+    "planner_dp_infeasible_expert_candidates",
+    "planner_dp_selected_total_cost",
+    "planner_dp_selected_kvc_cost",
+    "planner_dp_selected_expert_cost",
+    "selected_kvc_tokens_by_layer",
+    "selected_expert_evictions_by_layer",
     "planned_kvc_reclaim_mb",
     "physical_kvc_reclaim_mb",
     "planned_expert_reclaim_mb",
@@ -124,6 +132,17 @@ CSV_FIELDS = [
     "kvc_ready_before_use_ratio",
     "kvc_ready_before_use_count",
     "kvc_ready_use_check_count",
+    "unified_residency_enabled",
+    "resident_group_count",
+    "resident_group_kvc_count",
+    "resident_group_expert_count",
+    "resident_group_resident_count",
+    "resident_group_offloaded_count",
+    "resident_group_recovering_count",
+    "resident_group_recover_count",
+    "resident_group_wait_count",
+    "resident_group_state_error_count",
+    "resident_group_last_error",
     "layerkv_copy_event_record_count",
     "layerkv_copy_event_wait_count",
     "layerkv_deadline_miss_count",
@@ -193,6 +212,10 @@ def validate_run(
         reasons.append("kvc_stale_entry_count_nonzero")
     if int(stats.get("kvc_page_alignment_violation_count", 0) or 0) != 0:
         reasons.append("kvc_page_alignment_violation_count_nonzero")
+    if int(stats.get("resident_group_state_error_count", 0) or 0) != 0:
+        reasons.append(
+            f"resident_group_state_error:{stats.get('resident_group_last_error')}"
+        )
     if int(stats.get("kvc_page_size", 1) or 1) != page_size:
         reasons.append(f"kvc_page_size_mismatch expected={page_size} got={stats.get('kvc_page_size')}")
     if int(stats.get("kvc_host_used_tokens", 0) or 0) != int(

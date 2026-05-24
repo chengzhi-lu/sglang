@@ -1488,6 +1488,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
             torch.npu.empty_cache()
+        gc.collect()
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
