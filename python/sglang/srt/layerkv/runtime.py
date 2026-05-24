@@ -1182,6 +1182,16 @@ class LayerKVRuntime:
         group.ready_waited = bool(entry.ready_waited)
         return group
 
+    def _sync_kvc_group_if_needed(
+        self, entry: _LayerKVResidencyEntry
+    ) -> Optional[_LayerKVResidentTensorGroup]:
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and self.config.runtime_profile == "optimized"
+        ):
+            return None
+        return self._sync_kvc_group(entry)
+
     def _remove_resident_group(self, kind: str, layer_id: int, logical_id: Any) -> None:
         self._resident_groups.pop(self._residency_key(kind, layer_id, logical_id), None)
 
@@ -4221,8 +4231,9 @@ class LayerKVRuntime:
                 entry.ready_start_event = None
                 entry.ready_event = None
                 entry.ready_waited = False
-                group = self._sync_kvc_group(entry)
-                group.recover_count += 1
+                group = self._sync_kvc_group_if_needed(entry)
+                if group is not None:
+                    group.recover_count += 1
                 self.stats.resident_group_recover_count += 1
                 did_finalize = True
         self._pending_kvc_reload_events = still_pending
@@ -4293,7 +4304,13 @@ class LayerKVRuntime:
             self._refresh_kvc_residency_stats()
             return None
         token_count = sum(entry.token_count for entry in selected)
-        group_keys = tuple(self._sync_kvc_group(entry).key for entry in selected)
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and self.config.runtime_profile == "optimized"
+        ):
+            group_keys = ()
+        else:
+            group_keys = tuple(self._sync_kvc_group(entry).key for entry in selected)
         bytes_per_token = (
             self._bytes_per_kvc_token_per_layer()
             if self.config.kvc_backend == "per-layer-arena"
@@ -4569,7 +4586,7 @@ class LayerKVRuntime:
                             self._host_store.free([int(entry.host_slot)])
                     entry.host_slots = None
                     entry.host_slot = None
-                self._sync_kvc_group(entry)
+                self._sync_kvc_group_if_needed(entry)
             if async_copy and ready_event is not None:
                 self._pending_kvc_reload_events.append(
                     _LayerKVPendingReload(start_event, ready_event, list(selected))
@@ -4708,7 +4725,7 @@ class LayerKVRuntime:
                 entry.ready_start_event = None
                 entry.ready_waited = False
                 entry.last_access_step = self._decode_step
-                self._sync_kvc_group(entry)
+                self._sync_kvc_group_if_needed(entry)
         except Exception:
             if self.config.kvc_backend == "per-layer-arena":
                 offset = 0
@@ -5270,7 +5287,7 @@ class LayerKVRuntime:
                     existing.device_locs = locs
                     existing.page_size = page_size
                     existing.last_access_step = self._decode_step
-                self._sync_kvc_group(existing)
+                self._sync_kvc_group_if_needed(existing)
                 candidates.append(existing)
             candidates.sort(key=lambda x: (x.pos, x.req_idx))
             return candidates
@@ -5373,7 +5390,7 @@ class LayerKVRuntime:
                     existing.device_locs = locs
                     existing.page_size = page_size
                     existing.last_access_step = self._decode_step
-                self._sync_kvc_group(existing)
+                self._sync_kvc_group_if_needed(existing)
                 selected.append(existing)
         selected.sort(key=lambda x: (x.layer_id, x.pos, x.req_idx))
         self.stats.kvc_evict_candidate_selected_tokens += sum(
