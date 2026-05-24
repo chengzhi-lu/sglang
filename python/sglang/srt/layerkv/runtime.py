@@ -552,9 +552,10 @@ class _LayerKVExpertLayerState:
 class _LayerKVHostKVStore:
     """Compact pinned host backing for LayerKV-owned evicted MHA KV tokens."""
 
-    def __init__(self, kv_pool: Any, capacity_tokens: int):
+    def __init__(self, kv_pool: Any, capacity_tokens: int, *, per_layer_mode: bool = False):
         self.kv_pool = kv_pool
         self.capacity_tokens = max(1, int(capacity_tokens))
+        self.per_layer_mode = bool(per_layer_mode)
         self.free_slots: List[int] = list(range(self.capacity_tokens))
         self.used_slots = set()
         self.layer_num = int(kv_pool.layer_num)
@@ -565,9 +566,17 @@ class _LayerKVHostKVStore:
         v0 = kv_pool._get_value_buffer(self.start_layer)
         self.k_buffers = []
         self.v_buffers = []
+        self.layer_capacities: List[int] = [0 for _ in range(self.layer_num)]
+        self.layer_free_slots: List[List[int]] = [[] for _ in range(self.layer_num)]
+        self.layer_used_slots: List[Set[int]] = [set() for _ in range(self.layer_num)]
+        self.bytes_per_token_per_layer = int(k0[0].nbytes + v0[0].nbytes)
         self.bytes_per_token_all_layers = int(
             (k0[0].nbytes + v0[0].nbytes) * self.layer_num
         )
+        if self.per_layer_mode:
+            self.k_buffers = [None for _ in range(self.layer_num)]
+            self.v_buffers = [None for _ in range(self.layer_num)]
+            return
         for layer_offset in range(self.layer_num):
             layer_id = self.start_layer + layer_offset
             k_ref = kv_pool._get_key_buffer(layer_id)
@@ -592,17 +601,72 @@ class _LayerKVHostKVStore:
 
     @property
     def used_count(self) -> int:
+        if self.per_layer_mode:
+            return sum(len(slots) for slots in self.layer_used_slots)
         return len(self.used_slots)
 
     @property
     def used_mb(self) -> float:
+        if self.per_layer_mode:
+            return self.used_count * self.bytes_per_token_per_layer / float(1024 * 1024)
         return self.used_count * self.bytes_per_token_all_layers / float(1024 * 1024)
 
     @property
     def capacity_mb(self) -> float:
+        if self.per_layer_mode:
+            return (
+                sum(self.layer_capacities)
+                * self.bytes_per_token_per_layer
+                / float(1024 * 1024)
+            )
         return self.capacity_tokens * self.bytes_per_token_all_layers / float(1024 * 1024)
 
+    def _ensure_layer_capacity(self, layer_offset: int, need_free: int) -> None:
+        if not self.per_layer_mode or need_free <= len(self.layer_free_slots[layer_offset]):
+            return
+        layer_id = self.start_layer + layer_offset
+        k_ref = self.kv_pool._get_key_buffer(layer_id)
+        v_ref = self.kv_pool._get_value_buffer(layer_id)
+        old_capacity = self.layer_capacities[layer_offset]
+        used = len(self.layer_used_slots[layer_offset])
+        required = used + int(need_free)
+        new_capacity = max(required, old_capacity * 2 if old_capacity > 0 else 0, 64)
+        k_new = self._empty_cpu((new_capacity,) + tuple(k_ref.shape[1:]), k_ref.dtype)
+        v_new = self._empty_cpu((new_capacity,) + tuple(v_ref.shape[1:]), v_ref.dtype)
+        k_old = self.k_buffers[layer_offset]
+        v_old = self.v_buffers[layer_offset]
+        if old_capacity > 0 and k_old is not None and v_old is not None:
+            k_new[:old_capacity].copy_(k_old[:old_capacity])
+            v_new[:old_capacity].copy_(v_old[:old_capacity])
+        self.k_buffers[layer_offset] = k_new
+        self.v_buffers[layer_offset] = v_new
+        self.layer_free_slots[layer_offset].extend(range(old_capacity, new_capacity))
+        self.layer_capacities[layer_offset] = new_capacity
+
+    def alloc_per_layer(self, entries: List["_LayerKVResidencyEntry"]) -> Optional[List[int]]:
+        if not self.per_layer_mode:
+            return self.alloc(sum(entry.token_count for entry in entries))
+        need_by_layer: Dict[int, int] = {}
+        for entry in entries:
+            layer_offset = int(entry.layer_id) - self.start_layer
+            if layer_offset < 0 or layer_offset >= self.layer_num:
+                return None
+            need_by_layer[layer_offset] = need_by_layer.get(layer_offset, 0) + int(entry.token_count)
+        for layer_offset, need in need_by_layer.items():
+            self._ensure_layer_capacity(layer_offset, need)
+        out: List[int] = []
+        for entry in entries:
+            layer_offset = int(entry.layer_id) - self.start_layer
+            need = int(entry.token_count)
+            slots = self.layer_free_slots[layer_offset][:need]
+            del self.layer_free_slots[layer_offset][:need]
+            self.layer_used_slots[layer_offset].update(slots)
+            out.extend(slots)
+        return out
+
     def alloc(self, need: int) -> Optional[List[int]]:
+        if self.per_layer_mode:
+            raise RuntimeError("use alloc_per_layer for per-layer KVC host store")
         if need > len(self.free_slots):
             return None
         slots = self.free_slots[:need]
@@ -611,12 +675,31 @@ class _LayerKVHostKVStore:
         return slots
 
     def free(self, slots: List[int]) -> None:
+        if self.per_layer_mode:
+            raise RuntimeError("use free_per_layer for per-layer KVC host store")
         if not slots:
             return
         for slot in slots:
             if slot in self.used_slots:
                 self.used_slots.remove(slot)
                 self.free_slots.append(slot)
+
+    def free_per_layer(self, layer_id: int, slots: List[int]) -> None:
+        if not self.per_layer_mode:
+            self.free(slots)
+            return
+        if not slots:
+            return
+        layer_offset = int(layer_id) - self.start_layer
+        if layer_offset < 0 or layer_offset >= self.layer_num:
+            return
+        used = self.layer_used_slots[layer_offset]
+        free = self.layer_free_slots[layer_offset]
+        for slot in slots:
+            slot = int(slot)
+            if slot in used:
+                used.remove(slot)
+                free.append(slot)
 
     def backup(self, device_locs: torch.Tensor, host_slots: List[int]) -> float:
         if device_locs.numel() == 0:
@@ -1333,7 +1416,11 @@ class LayerKVRuntime:
         capacity_tokens = target_tokens + max(
             target_tokens, self._align_tokens_up(self.config.kvc_block_tokens)
         )
-        self._host_store = _LayerKVHostKVStore(self._kv_pool, capacity_tokens)
+        self._host_store = _LayerKVHostKVStore(
+            self._kv_pool,
+            capacity_tokens,
+            per_layer_mode=(self.config.kvc_backend == "per-layer-arena"),
+        )
         self.stats.kvc_host_capacity_tokens = self._host_store.capacity_tokens
         self.stats.kvc_host_backing_mb = self._host_store.capacity_mb
 
@@ -2827,24 +2914,29 @@ class LayerKVRuntime:
                 if use_tensor_batch:
                     for name in param_names:
                         param = getattr(module, name).data
-                        idx = torch.tensor(
-                            expert_ids,
-                            dtype=torch.long,
-                            device=param.device,
-                        )
-                        selected = param.index_select(0, idx).detach()
-                        try:
-                            dst = torch.empty(
-                                tuple(selected.shape),
-                                dtype=selected.dtype,
-                                device="cpu",
-                                pin_memory=True,
+                        max_chunk_bytes = 256 * 1024 * 1024
+                        per_expert_bytes = max(1, int(param[0].nbytes))
+                        chunk_size = max(1, max_chunk_bytes // per_expert_bytes)
+                        for begin in range(0, len(expert_ids), chunk_size):
+                            chunk = expert_ids[begin : begin + chunk_size]
+                            idx = torch.tensor(
+                                chunk,
+                                dtype=torch.long,
+                                device=param.device,
                             )
-                            dst.copy_(selected, non_blocking=True)
-                        except Exception:
-                            dst = selected.to("cpu", copy=True)
-                        for offset, expert_id in enumerate(expert_ids):
-                            copied[int(expert_id)][name] = dst[offset]
+                            selected = param.index_select(0, idx).detach()
+                            try:
+                                dst = torch.empty(
+                                    tuple(selected.shape),
+                                    dtype=selected.dtype,
+                                    device="cpu",
+                                    pin_memory=True,
+                                )
+                                dst.copy_(selected, non_blocking=True)
+                            except Exception:
+                                dst = selected.to("cpu", copy=True)
+                            for offset, expert_id in enumerate(chunk):
+                                copied[int(expert_id)][name] = dst[offset]
                 else:
                     for name in param_names:
                         param = getattr(module, name).data
@@ -2901,25 +2993,31 @@ class LayerKVRuntime:
                     try:
                         for name in state.param_names:
                             param = getattr(state.module, name).data
-                            idx = torch.tensor(
-                                slot_ids,
-                                dtype=torch.long,
-                                device=param.device,
-                            )
-                            selected = param.index_select(0, idx).detach()
-                            try:
-                                dst = torch.empty(
-                                    tuple(selected.shape),
-                                    dtype=selected.dtype,
-                                    device="cpu",
-                                    pin_memory=True,
+                            max_chunk_bytes = 256 * 1024 * 1024
+                            per_expert_bytes = max(1, int(param[0].nbytes))
+                            chunk_size = max(1, max_chunk_bytes // per_expert_bytes)
+                            for begin in range(0, len(evicted_pairs), chunk_size):
+                                chunk_pairs = evicted_pairs[begin : begin + chunk_size]
+                                chunk_slots = slot_ids[begin : begin + chunk_size]
+                                idx = torch.tensor(
+                                    chunk_slots,
+                                    dtype=torch.long,
+                                    device=param.device,
                                 )
-                                dst.copy_(selected, non_blocking=True)
-                            except Exception:
-                                dst = selected.to("cpu", copy=True)
-                            copied_bytes += int(dst.nbytes)
-                            for offset, (logical_id, _slot_id) in enumerate(evicted_pairs):
-                                copied[int(logical_id)][name] = dst[offset]
+                                selected = param.index_select(0, idx).detach()
+                                try:
+                                    dst = torch.empty(
+                                        tuple(selected.shape),
+                                        dtype=selected.dtype,
+                                        device="cpu",
+                                        pin_memory=True,
+                                    )
+                                    dst.copy_(selected, non_blocking=True)
+                                except Exception:
+                                    dst = selected.to("cpu", copy=True)
+                                copied_bytes += int(dst.nbytes)
+                                for offset, (logical_id, _slot_id) in enumerate(chunk_pairs):
+                                    copied[int(logical_id)][name] = dst[offset]
                         self.stats.expert_eviction_d2h_batched_count += len(evicted_pairs)
                         self.stats.expert_eviction_d2h_batched_mb += copied_bytes / float(
                             1024 * 1024
@@ -4075,7 +4173,10 @@ class LayerKVRuntime:
                     continue
                 host_slots = entry.host_slot_list()
                 if host_slots:
-                    self._host_store.free(host_slots)
+                    if self.config.kvc_backend == "per-layer-arena":
+                        self._host_store.free_per_layer(entry.layer_id, host_slots)
+                    else:
+                        self._host_store.free(host_slots)
                 entry.host_slots = None
                 entry.host_slot = None
                 entry.state = "resident"
@@ -4414,9 +4515,15 @@ class LayerKVRuntime:
                 else:
                     entry.state = "resident"
                     if entry.host_slots is not None:
-                        self._host_store.free(entry.host_slots)
+                        if self.config.kvc_backend == "per-layer-arena":
+                            self._host_store.free_per_layer(entry.layer_id, entry.host_slots)
+                        else:
+                            self._host_store.free(entry.host_slots)
                     elif entry.host_slot is not None:
-                        self._host_store.free([int(entry.host_slot)])
+                        if self.config.kvc_backend == "per-layer-arena":
+                            self._host_store.free_per_layer(entry.layer_id, [int(entry.host_slot)])
+                        else:
+                            self._host_store.free([int(entry.host_slot)])
                     entry.host_slots = None
                     entry.host_slot = None
                 self._sync_kvc_group(entry)
@@ -4511,7 +4618,11 @@ class LayerKVRuntime:
             self.stats.selected_kvc_tokens_by_layer = self._kvc_tokens_by_layer_json(
                 token_count
             )
-        host_slots = self._host_store.alloc(token_count)
+        host_slots = (
+            self._host_store.alloc_per_layer(selected)
+            if self.config.kvc_backend == "per-layer-arena"
+            else self._host_store.alloc(token_count)
+        )
         if host_slots is None:
             self.stats.kvc_physical_failure_count += 1
             self.stats.comparable = False
@@ -4552,7 +4663,14 @@ class LayerKVRuntime:
                 entry.last_access_step = self._decode_step
                 self._sync_kvc_group(entry)
         except Exception:
-            self._host_store.free(host_slots)
+            if self.config.kvc_backend == "per-layer-arena":
+                offset = 0
+                for entry in selected:
+                    slots = host_slots[offset : offset + entry.token_count]
+                    offset += entry.token_count
+                    self._host_store.free_per_layer(entry.layer_id, slots)
+            else:
+                self._host_store.free(host_slots)
             self.stats.kvc_physical_failure_count += 1
             self.stats.comparable = False
             self.stats.comparability_reason = "KVC eviction failed"
@@ -4678,9 +4796,16 @@ class LayerKVRuntime:
                 for req_idx, seq_len in self._batch_req_indices_and_lens(forward_batch)
             }
 
-        host_used_slots = (
-            set(self._host_store.used_slots) if self._host_store is not None else set()
-        )
+        if self._host_store is not None and self.config.kvc_backend == "per-layer-arena":
+            host_used_slots = {
+                (self._host_store.start_layer + layer_offset, int(slot))
+                for layer_offset, slots in enumerate(self._host_store.layer_used_slots)
+                for slot in slots
+            }
+        else:
+            host_used_slots = (
+                set(self._host_store.used_slots) if self._host_store is not None else set()
+            )
 
         if self.config.kvc_backend == "per-layer-arena":
             iter_entries = [
@@ -4718,13 +4843,18 @@ class LayerKVRuntime:
                     stale_count += 1
                     reasons.append("offloaded_missing_host_slot")
                 for host_slot in host_slots:
-                    if host_slot in seen_host_slots:
+                    host_key = (
+                        (int(entry.layer_id), int(host_slot))
+                        if self.config.kvc_backend == "per-layer-arena"
+                        else int(host_slot)
+                    )
+                    if host_key in seen_host_slots:
                         stale_count += 1
                         reasons.append("duplicate_host_slot")
-                    elif self._host_store is not None and int(host_slot) not in host_used_slots:
+                    elif self._host_store is not None and host_key not in host_used_slots:
                         stale_count += 1
                         reasons.append("host_slot_not_marked_used")
-                    seen_host_slots.add(int(host_slot))
+                    seen_host_slots.add(host_key)
                 if entry.device_loc is not None:
                     stale_count += 1
                     reasons.append("offloaded_has_device_loc")
@@ -4924,20 +5054,19 @@ class LayerKVRuntime:
     def _drop_per_layer_residency_keys(self, keys: List[Tuple[int, int, int]]) -> None:
         if not keys:
             return
-        host_slots = []
         for key in keys:
             entry = self._per_layer_residency.pop(key, None)
             if entry is not None:
                 if entry.ready_event is not None and not entry.ready_event.query():
                     entry.ready_event.synchronize()
-                host_slots.extend(entry.host_slot_list())
+                host_slots = entry.host_slot_list()
+                if host_slots and self._host_store is not None:
+                    self._host_store.free_per_layer(entry.layer_id, host_slots)
                 self._remove_resident_group(
                     "kvc",
                     int(entry.layer_id),
                     (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
                 )
-        if host_slots and self._host_store is not None:
-            self._host_store.free(host_slots)
         self._refresh_kvc_residency_stats()
 
     def _select_required_offloaded_entries(

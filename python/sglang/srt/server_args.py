@@ -777,7 +777,6 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
-    delete_ckpt_after_loading: bool = False
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
@@ -6864,11 +6863,6 @@ class ServerArgs:
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
             "This can potentially increase throughput but may also increase time-to-first-token latency. "
             "The default value is 1, meaning only run one decoding step at a time.",
-        )
-        parser.add_argument(
-            "--delete-ckpt-after-loading",
-            action="store_true",
-            help="Delete the model checkpoint after loading the model.",
         )
         parser.add_argument(
             "--enable-memory-saver",

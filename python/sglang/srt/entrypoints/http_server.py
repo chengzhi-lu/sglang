@@ -2032,9 +2032,6 @@ def _wait_and_warmup(
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
-    if server_args.delete_ckpt_after_loading:
-        delete_directory(server_args.model_path)
-
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
 
