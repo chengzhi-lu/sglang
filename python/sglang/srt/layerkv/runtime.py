@@ -5349,11 +5349,10 @@ class LayerKVRuntime:
                 loc_offset += page_size
                 if any(loc <= 0 for loc in locs):
                     continue
-                if page_size > 1:
-                    base = locs[0]
-                    if locs != list(range(base, base + page_size)) or base % page_size != 0:
-                        self.stats.kvc_page_alignment_violation_count += 1
-                        continue
+                # Per-layer arena blocks are logical token ranges, not physical
+                # contiguous KV slots. SGLang's req_to_token table may map a
+                # contiguous logical range to non-contiguous physical slots, and
+                # the arena stores the exact loc list for restore/rewrite.
                 if existing is None:
                     existing = _LayerKVResidencyEntry(
                         req_idx=req_idx,
