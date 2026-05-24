@@ -2193,7 +2193,18 @@ class LayerKVRuntime:
         total_tokens = self._align_tokens_down(int(total_tokens))
         if total_tokens <= 0:
             return {}
-        avg_prefix = max(1.0, self._avg_prefix_len(forward_batch))
+        pairs = self._batch_req_indices_and_lens(forward_batch)
+        max_tokens_per_layer = sum(
+            self._align_tokens_down(max(0, int(seq_len) - 1))
+            for _req_idx, seq_len in pairs
+        )
+        if max_tokens_per_layer <= 0:
+            max_tokens_per_layer = int(max(1.0, self._avg_prefix_len(forward_batch)))
+        max_tokens_per_layer = self._align_tokens_down(max_tokens_per_layer)
+        total_capacity = max_tokens_per_layer * len(layer_ids)
+        total_tokens = min(total_tokens, total_capacity)
+        if total_tokens <= 0:
+            return {}
         # v1 keeps the DP output layer-aware by assigning more reclaim to later
         # layers, where KVC reload has more forward-path overlap.  This is a
         # deterministic plan and does not change baseline layer-average policy
@@ -2207,7 +2218,7 @@ class LayerKVRuntime:
         plan: Dict[int, int] = {}
         for layer_id in layer_ids:
             raw = int(round(total_tokens * weights[int(layer_id)] / weight_sum))
-            tokens = min(int(avg_prefix), self._align_tokens_down(raw))
+            tokens = min(max_tokens_per_layer, self._align_tokens_down(raw))
             tokens = tokens - (tokens % block_tokens)
             if tokens > 0:
                 plan[int(layer_id)] = tokens
@@ -2216,7 +2227,7 @@ class LayerKVRuntime:
             for layer_id in reversed(layer_ids):
                 if remaining <= 0:
                     break
-                add = min(int(avg_prefix) - plan.get(int(layer_id), 0), remaining)
+                add = min(max_tokens_per_layer - plan.get(int(layer_id), 0), remaining)
                 add = add - (add % block_tokens)
                 if add <= 0:
                     continue
@@ -4256,10 +4267,15 @@ class LayerKVRuntime:
             return None
         token_count = sum(entry.token_count for entry in selected)
         group_keys = tuple(self._sync_kvc_group(entry).key for entry in selected)
+        bytes_per_token = (
+            self._bytes_per_kvc_token_per_layer()
+            if self.config.kvc_backend == "per-layer-arena"
+            else self._bytes_per_token_all_layers
+        )
         return _LayerKVRecoveryTask(
             kind="kvc",
             layer_id=-1,
-            bytes=int(token_count * self._bytes_per_token_all_layers),
+            bytes=int(token_count * bytes_per_token),
             deadline_layer=0,
             group_keys=group_keys,
             entries=tuple(selected),
@@ -4537,17 +4553,21 @@ class LayerKVRuntime:
             self.stats.comparability_reason = "KVC reload failed"
             raise
 
-        reload_mb = token_count * self._bytes_per_token_all_layers / float(1024 * 1024)
+        if self.config.kvc_backend == "per-layer-arena":
+            reload_mb = (
+                token_count
+                * self._bytes_per_kvc_token_per_layer()
+                / float(1024 * 1024)
+            )
+        else:
+            reload_mb = token_count * self._bytes_per_token_all_layers / float(1024 * 1024)
         self.stats.kvc_reload_count_total += token_count
         self.stats.kvc_reload_page_count_total += len(selected)
         self.stats.kvc_reload_mb_total += reload_mb
         self.stats.kvc_reload_ms += elapsed_ms
         if self.config.kvc_backend == "per-layer-arena":
-            per_layer_mb = (
-                token_count * self._bytes_per_kvc_token_per_layer() / float(1024 * 1024)
-            )
             self.stats.kvc_per_layer_reload_count += token_count
-            self.stats.kvc_per_layer_reload_mb_total += per_layer_mb
+            self.stats.kvc_per_layer_reload_mb_total += reload_mb
             self.stats.kvc_per_layer_reload_ms += elapsed_ms
         self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
         self.stats.layerkv_kvc_reload_started += 1
