@@ -1839,32 +1839,9 @@ class LayerKVRuntime:
             return 0.0
         if self.config.kvc_backend == "per-layer-arena":
             return self._estimate_arena_kvc_reclaim_cost(reclaim_mb, forward_batch)
-        return self._estimate_legacy_token_slot_kvc_reclaim_cost(
-            reclaim_mb, forward_batch
-        )
-
-    def _estimate_legacy_token_slot_kvc_reclaim_cost(
-        self, reclaim_mb: float, forward_batch: Any
-    ) -> float:
-        avg_prefix = self._avg_prefix_len(forward_batch)
-        cost_per_mb = max(0.1, avg_prefix / 1024.0)
-        if avg_prefix <= 2048:
-            # Short-context batch-heavy runs have little KV value but expensive
-            # physical backup/controller overhead when reclaiming thousands of MB
-            # across many requests.  Without this term, churn-aware expert cost
-            # incorrectly pushes the planner into KVC-only reclaim.
-            cost_per_mb = max(cost_per_mb, 8.0)
-        elif avg_prefix >= 8192:
-            # Long-context KVC reload can be issued far before the layer use
-            # point, but the current SGLang KVC eviction path still has heavy
-            # controller/backup cost for multi-GB reclaim.  Keep this conservative
-            # until the KVC selector is vectorized.
-            cost_per_mb = 1.00
-        controller_cost = 0.0
-        if reclaim_mb > 0.0:
-            controller_cost = 0.02 * reclaim_mb
-        self.stats.planner_estimated_kvc_controller_cost = controller_cost
-        return reclaim_mb * cost_per_mb + controller_cost
+        self.stats.planner_estimated_kvc_controller_cost = 0.0
+        self.stats.planner_fallback_reason = "kvc_cost_requires_per_layer_arena"
+        return 1.0e30
 
     def _estimate_arena_kvc_reclaim_cost(self, reclaim_mb: float, forward_batch: Any) -> float:
         token_plan = self._arena_kvc_token_plan_for_reclaim(reclaim_mb, forward_batch)
