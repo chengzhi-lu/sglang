@@ -94,6 +94,12 @@ SUMMARY_FIELDS = [
     "kvc_per_layer_reload_count",
     "kvc_per_layer_reload_mb_total",
     "selected_kvc_tokens_by_layer",
+    "selected_expert_evictions_by_layer",
+    "selected_expert_capacity_by_layer",
+    "selected_expert_cost_by_layer",
+    "applied_expert_evictions_by_layer",
+    "expert_plan_match",
+    "expert_plan_mismatch_reason",
     "request_count",
     "success_count",
     "failed_count",
@@ -214,8 +220,16 @@ def _terminate(proc: subprocess.Popen) -> None:
         proc.wait(timeout=30)
 
 
-def load_trace(path: str, window_s: float, max_requests: int) -> List[Dict[str, Any]]:
-    rows: List[Tuple[dt.datetime, int, int]] = []
+def load_trace(
+    path: str,
+    window_s: float,
+    max_requests: int,
+    window_start_s: float = 0.0,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    first_ts: Optional[dt.datetime] = None
+    window_start_s = max(0.0, float(window_start_s or 0.0))
+    window_end_s = window_start_s + float(window_s)
     with open(path, newline="", errors="replace") as f:
         for row in csv.DictReader(f):
             try:
@@ -224,26 +238,26 @@ def load_trace(path: str, window_s: float, max_requests: int) -> List[Dict[str, 
                 out = max(1, int(row["GeneratedTokens"]))
             except Exception:
                 continue
-            rows.append((ts, ctx, out))
+            if first_ts is None:
+                first_ts = ts
+            arrival_from_start_s = (ts - first_ts).total_seconds()
+            if arrival_from_start_s < window_start_s:
+                continue
+            if arrival_from_start_s >= window_end_s:
+                break
+            rows.append(
+                {
+                    "request_id": len(rows),
+                    "arrival_s": float(arrival_from_start_s - window_start_s),
+                    "target_context_tokens": int(ctx),
+                    "target_output_tokens": int(out),
+                }
+            )
+            if max_requests > 0 and len(rows) >= max_requests:
+                break
     if not rows:
         raise RuntimeError(f"empty trace: {path}")
-    start = rows[0][0]
-    selected = []
-    for ts, ctx, out in rows:
-        arrival_s = (ts - start).total_seconds()
-        if arrival_s > window_s:
-            break
-        selected.append(
-            {
-                "request_id": len(selected),
-                "arrival_s": float(arrival_s),
-                "target_context_tokens": int(ctx),
-                "target_output_tokens": int(out),
-            }
-        )
-        if max_requests > 0 and len(selected) >= max_requests:
-            break
-    return selected
+    return rows
 
 
 def _assign_prompt(
@@ -354,7 +368,12 @@ def fill_from_wildchat(
 def build_payload(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     from transformers import AutoTokenizer
 
-    rows = load_trace(args.trace_path, args.trace_window_s, args.max_requests)
+    rows = load_trace(
+        args.trace_path,
+        args.trace_window_s,
+        args.max_requests,
+        args.trace_window_start_s,
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     outstanding = sorted(
         (int(row["target_context_tokens"]), idx) for idx, row in enumerate(rows)
@@ -374,6 +393,7 @@ def build_payload(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[
     ).hexdigest()[:16]
     metadata = {
         "trace_path": args.trace_path,
+        "trace_window_start_s": args.trace_window_start_s,
         "trace_window_s": args.trace_window_s,
         "request_count": len(rows),
         "payload_hash": payload_hash,
@@ -386,6 +406,126 @@ def build_payload(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[
         "sharegpt_count": sum(1 for r in rows if r.get("prompt_source") == "sharegpt"),
         "wildchat_count": sum(1 for r in rows if r.get("prompt_source") == "wildchat"),
     }
+    return rows, metadata
+
+
+def _payload_config(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "model_path": str(args.model_path),
+        "trace_path": str(args.trace_path),
+        "trace_window_start_s": float(args.trace_window_start_s),
+        "trace_window_s": float(args.trace_window_s),
+        "max_requests": int(args.max_requests),
+        "sharegpt_path": str(args.sharegpt_path),
+        "wildchat_path": str(args.wildchat_path),
+    }
+
+
+def payload_cache_paths(args: argparse.Namespace, output_dir: Path) -> Tuple[Path, Path]:
+    if args.payload_path:
+        payload_path = Path(args.payload_path)
+    else:
+        payload_path = output_dir / "trace_payload_full.jsonl"
+    meta_path = Path(str(payload_path) + ".meta.json")
+    return payload_path, meta_path
+
+
+def _payload_hash(rows: List[Dict[str, Any]]) -> str:
+    payload = [
+        [
+            row["arrival_s"],
+            row["target_context_tokens"],
+            row["target_output_tokens"],
+            row["input_ids"],
+        ]
+        for row in rows
+    ]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+def load_payload_cache(
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+    payload_path, meta_path = payload_cache_paths(args, output_dir)
+    if not args.reuse_payload or not payload_path.exists() or not meta_path.exists():
+        return None
+    try:
+        metadata = json.loads(meta_path.read_text())
+    except Exception:
+        return None
+    if metadata.get("payload_config") != _payload_config(args):
+        if not args.force_reuse_payload:
+            return None
+    rows: List[Dict[str, Any]] = []
+    with payload_path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            row["request_id"] = int(row["request_id"])
+            row["arrival_s"] = float(row["arrival_s"])
+            row["target_context_tokens"] = int(row["target_context_tokens"])
+            row["actual_context_tokens"] = int(row["actual_context_tokens"])
+            row["target_output_tokens"] = int(row["target_output_tokens"])
+            row["input_ids"] = [int(x) for x in row["input_ids"]]
+            rows.append(row)
+    if not rows:
+        return None
+    metadata["payload_reused"] = True
+    metadata["payload_path"] = str(payload_path)
+    return rows, metadata
+
+
+def save_payload_cache(
+    args: argparse.Namespace,
+    output_dir: Path,
+    rows: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+) -> None:
+    payload_path, meta_path = payload_cache_paths(args, output_dir)
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(str(payload_path) + ".tmp")
+    with tmp_path.open("w") as f:
+        for row in rows:
+            f.write(
+                json.dumps(
+                    {
+                        "request_id": int(row["request_id"]),
+                        "arrival_s": float(row["arrival_s"]),
+                        "target_context_tokens": int(row["target_context_tokens"]),
+                        "actual_context_tokens": int(row["actual_context_tokens"]),
+                        "target_output_tokens": int(row["target_output_tokens"]),
+                        "prompt_source": row.get("prompt_source", ""),
+                        "prompt_record_id": row.get("prompt_record_id", ""),
+                        "input_ids": row["input_ids"],
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    tmp_path.replace(payload_path)
+    cache_meta = {
+        **metadata,
+        "payload_config": _payload_config(args),
+        "payload_path": str(payload_path),
+        "payload_reused": False,
+    }
+    meta_path.write_text(json.dumps(cache_meta, indent=2, sort_keys=True))
+
+
+def get_or_build_payload(
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    cached = load_payload_cache(args, output_dir)
+    if cached is not None:
+        return cached
+    rows, metadata = build_payload(args)
+    metadata["payload_hash"] = _payload_hash(rows)
+    metadata["payload_reused"] = False
+    save_payload_cache(args, output_dir, rows, metadata)
     return rows, metadata
 
 
@@ -550,6 +690,17 @@ def validate_summary(spec: PolicyRun, returncode: int, stats: Dict[str, Any], fa
             reasons.append(f"expert_guard_failed:{stats.get('expert_guard_reason')}")
         if _to_int(stats.get("resident_group_state_error_count")) != 0:
             reasons.append("resident_group_state_error")
+        if spec.policy == "coresid":
+            if not stats.get("selected_expert_evictions_by_layer"):
+                reasons.append("missing_selected_expert_plan")
+            if not stats.get("selected_expert_capacity_by_layer"):
+                reasons.append("missing_selected_expert_capacity_plan")
+            if not stats.get("applied_expert_evictions_by_layer"):
+                reasons.append("missing_applied_expert_plan")
+            if str(stats.get("expert_plan_match", True)) != "True":
+                reasons.append(
+                    f"expert_plan_mismatch:{stats.get('expert_plan_mismatch_reason')}"
+                )
     return not reasons, ";".join(reasons)
 
 
@@ -669,8 +820,30 @@ def main() -> int:
     parser.add_argument("--wildchat-path", default=WILDCHAT_PATH)
     parser.add_argument("--output-dir", default="outputs/layerkv/azure_trace_policy_eval")
     parser.add_argument("--gpu", default="1")
+    parser.add_argument("--trace-window-start-s", type=float, default=0.0)
     parser.add_argument("--trace-window-s", type=float, default=300.0)
     parser.add_argument("--max-requests", type=int, default=0)
+    parser.add_argument(
+        "--payload-path",
+        default="",
+        help="Path to a reusable JSONL payload containing input_ids. Defaults to <output-dir>/trace_payload_full.jsonl.",
+    )
+    parser.add_argument(
+        "--reuse-payload",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse an existing payload cache when its metadata matches the current trace/model settings.",
+    )
+    parser.add_argument(
+        "--force-reuse-payload",
+        action="store_true",
+        help="Reuse --payload-path even if metadata does not match. Intended only for deliberate A/B reruns.",
+    )
+    parser.add_argument(
+        "--prepare-payload-only",
+        action="store_true",
+        help="Build or load the reusable payload and exit before launching any policy.",
+    )
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--max-client-workers", type=int, default=128)
     parser.add_argument("--max-total-tokens", type=int, default=0)
@@ -680,8 +853,11 @@ def main() -> int:
     parser.add_argument(
         "--baseline-kvc-backend",
         choices=["token-slot", "per-layer-arena"],
-        default="token-slot",
-        help="KVC backend for non-DP baselines. Keep token-slot for layer-average baseline semantics.",
+        default="per-layer-arena",
+        help=(
+            "KVC backend for non-DP baselines. Use per-layer-arena by default "
+            "so baseline KVC reclaim is physical and safe under hard KV-table pressure."
+        ),
     )
     parser.add_argument(
         "--dp-kvc-backend",
@@ -715,7 +891,7 @@ def main() -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows, metadata = build_payload(args)
+    rows, metadata = get_or_build_payload(args, output_dir)
     (output_dir / "run_config.json").write_text(json.dumps({**vars(args), **metadata}, indent=2, sort_keys=True))
     payload_rows = [
         {k: v for k, v in row.items() if k != "input_ids"}
@@ -725,10 +901,42 @@ def main() -> int:
         "request_id", "arrival_s", "target_context_tokens", "actual_context_tokens",
         "target_output_tokens", "prompt_source", "prompt_record_id",
     ])
+    if args.prepare_payload_only:
+        result = {
+            "payload_path": metadata.get("payload_path", str(payload_cache_paths(args, output_dir)[0])),
+            "payload_hash": metadata.get("payload_hash", ""),
+            "payload_reused": metadata.get("payload_reused", False),
+            "request_count": len(rows),
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
 
     selected = [p for p in POLICY_RUNS if p.scenario in set(args.policies)]
     all_request_rows: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
+
+    def write_partial_outputs() -> None:
+        write_csv(output_dir / "per_request.csv", all_request_rows, PER_REQUEST_FIELDS)
+        write_csv(output_dir / "policy_summary.csv", summary_rows, SUMMARY_FIELDS)
+        valid_rows = [r for r in summary_rows if str(r.get("valid")) == "True"]
+        best = max(
+            valid_rows,
+            key=lambda r: _to_float(r.get("output_throughput_tok_s")),
+            default={},
+        )
+        result = {
+            "summary_csv": str(output_dir / "policy_summary.csv"),
+            "per_request_csv": str(output_dir / "per_request.csv"),
+            "request_count": len(rows),
+            "best_policy": best.get("policy", ""),
+            "best_output_throughput_tok_s": best.get("output_throughput_tok_s", 0.0),
+            "all_valid": len(valid_rows) == len(summary_rows),
+            "rows": summary_rows,
+        }
+        (output_dir / "summary.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True)
+        )
+
     for spec in selected:
         print(f"[azure-trace] running {spec.scenario}", flush=True)
         summary, request_rows = run_policy(args, spec, rows, output_dir)
@@ -741,8 +949,7 @@ def main() -> int:
             f"tpot_p95={summary['tpot_ms_p95']:.3f} reason={summary['validation_reason']}",
             flush=True,
         )
-        write_csv(output_dir / "per_request.csv", all_request_rows, PER_REQUEST_FIELDS)
-        write_csv(output_dir / "policy_summary.csv", summary_rows, SUMMARY_FIELDS)
+        write_partial_outputs()
 
     valid_rows = [r for r in summary_rows if str(r.get("valid")) == "True"]
     best = max(valid_rows, key=lambda r: _to_float(r.get("output_throughput_tok_s")), default={})
@@ -756,6 +963,8 @@ def main() -> int:
         "rows": summary_rows,
     }
     (output_dir / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+    write_csv(output_dir / "per_request.csv", all_request_rows, PER_REQUEST_FIELDS)
+    write_csv(output_dir / "policy_summary.csv", summary_rows, SUMMARY_FIELDS)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["all_valid"] else 1
 
