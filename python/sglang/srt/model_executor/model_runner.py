@@ -3260,7 +3260,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device_timer
             else contextlib.nullcontext()
         )
-        layerkv_runtime = getattr(self, "layerkv_runtime", None)
+        layerkv_runtime = (
+            getattr(self, "layerkv_runtime", None)
+            if self.server_args.disaggregation_mode == "null"
+            else None
+        )
         if layerkv_runtime is not None:
             layerkv_runtime.on_forward_begin(mode="extend", forward_batch=forward_batch)
         with ctx:

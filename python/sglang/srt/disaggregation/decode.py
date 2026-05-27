@@ -854,17 +854,14 @@ class DecodePreallocQueue:
             )
 
             if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
+                    max(
+                        required_tokens_for_request,
+                        origin_input_len
+                        - prefix_len
+                        + self._estimated_output_tokens(decode_req.req)
+                        - retractable_tokens,
                     )
-                    - retractable_tokens,
-                )
-                > full_allocatable_tokens
+                    > full_allocatable_tokens
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
@@ -877,10 +874,7 @@ class DecodePreallocQueue:
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
-                )
+                max_new_tokens = self._estimated_output_tokens(decode_req.req)
                 if (
                     max(
                         swa_required,
@@ -1011,13 +1005,19 @@ class DecodePreallocQueue:
             len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
         )
 
+    def _estimated_output_tokens(self, req: Req) -> int:
+        estimate = self.scheduler.server_args.disaggregation_decode_output_estimate_tokens
+        if estimate is not None:
+            return min(max(0, estimate), CLIP_MAX_NEW_TOKEN)
+        return min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
     ) -> int:
         need_space_for_single_req = (
             max(
                 [
-                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    self._estimated_output_tokens(x)
                     + len(x.origin_input_ids)
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
@@ -1134,7 +1134,7 @@ class DecodePreallocQueue:
         ):
             need_swa_space_for_single_req = max(
                 self._swa_tail_len(len(x.origin_input_ids))
-                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                + self._estimated_output_tokens(x)
                 - retractable_swa_tokens
                 for x in self.scheduler.running_batch.reqs
             )

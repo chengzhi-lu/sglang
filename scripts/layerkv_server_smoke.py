@@ -63,6 +63,7 @@ CSV_FIELDS = [
     "response_text",
     "layerkv_mode",
     "layerkv_policy",
+    "layerkv_worker_role",
     "comparable",
     "comparability_reason",
     "planned_kvc_reclaim_mb",
@@ -77,6 +78,12 @@ CSV_FIELDS = [
     "kvc_guard_reason",
     "expert_guard_pass",
     "expert_guard_reason",
+    "native_scheduler_observation_count",
+    "native_schedule_policy",
+    "native_schedule_forward_mode",
+    "native_schedule_batch_size",
+    "native_schedule_waiting_queue_len",
+    "native_schedule_running_batch_size",
     "actual_reclaim_limited_by_workload",
     "summary_path",
     "stdout_path",
@@ -172,6 +179,8 @@ def launch_command(
         "triton",
         "--grammar-backend",
         "none",
+        "--schedule-policy",
+        args.schedule_policy,
         "--log-level",
         args.log_level,
     ]
@@ -403,6 +412,7 @@ def main() -> int:
     parser.add_argument("--layerkv-mode", default="kvc-expert")
     parser.add_argument("--layerkv-policy", default="layer-aware-joint-dp")
     parser.add_argument("--target-reclaim-mb", type=float, default=512.0)
+    parser.add_argument("--schedule-policy", default="fcfs")
     parser.add_argument("--kvc-block-tokens", type=int, default=16)
     parser.add_argument("--kvc-scheduler", default="async-deadline")
     parser.add_argument(

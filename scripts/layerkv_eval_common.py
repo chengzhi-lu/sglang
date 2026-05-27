@@ -15,7 +15,6 @@ import subprocess
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-
 DEFAULT_MODEL_PATH = (
     "/data/wenyan/.cache/huggingface/hub/"
     "models--Qwen--Qwen3-30B-A3B/"
@@ -183,9 +182,9 @@ def _prompt_metadata(
         "context_len_max": int(max(counts)),
         "context_len_mean": float(sum(counts) / len(counts)),
         "context_len_p50": int(sorted(counts)[len(counts) // 2]),
-        "context_len_p95": int(sorted(counts)[
-            min(len(counts) - 1, int(len(counts) * 0.95))
-        ]),
+        "context_len_p95": int(
+            sorted(counts)[min(len(counts) - 1, int(len(counts) * 0.95))]
+        ),
     }
 
 
@@ -230,12 +229,14 @@ def load_sharegpt_fig4_prompts(
             rec.get("id")
             or hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
         )
-        selected.append({
-            "record_id": rec_id,
-            "text": text,
-            "token_count": n_tokens,
-            "selection_index": idx,
-        })
+        selected.append(
+            {
+                "record_id": rec_id,
+                "text": text,
+                "token_count": n_tokens,
+                "selection_index": idx,
+            }
+        )
     if len(selected) < num_prompts:
         raise InsufficientPromptsError(
             f"only {len(selected)}/{num_prompts} ShareGPT prompts in "
@@ -277,7 +278,9 @@ def load_wildchat_fig4_prompts(
     root = Path(path)
     if not root.exists():
         raise FileNotFoundError(f"WildChat path not found: {root}")
-    candidates = [root] if root.is_file() else sorted(x for x in root.rglob("*") if x.is_file())
+    candidates = (
+        [root] if root.is_file() else sorted(x for x in root.rglob("*") if x.is_file())
+    )
     files = []
     for item in candidates:
         try:
@@ -354,12 +357,14 @@ def load_wildchat_fig4_prompts(
             rec.get("conversation_hash")
             or hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
         )
-        selected.append({
-            "record_id": rec_id,
-            "text": text,
-            "token_count": n_tokens,
-            "selection_index": examined - 1,
-        })
+        selected.append(
+            {
+                "record_id": rec_id,
+                "text": text,
+                "token_count": n_tokens,
+                "selection_index": examined - 1,
+            }
+        )
 
     for kind, item in files:
         if len(selected) >= num_prompts:
@@ -405,7 +410,9 @@ def load_wildchat_fig4_prompts(
     )
 
 
-def load_fig4_prompt_ids(args: Any, tokenizer: Any) -> Tuple[List[List[int]], Dict[str, Any]]:
+def load_fig4_prompt_ids(
+    args: Any, tokenizer: Any
+) -> Tuple[List[List[int]], Dict[str, Any]]:
     if not getattr(args, "fig4_aligned", False):
         raise ValueError("Fig4 prompt loading requires a known Fig4 workload")
     if args.fig4_dataset_name == "WildChat-1M":
@@ -427,14 +434,18 @@ def load_fig4_prompt_ids(args: Any, tokenizer: Any) -> Tuple[List[List[int]], Di
             seed=int(args.seed),
         )
     input_ids = [
-        tokenizer(text, add_special_tokens=False, truncation=True,
-                  max_length=int(args.input_len))["input_ids"]
+        tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=int(args.input_len),
+        )["input_ids"]
         for text in prompts
     ]
     metadata["payload_input_len_min"] = min(len(ids) for ids in input_ids)
     metadata["payload_input_len_max"] = max(len(ids) for ids in input_ids)
-    metadata["payload_input_len_mean"] = (
-        sum(len(ids) for ids in input_ids) / max(1, len(input_ids))
+    metadata["payload_input_len_mean"] = sum(len(ids) for ids in input_ids) / max(
+        1, len(input_ids)
     )
     metadata["payload_input_ids_hash"] = hashlib.sha256(
         json.dumps(input_ids).encode()
@@ -494,8 +505,9 @@ def layerkv_flags(
     *,
     mode: str,
     policy: str,
-    target_reclaim_mb: float,
+    target_reclaim_mb: Optional[float],
     kvc_block_tokens: int,
+    reclaim_limit_mb: Optional[float] = None,
     kvc_backend: str = "token-slot",
     dynamic_pressure_from_kvc: bool = False,
     scheduler: str = "async-deadline",
@@ -514,8 +526,6 @@ def layerkv_flags(
         mode,
         "--layerkv-policy",
         policy,
-        "--layerkv-target-reclaim-mb",
-        str(target_reclaim_mb),
         "--layerkv-kvc-block-tokens",
         str(kvc_block_tokens),
         "--layerkv-kvc-backend",
@@ -535,6 +545,9 @@ def layerkv_flags(
         "--layerkv-expert-install-target-steps",
         str(expert_install_target_steps),
     ]
+    limit_mb = reclaim_limit_mb if reclaim_limit_mb is not None else target_reclaim_mb
+    if limit_mb is not None:
+        flags.extend(["--layerkv-reclaim-limit-mb", str(limit_mb)])
     if dynamic_pressure_from_kvc:
         flags.append("--layerkv-dynamic-pressure-from-kvc")
     if debug_stats:

@@ -77,6 +77,7 @@ SUMMARY_FIELDS = [
     "validation_reason",
     "runtime_profile",
     "kvc_backend",
+    "layerkv_worker_role",
     "layerkv_kvc_backend",
     "layerkv_kvc_backend_semantics",
     "layerkv_kvc_backend_limited",
@@ -129,6 +130,16 @@ SUMMARY_FIELDS = [
     "kvc_reload_count_total",
     "expert_materialize_count",
     "expert_prefetch_count",
+    "native_scheduler_observation_count",
+    "native_schedule_policy",
+    "native_schedule_forward_mode",
+    "native_schedule_waiting_queue_len",
+    "native_schedule_running_batch_size",
+    "native_schedule_batch_size",
+    "native_schedule_max_running_requests",
+    "native_schedule_new_token_ratio",
+    "native_schedule_kv_available_tokens",
+    "native_schedule_overlap_enabled",
     "layerkv_python_overhead_ms",
     "profile_planner_dp_ms",
     "profile_copy_expert_to_cpu_ms",
@@ -557,6 +568,8 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int, runtime
         "--watchdog-timeout",
         str(args.watchdog_timeout_s),
         "--disable-overlap-schedule",
+        "--schedule-policy",
+        args.schedule_policy,
         "--log-level",
         args.log_level,
     ]
@@ -849,6 +862,7 @@ def main() -> int:
     parser.add_argument("--max-total-tokens", type=int, default=0)
     parser.add_argument("--max-running-requests", type=int, default=128)
     parser.add_argument("--mem-fraction-static", type=float, default=0.90)
+    parser.add_argument("--schedule-policy", default="fcfs")
     parser.add_argument("--kvc-block-tokens", type=int, default=16)
     parser.add_argument(
         "--baseline-kvc-backend",

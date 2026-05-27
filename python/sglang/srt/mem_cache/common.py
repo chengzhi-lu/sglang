@@ -577,6 +577,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    layerkv_runtime = getattr(
+        tree_cache.token_to_kv_pool_allocator.get_kvcache(),
+        "layerkv_runtime",
+        None,
+    )
+    if layerkv_runtime is not None and getattr(
+        layerkv_runtime, "release_virtualized_request", None
+    ):
+        if layerkv_runtime.release_virtualized_request(req, tree_cache):
+            return
+
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),

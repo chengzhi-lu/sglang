@@ -23,7 +23,6 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Tuple
 
-
 DEFAULT_MODEL_PATH = (
     "/data/wenyan/.cache/huggingface/hub/"
     "models--Qwen--Qwen2.5-0.5B-Instruct/"
@@ -62,6 +61,11 @@ CSV_FIELDS = [
     "layerkv_mode",
     "layerkv_policy",
     "layerkv_target_reclaim_mb",
+    "layerkv_kvc_backend",
+    "layerkv_kvc_backend_semantics",
+    "layerkv_kvc_backend_limited",
+    "layerkv_kvc_backend_ready",
+    "layerkv_kvc_backend_reason",
     "layerkv_kvc_scheduler",
     "layerkv_runtime_profile",
     "layerkv_physical_kvc_supported",
@@ -78,6 +82,16 @@ CSV_FIELDS = [
     "planner_fallback_reason",
     "planner_estimated_kvc_cost",
     "planner_estimated_expert_cost",
+    "planner_estimated_kvc_overlap_ms",
+    "planner_estimated_kvc_exposed_ms",
+    "planner_estimated_expert_backing_miss_cost",
+    "planner_estimated_expert_materialize_cost",
+    "planner_dp_table_build_ms",
+    "planner_dp_lookup_ms",
+    "planner_dp_kvc_candidate_count",
+    "planner_dp_expert_candidate_count",
+    "planner_cache_hit_count",
+    "planner_cache_miss_count",
     "planner_selected_kvc_reclaim_mb",
     "planner_selected_expert_reclaim_mb",
     "planner_dp_infeasible_kvc_candidates",
@@ -129,6 +143,15 @@ CSV_FIELDS = [
     "kvc_physical_cycle_count",
     "kvc_physical_failure_count",
     "kvc_eviction_skipped_count",
+    "kvc_layerwise_required_index_hit_count",
+    "kvc_layerwise_required_index_scan_count",
+    "kvc_layerwise_required_index_stale_count",
+    "kvc_layerwise_required_selected_token_count",
+    "kvc_layerwise_scheduler_deadline_reject_count",
+    "kvc_layerwise_scheduler_dynamic_budget_count",
+    "kvc_layerwise_cost_observation_count",
+    "kvc_layerwise_reload_ewma_ms_per_mb",
+    "kvc_layerwise_evict_ewma_ms_per_mb",
     "kvc_ready_before_use_ratio",
     "kvc_ready_before_use_count",
     "kvc_ready_use_check_count",
@@ -197,7 +220,9 @@ def validate_run(
         )
 
     expected_effective = target * expected_fraction
-    if not _float_close(stats.get("effective_kvc_reclaim_mb"), expected_effective, tol=1e-3):
+    if not _float_close(
+        stats.get("effective_kvc_reclaim_mb"), expected_effective, tol=1e-3
+    ):
         reasons.append(
             f"effective_kvc_reclaim_mismatch expected={expected_effective} got={stats.get('effective_kvc_reclaim_mb')}"
         )
@@ -217,7 +242,9 @@ def validate_run(
             f"resident_group_state_error:{stats.get('resident_group_last_error')}"
         )
     if int(stats.get("kvc_page_size", 1) or 1) != page_size:
-        reasons.append(f"kvc_page_size_mismatch expected={page_size} got={stats.get('kvc_page_size')}")
+        reasons.append(
+            f"kvc_page_size_mismatch expected={page_size} got={stats.get('kvc_page_size')}"
+        )
     if int(stats.get("kvc_host_used_tokens", 0) or 0) != int(
         stats.get("kvc_offloaded_token_count", 0) or 0
     ):
@@ -226,6 +253,7 @@ def validate_run(
     evict_count = int(stats.get("kvc_evict_count_total", 0) or 0)
     reload_count = int(stats.get("kvc_reload_count_total", 0) or 0)
     effective_mb = float(stats.get("effective_kvc_reclaim_mb", 0.0) or 0.0)
+    kvc_backend = str(stats.get("layerkv_kvc_backend") or "token-slot")
     if target == 0 or expected_fraction == 0.0:
         if effective_mb != 0.0:
             reasons.append("zero_fraction_or_target_has_effective_reclaim")
@@ -244,10 +272,16 @@ def validate_run(
             reasons.append("evict_count_not_page_aligned")
         if reload_count % page_size != 0:
             reasons.append("reload_count_not_page_aligned")
-        if int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0) <= 0:
-            reasons.append("positive_policy_has_no_req_to_token_rewrite")
-        if int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0) % page_size != 0:
-            reasons.append("req_to_token_rewrite_not_page_aligned")
+        rewrite_count = int(stats.get("kvc_req_to_token_rewrite_count", 0) or 0)
+        if kvc_backend != "per-layer-arena":
+            if rewrite_count <= 0:
+                reasons.append("positive_policy_has_no_req_to_token_rewrite")
+            if rewrite_count % page_size != 0:
+                reasons.append("req_to_token_rewrite_not_page_aligned")
+        elif not bool(stats.get("layerkv_kvc_backend_ready", False)):
+            reasons.append(
+                f"per_layer_backend_not_ready:{stats.get('layerkv_kvc_backend_reason')}"
+            )
         if float(stats.get("physical_kvc_reclaim_mb", 0.0) or 0.0) <= 0.0:
             reasons.append("positive_policy_has_no_physical_reclaim")
 
@@ -255,7 +289,11 @@ def validate_run(
 
 
 def run_one(
-    args: argparse.Namespace, policy: str, target: float, page_size: int, output_dir: Path
+    args: argparse.Namespace,
+    policy: str,
+    target: float,
+    page_size: int,
+    output_dir: Path,
 ) -> Dict[str, Any]:
     stamp = f"{policy.replace('-', '_')}_p{page_size}_{str(target).replace('.', 'p')}_{int(time.time() * 1000)}"
     result_path = output_dir / f"{stamp}.bench.jsonl"
@@ -289,6 +327,8 @@ def run_one(
         str(target),
         "--layerkv-kvc-block-tokens",
         str(args.kvc_block_tokens),
+        "--layerkv-kvc-backend",
+        args.kvc_backend,
         "--layerkv-kvc-scheduler",
         args.scheduler,
         "--layerkv-debug-stats",
@@ -304,7 +344,9 @@ def run_one(
     env["TMPDIR"] = args.tmpdir
     repo_python = str(Path.cwd() / "python")
     env["PYTHONPATH"] = (
-        repo_python if not env.get("PYTHONPATH") else repo_python + os.pathsep + env["PYTHONPATH"]
+        repo_python
+        if not env.get("PYTHONPATH")
+        else repo_python + os.pathsep + env["PYTHONPATH"]
     )
 
     proc = subprocess.run(
@@ -319,7 +361,9 @@ def run_one(
 
     all_stats = parse_layerkv_stats(proc.stdout + "\n" + proc.stderr)
     final_stats = all_stats[-1] if all_stats else {}
-    valid, reason = validate_run(policy, target, page_size, final_stats, proc.returncode)
+    valid, reason = validate_run(
+        policy, target, page_size, final_stats, proc.returncode
+    )
 
     row: Dict[str, Any] = {field: "" for field in CSV_FIELDS}
     row.update(final_stats)
@@ -360,7 +404,14 @@ def main() -> int:
     parser.add_argument("--input-len", type=int, default=64)
     parser.add_argument("--output-len", type=int, default=3)
     parser.add_argument("--kvc-block-tokens", type=int, default=4)
-    parser.add_argument("--scheduler", choices=["sync", "async-deadline"], default="async-deadline")
+    parser.add_argument(
+        "--kvc-backend",
+        choices=["token-slot", "virtual-arena", "per-layer-arena"],
+        default="token-slot",
+    )
+    parser.add_argument(
+        "--scheduler", choices=["sync", "async-deadline"], default="async-deadline"
+    )
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--timeout-s", type=int, default=300)

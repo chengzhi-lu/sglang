@@ -57,6 +57,20 @@ logger = logging.getLogger(__name__)
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
+def _has_state_indices(state_indices: Optional[List]) -> bool:
+    if not state_indices:
+        return False
+    for indices in state_indices:
+        if indices is None:
+            continue
+        if hasattr(indices, "__len__"):
+            if len(indices) > 0:
+                return True
+        else:
+            return True
+    return False
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -212,6 +226,22 @@ class TransferStatus:
     def is_failed(self):
         return self.is_failure
 
+    def debug_summary(self) -> str:
+        expected_kv = {
+            pp_rank: expected for pp_rank, expected in self.expected_kvs_per_pp.items()
+        }
+        received_kv = {
+            pp_rank: len(chunk_ids)
+            for pp_rank, chunk_ids in self.received_kvs_per_pp.items()
+        }
+        return (
+            f"failed={self.is_failure}, received_aux={self.received_aux}, "
+            f"expects_state={self.expects_state}, "
+            f"state_pp={len(self.received_state_per_pp)}/"
+            f"{self.num_pp_ranks_expected}, "
+            f"expected_kv={expected_kv}, received_kv={received_kv}"
+        )
+
 
 class NixlKVManager(CommonKVManager):
     def __init__(
@@ -263,7 +293,12 @@ class NixlKVManager(CommonKVManager):
                 f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
                 f"Please install the required NIXL plugin or choose from: {available_plugins}"
             )
-        logger.info(f"NIXL KVManager initialized with backend: {backend}")
+        logger.info(
+            "NIXL KVManager initialized with backend: %s, params=%s, plugins=%s",
+            backend,
+            backend_params,
+            available_plugins,
+        )
 
         self.register_buffer_to_engine()
 
@@ -688,19 +723,23 @@ class NixlKVManager(CommonKVManager):
 
                         handles.append(kv_xfer_handle)
 
-                    if kv_chunk.is_last and kv_chunk.state_indices:
+                    if kv_chunk.is_last:
                         dst_info = self.decode_kv_args_table[req.agent_name]
-                        state_xfer_handles = self.maybe_send_extra(
-                            req.agent_name,
-                            kv_chunk.state_indices,
-                            dst_info.dst_state_data_ptrs,
-                            req.dst_state_indices,
-                            dst_info.gpu_id,
-                            f"{req.room}_state_{self.kv_args.engine_rank}",
-                            decode_tp_size,
-                            decode_tp_rank=dst_info.decode_tp_rank,
-                            dst_state_item_lens=dst_info.dst_state_item_lens,
-                            dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                        state_xfer_handles = (
+                            self.maybe_send_extra(
+                                req.agent_name,
+                                kv_chunk.state_indices,
+                                dst_info.dst_state_data_ptrs,
+                                req.dst_state_indices,
+                                dst_info.gpu_id,
+                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                decode_tp_size,
+                                decode_tp_rank=dst_info.decode_tp_rank,
+                                dst_state_item_lens=dst_info.dst_state_item_lens,
+                                dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                            )
+                            if _has_state_indices(kv_chunk.state_indices)
+                            else []
                         )
                         handles.extend(h for h in state_xfer_handles if h is not None)
 
@@ -1955,7 +1994,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 pack_int_lists(
                     [(idx if idx is not None else []) for idx in state_indices], "i"
                 )
-                if not is_dummy and state_indices is not None
+                if not is_dummy and _has_state_indices(state_indices)
                 else b""
             )
             with lock:
@@ -1975,7 +2014,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
 
         # Mark that we expect state data if state_indices was provided
-        if state_indices is not None:
+        if _has_state_indices(state_indices):
             self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True
@@ -1995,10 +2034,19 @@ class NixlKVReceiver(CommonKVReceiver):
         elapsed = now - self.init_time
 
         if elapsed >= self.kv_mgr.waiting_timeout:
-            logger.error(f"Request {self.bootstrap_room} waiting_timeout")
+            status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            status_summary = status.debug_summary() if status is not None else "missing"
+            logger.error(
+                "Request %s waiting_timeout; transfer_status=%s",
+                self.bootstrap_room,
+                status_summary,
+            )
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
-                f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
+                (
+                    f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+                    "in KVPoll.WaitingForInput"
+                ),
             )
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed

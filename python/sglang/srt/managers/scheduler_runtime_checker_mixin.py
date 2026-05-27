@@ -175,6 +175,20 @@ class SchedulerRuntimeCheckerMixin:
     def _session_held_mamba_slots(self: Scheduler) -> int:
         return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
 
+    def _layerkv_reserved_allocator_tokens(self: Scheduler) -> int:
+        layerkv_runtime = None
+        if hasattr(self, "_get_layerkv_runtime"):
+            layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None:
+            model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+            layerkv_runtime = getattr(model_runner, "layerkv_runtime", None)
+        if layerkv_runtime is None:
+            return 0
+        reserved_fn = getattr(layerkv_runtime, "reserved_allocator_tokens", None)
+        if reserved_fn is None:
+            return 0
+        return int(reserved_fn())
+
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
@@ -434,6 +448,7 @@ class SchedulerRuntimeCheckerMixin:
 
         ps = self.get_pool_stats()
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
+        full_uncached += self._layerkv_reserved_allocator_tokens()
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
@@ -556,7 +571,10 @@ class SchedulerRuntimeCheckerMixin:
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
-            has_leak, messages = self._check_all_pools(self.get_pool_stats())
+            has_leak, messages = self._check_all_pools(
+                self.get_pool_stats(),
+                uncached=self._layerkv_reserved_allocator_tokens(),
+            )
             if has_leak:
                 self._report_leak("pool", "\n".join(messages))
             self._check_req_pool()

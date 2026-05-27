@@ -683,11 +683,15 @@ class ServerArgs:
         "layer-aware-joint-dp",
         "coresid",
     ] = "none"
+    layerkv_reclaim_limit_mb: float = 0.0
     layerkv_target_reclaim_mb: float = 0.0
     layerkv_dynamic_pressure_from_kvc: bool = False
     layerkv_kvc_block_tokens: int = 16
-    layerkv_kvc_backend: Literal["token-slot", "per-layer-arena"] = "token-slot"
+    layerkv_kvc_backend: Literal["token-slot", "per-layer-arena", "virtual-arena"] = (
+        "token-slot"
+    )
     layerkv_kvc_scheduler: Literal["sync", "async-deadline"] = "async-deadline"
+    layerkv_virtual_scratch_tokens: int = 4096
     layerkv_runtime_profile: Literal["simple", "optimized"] = "optimized"
     layerkv_debug_stats: bool = False
     layerkv_profile_detail: bool = False
@@ -828,6 +832,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
+    disaggregation_decode_output_estimate_tokens: Optional[int] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -981,9 +986,10 @@ class ServerArgs:
         # _validate_prefill_only_disable_kv_cache_args().
         self._handle_prefill_only_disable_kv_cache()
 
-        # Handle Hicache settings.
-        self._handle_hicache()
+        # Handle LayerKV before HiCache so decode-side native KVC offload can
+        # be disabled before HiCache normalizes offload-only settings.
         self._handle_layerkv()
+        self._handle_hicache()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -3507,8 +3513,38 @@ class ServerArgs:
         if not self.enable_layerkv:
             self.layerkv_mode = "off"
             self.layerkv_policy = "none"
+            self.layerkv_reclaim_limit_mb = 0.0
             self.layerkv_target_reclaim_mb = 0.0
             return
+
+        if (
+            self.layerkv_reclaim_limit_mb <= 0.0
+            and self.layerkv_target_reclaim_mb > 0.0
+        ):
+            self.layerkv_reclaim_limit_mb = float(self.layerkv_target_reclaim_mb)
+        self.layerkv_target_reclaim_mb = float(self.layerkv_reclaim_limit_mb)
+
+        if self.disaggregation_mode == "prefill":
+            logger.warning(
+                "LayerKV is disabled on PD prefill workers; enable it on the "
+                "PD decode worker or standalone worker instead."
+            )
+            self.layerkv_mode = "off"
+            self.layerkv_policy = "none"
+            self.layerkv_reclaim_limit_mb = 0.0
+            self.layerkv_target_reclaim_mb = 0.0
+            return
+
+        if (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_decode_enable_offload_kvcache
+        ):
+            logger.warning(
+                "LayerKV manages PD decode-side KVC residency; disabling native "
+                "--disaggregation-decode-enable-offload-kvcache to avoid double "
+                "offload/free ownership."
+            )
+            self.disaggregation_decode_enable_offload_kvcache = False
 
         if self.layerkv_mode == "off":
             logger.warning("--enable-layerkv is set but --layerkv-mode=off")
@@ -3520,15 +3556,21 @@ class ServerArgs:
                 "the runtime will install accounting hooks only."
             )
 
-        if self.layerkv_target_reclaim_mb < 0:
-            raise ValueError("--layerkv-target-reclaim-mb must be non-negative")
+        if self.layerkv_reclaim_limit_mb < 0:
+            raise ValueError("--layerkv-reclaim-limit-mb must be non-negative")
 
         if self.layerkv_kvc_block_tokens <= 0:
             raise ValueError("--layerkv-kvc-block-tokens must be positive")
-        if self.layerkv_kvc_backend not in ("token-slot", "per-layer-arena"):
+        if self.layerkv_kvc_backend not in (
+            "token-slot",
+            "per-layer-arena",
+            "virtual-arena",
+        ):
             raise ValueError(
-                "--layerkv-kvc-backend must be one of: token-slot, per-layer-arena"
+                "--layerkv-kvc-backend must be one of: token-slot, per-layer-arena, virtual-arena"
             )
+        if self.layerkv_virtual_scratch_tokens < 0:
+            raise ValueError("--layerkv-virtual-scratch-tokens must be non-negative")
         if self.layerkv_kvc_scheduler not in ("sync", "async-deadline"):
             raise ValueError(
                 "--layerkv-kvc-scheduler must be one of: sync, async-deadline"
@@ -3538,13 +3580,19 @@ class ServerArgs:
                 "--layerkv-runtime-profile must be one of: simple, optimized"
             )
         if self.layerkv_expert_install_layers_per_step <= 0:
-            raise ValueError("--layerkv-expert-install-layers-per-step must be positive")
+            raise ValueError(
+                "--layerkv-expert-install-layers-per-step must be positive"
+            )
         if self.layerkv_expert_install_budget_mb < 0:
             raise ValueError("--layerkv-expert-install-budget-mb must be non-negative")
         if self.layerkv_expert_install_target_steps < 0:
-            raise ValueError("--layerkv-expert-install-target-steps must be non-negative")
+            raise ValueError(
+                "--layerkv-expert-install-target-steps must be non-negative"
+            )
         if self.layerkv_expert_cpu_backing_mode not in ("none", "all"):
-            raise ValueError("--layerkv-expert-cpu-backing-mode must be one of: none, all")
+            raise ValueError(
+                "--layerkv-expert-cpu-backing-mode must be one of: none, all"
+            )
 
         # v1 recovery is scheduled outside graph capture.
         if not self.disable_cuda_graph:
@@ -4122,6 +4170,17 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        if self.disaggregation_decode_output_estimate_tokens is not None:
+            if self.disaggregation_decode_output_estimate_tokens < 0:
+                raise ValueError(
+                    "--disaggregation-decode-output-estimate-tokens must be non-negative"
+                )
+            if self.disaggregation_mode != "decode":
+                logger.warning(
+                    "--disaggregation-decode-output-estimate-tokens only takes "
+                    "effect on decode servers."
+                )
+
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
                 if self.enable_hisparse:
@@ -6412,20 +6471,27 @@ class ServerArgs:
                 "coresid",
             ],
             default=ServerArgs.layerkv_policy,
-            help="LayerKV policy. In kvc-expert mode, ratio and joint policies split target reclaim between physical KVC and supported standard FusedMoE expert slots.",
+            help="LayerKV policy. In kvc-expert mode, ratio and joint policies split reclaim pressure between physical KVC and supported standard FusedMoE expert slots.",
+        )
+        parser.add_argument(
+            "--layerkv-reclaim-limit-mb",
+            type=float,
+            default=ServerArgs.layerkv_reclaim_limit_mb,
+            help="Optional upper limit in MB for LayerKV dynamic pressure/reclaim planning.",
         )
         parser.add_argument(
             "--layerkv-target-reclaim-mb",
+            dest="layerkv_reclaim_limit_mb",
             type=float,
-            default=ServerArgs.layerkv_target_reclaim_mb,
-            help="Target GPU memory pressure/reclaim in MB for LayerKV planning.",
+            default=argparse.SUPPRESS,
+            help="Deprecated alias for --layerkv-reclaim-limit-mb.",
         )
         parser.add_argument(
             "--layerkv-dynamic-pressure-from-kvc",
             action="store_true",
             help=(
                 "Use current live KV demand as the LayerKV pressure estimate, "
-                "capped by --layerkv-target-reclaim-mb. This is intended for "
+                "optionally capped by --layerkv-reclaim-limit-mb. This is intended for "
                 "end-to-end trace replay where pressure should grow with workload."
             ),
         )
@@ -6438,12 +6504,23 @@ class ServerArgs:
         parser.add_argument(
             "--layerkv-kvc-backend",
             type=str,
-            choices=["token-slot", "per-layer-arena"],
+            choices=["token-slot", "per-layer-arena", "virtual-arena"],
             default=ServerArgs.layerkv_kvc_backend,
             help=(
                 "Physical KVC residency backend. token-slot uses SGLang's global "
                 "token KV slots and can only realize layer-average KVC eviction; "
-                "per-layer-arena is reserved for true layer-wise KVC residency."
+                "per-layer-arena keeps layer-wise residency without freeing global "
+                "slots; virtual-arena frees global slots and materializes required "
+                "KVC into scratch slots at layer use points."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-virtual-scratch-tokens",
+            type=int,
+            default=ServerArgs.layerkv_virtual_scratch_tokens,
+            help=(
+                "Number of global KV token slots reserved as LayerKV scratch space "
+                "for the virtual-arena KVC backend."
             ),
         )
         parser.add_argument(
@@ -7103,6 +7180,17 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-output-estimate-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_decode_output_estimate_tokens,
+            help=(
+                "If set, PD decode admission uses this fixed output-token "
+                "estimate instead of each request's max_new_tokens. This "
+                "simulates unknown output lengths without changing the actual "
+                "generation length."
+            ),
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

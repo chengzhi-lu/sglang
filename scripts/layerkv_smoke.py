@@ -164,10 +164,25 @@ def main() -> int:
     assert expert_summary["planned_expert_reclaim_mb"] > 0.0
     assert expert_summary["comparable"] is True
     assert expert_summary["kvc_guard_pass"] is True
-    assert expert_runner.model.moe.w13_weight.shape[0] < 4
+    assert expert_runner.model.moe.w13_weight.shape[0] == 4
     topk = TopKOut(
         topk_weights=torch.ones((1, 2), dtype=torch.float32),
         topk_ids=torch.tensor([[2, 3]], dtype=torch.int32),
+        router_logits=torch.empty((1, 4), dtype=torch.float32),
+    )
+    expert_runner.model.moe(torch.zeros((1, 2), dtype=torch.float32), topk)
+    expert_rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    assert expert_runner.model.moe.w13_weight.shape[0] < 4
+    state = expert_rt._expert_layers.get(expert_runner.model.moe.layer_id)
+    offloaded = [
+        expert_id
+        for expert_id in range(expert_runner.model.moe.num_experts)
+        if state is not None and expert_id not in state.logical_to_slot
+    ]
+    expert_id = int(offloaded[0]) if offloaded else 0
+    topk = TopKOut(
+        topk_weights=torch.ones((1, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[expert_id, expert_id]], dtype=torch.int32),
         router_logits=torch.empty((1, 4), dtype=torch.float32),
     )
     expert_runner.model.moe(torch.zeros((1, 2), dtype=torch.float32), topk)

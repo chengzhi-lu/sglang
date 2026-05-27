@@ -1404,6 +1404,72 @@ class Scheduler(
             )
         return batch
 
+    def _get_layerkv_runtime(self):
+        model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+        return getattr(model_runner, "layerkv_runtime", None)
+
+    def _notify_layerkv_schedule_batch(self, batch: Optional[ScheduleBatch]) -> None:
+        if batch is None:
+            return
+        layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None:
+            return
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is not None:
+            if getattr(forward_mode, "is_prebuilt", lambda: False)():
+                return
+            if getattr(forward_mode, "is_idle", lambda: False)():
+                return
+        token_allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        available_tokens = -1
+        if token_allocator is not None and hasattr(token_allocator, "available_size"):
+            available_tokens = int(token_allocator.available_size())
+        layerkv_runtime.on_schedule_batch(
+            schedule_batch=batch,
+            scheduler_context={
+                "forward_iter": int(self.forward_ct),
+                "forward_mode": getattr(forward_mode, "name", str(forward_mode)),
+                "schedule_policy": str(getattr(self, "schedule_policy", "")),
+                "waiting_queue_len": len(getattr(self, "waiting_queue", []) or []),
+                "running_batch_size": len(
+                    getattr(getattr(self, "running_batch", None), "reqs", []) or []
+                ),
+                "max_running_requests": int(
+                    getattr(self, "max_running_requests", 0) or 0
+                ),
+                "new_token_ratio": float(getattr(self, "new_token_ratio", 0.0) or 0.0),
+                "kv_available_tokens": available_tokens,
+                "enable_overlap": bool(getattr(self, "enable_overlap", False)),
+            },
+        )
+
+    def _try_layerkv_reclaim_before_retract(self, batch: ScheduleBatch) -> bool:
+        layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None or not hasattr(
+            layerkv_runtime, "try_reclaim_kvc_before_retract"
+        ):
+            return False
+        token_allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if token_allocator is None or not hasattr(token_allocator, "available_size"):
+            return False
+        required_tokens = int(batch.new_tokens_required_next_decode())
+        available_tokens = int(token_allocator.available_size())
+        if available_tokens >= required_tokens:
+            return True
+        try:
+            layerkv_runtime.try_reclaim_kvc_before_retract(
+                schedule_batch=batch,
+                required_tokens=required_tokens,
+                available_tokens=available_tokens,
+            )
+        except Exception:
+            logger.warning(
+                "LayerKV pre-retraction KVC reclaim failed; falling back to request retraction.",
+                exc_info=True,
+            )
+            return False
+        return batch.check_decode_mem()
+
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
         if not self.server_args.enable_deterministic_inference:
@@ -2909,8 +2975,13 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
-        # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        # Check if decode out of memory. LayerKV gets one chance to reclaim KVC
+        # before SGLang falls back to request-level retraction.
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag and self._try_layerkv_reclaim_before_retract(batch):
+            kv_full_retract_flag = False
+
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
@@ -2919,9 +2990,25 @@ class Scheduler(
             old_mamba_available = (
                 mamba_pool.available_size() if mamba_pool is not None else None
             )
+            pre_retract_req_indices = {
+                id(req): req.req_pool_idx
+                for req in batch.reqs
+                if getattr(req, "req_pool_idx", None) is not None
+            }
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            layerkv_runtime = self._get_layerkv_runtime()
+            if layerkv_runtime is not None and hasattr(
+                layerkv_runtime, "on_requests_retracted"
+            ):
+                layerkv_runtime.on_requests_retracted(
+                    [
+                        pre_retract_req_indices[id(req)]
+                        for req in retracted_reqs
+                        if id(req) in pre_retract_req_indices
+                    ]
+                )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -3001,6 +3088,7 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        self._notify_layerkv_schedule_batch(batch)
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
