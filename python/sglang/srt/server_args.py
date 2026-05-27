@@ -684,7 +684,6 @@ class ServerArgs:
         "coresid",
     ] = "none"
     layerkv_reclaim_limit_mb: float = 0.0
-    layerkv_target_reclaim_mb: float = 0.0
     layerkv_dynamic_pressure_from_kvc: bool = False
     layerkv_kvc_block_tokens: int = 16
     layerkv_kvc_backend: Literal["token-slot", "per-layer-arena", "virtual-arena"] = (
@@ -3514,15 +3513,7 @@ class ServerArgs:
             self.layerkv_mode = "off"
             self.layerkv_policy = "none"
             self.layerkv_reclaim_limit_mb = 0.0
-            self.layerkv_target_reclaim_mb = 0.0
             return
-
-        if (
-            self.layerkv_reclaim_limit_mb <= 0.0
-            and self.layerkv_target_reclaim_mb > 0.0
-        ):
-            self.layerkv_reclaim_limit_mb = float(self.layerkv_target_reclaim_mb)
-        self.layerkv_target_reclaim_mb = float(self.layerkv_reclaim_limit_mb)
 
         if self.disaggregation_mode == "prefill":
             logger.warning(
@@ -3532,7 +3523,6 @@ class ServerArgs:
             self.layerkv_mode = "off"
             self.layerkv_policy = "none"
             self.layerkv_reclaim_limit_mb = 0.0
-            self.layerkv_target_reclaim_mb = 0.0
             return
 
         if (
@@ -6478,13 +6468,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.layerkv_reclaim_limit_mb,
             help="Optional upper limit in MB for LayerKV dynamic pressure/reclaim planning.",
-        )
-        parser.add_argument(
-            "--layerkv-target-reclaim-mb",
-            dest="layerkv_reclaim_limit_mb",
-            type=float,
-            default=argparse.SUPPRESS,
-            help="Deprecated alias for --layerkv-reclaim-limit-mb.",
         )
         parser.add_argument(
             "--layerkv-dynamic-pressure-from-kvc",

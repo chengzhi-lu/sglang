@@ -52,7 +52,7 @@ EXPECTED_FRACTIONS = {
 
 CSV_FIELDS = [
     "policy",
-    "target_reclaim_mb",
+    "reclaim_limit_mb",
     "page_size",
     "returncode",
     "valid",
@@ -60,7 +60,7 @@ CSV_FIELDS = [
     "layerkv_enabled",
     "layerkv_mode",
     "layerkv_policy",
-    "layerkv_target_reclaim_mb",
+    "layerkv_reclaim_limit_mb",
     "layerkv_kvc_backend",
     "layerkv_kvc_backend_semantics",
     "layerkv_kvc_backend_limited",
@@ -323,7 +323,7 @@ def run_one(
         "kvc-only",
         "--layerkv-policy",
         policy,
-        "--layerkv-target-reclaim-mb",
+        "--layerkv-reclaim-limit-mb",
         str(target),
         "--layerkv-kvc-block-tokens",
         str(args.kvc_block_tokens),
@@ -370,7 +370,7 @@ def run_one(
     row.update(
         {
             "policy": policy,
-            "target_reclaim_mb": target,
+            "reclaim_limit_mb": target,
             "page_size": page_size,
             "returncode": proc.returncode,
             "valid": valid,
@@ -451,7 +451,7 @@ def main() -> int:
         "invalid": [
             {
                 "policy": row.get("policy"),
-                "target_reclaim_mb": row.get("target_reclaim_mb"),
+                "reclaim_limit_mb": row.get("reclaim_limit_mb"),
                 "reason": row.get("validation_reason"),
                 "returncode": row.get("returncode"),
                 "stdout_path": row.get("stdout_path"),

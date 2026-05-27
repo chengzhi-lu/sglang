@@ -26,7 +26,7 @@ from urllib import request
 
 from layerkv_eval_common import (
     DEFAULT_MODEL_PATH,
-    FIG4_TARGET_RECLAIM_MB,
+    FIG4_RECLAIM_LIMIT_MB,
     FIG4_WORKLOADS,
     apply_fig4_workload,
     base_command,
@@ -36,7 +36,6 @@ from layerkv_eval_common import (
     run_bench_command,
     write_csv,
 )
-
 
 CSV_FIELDS = [
     "workload",
@@ -68,8 +67,8 @@ CSV_FIELDS = [
     "returncode",
     "valid",
     "validation_reason",
-    "target_reclaim_mb",
-    "configured_target_reclaim_mb",
+    "reclaim_limit_mb",
+    "configured_reclaim_limit_mb",
     "effective_reclaim_target_mb",
     "needed_pressure_mb",
     "available_kvc_reclaim_mb",
@@ -114,7 +113,7 @@ CSV_FIELDS = [
     "selected_kvc_tokens_by_layer",
     "selected_expert_evictions_by_layer",
     "layerkv_enabled",
-    "layerkv_target_reclaim_mb",
+    "layerkv_reclaim_limit_mb",
     "layerkv_runtime_profile",
     "layerkv_worker_role",
     "layerkv_kvc_backend",
@@ -355,18 +354,18 @@ class PolicyRun:
     scenario: str
     mode: str
     policy: str
-    target_reclaim_mb: float
+    reclaim_limit_mb: float
 
 
 POLICY_RUNS = [
     PolicyRun("full_residency", "off", "none", 0.0),
-    PolicyRun("expert_first", "kvc-expert", "expert-first", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("kvc_first", "kvc-expert", "kv-first", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("ratio_25_75", "kvc-expert", "ratio-25-75", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("ratio_50_50", "kvc-expert", "ratio-50-50", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("ratio_75_25", "kvc-expert", "ratio-75-25", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("coresid", "kvc-expert", "coresid", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("layer_aware_joint_dp", "kvc-expert", "coresid", FIG4_TARGET_RECLAIM_MB),
+    PolicyRun("expert_first", "kvc-expert", "expert-first", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("kvc_first", "kvc-expert", "kv-first", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("ratio_25_75", "kvc-expert", "ratio-25-75", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("ratio_50_50", "kvc-expert", "ratio-50-50", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("ratio_75_25", "kvc-expert", "ratio-75-25", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("coresid", "kvc-expert", "coresid", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("layer_aware_joint_dp", "kvc-expert", "coresid", FIG4_RECLAIM_LIMIT_MB),
 ]
 
 
@@ -405,19 +404,17 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def policy_command(args: argparse.Namespace, spec: PolicyRun, result_path: Path) -> List[str]:
+def policy_command(
+    args: argparse.Namespace, spec: PolicyRun, result_path: Path
+) -> List[str]:
     cmd = base_command(args, result_path)
     if spec.mode == "off":
         return cmd
-    kvc_backend = (
-        args.dp_kvc_backend
-        if is_coresid(spec)
-        else args.baseline_kvc_backend
-    )
+    kvc_backend = args.dp_kvc_backend if is_coresid(spec) else args.baseline_kvc_backend
     return cmd + layerkv_flags(
         mode=spec.mode,
         policy=spec.policy,
-        target_reclaim_mb=spec.target_reclaim_mb,
+        reclaim_limit_mb=spec.reclaim_limit_mb,
         kvc_block_tokens=args.kvc_block_tokens,
         kvc_backend=kvc_backend,
         scheduler=args.kvc_scheduler,
@@ -554,7 +551,9 @@ def _child_pids(pid: int) -> List[int]:
     return children
 
 
-def _start_rss_monitor(root_pid: int, path: Path, stop: threading.Event) -> threading.Thread:
+def _start_rss_monitor(
+    root_pid: int, path: Path, stop: threading.Event
+) -> threading.Thread:
     def _run() -> None:
         peak_kb = 0
         with path.open("w", encoding="utf-8") as f:
@@ -616,16 +615,12 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int) -> List
         cmd.extend(["--max-running-requests", str(args.max_running_requests)])
     if args.mem_fraction_static > 0.0:
         cmd.extend(["--mem-fraction-static", str(args.mem_fraction_static)])
-    kvc_backend = (
-        args.dp_kvc_backend
-        if is_coresid(spec)
-        else args.baseline_kvc_backend
-    )
+    kvc_backend = args.dp_kvc_backend if is_coresid(spec) else args.baseline_kvc_backend
     cmd.extend(
         layerkv_flags(
             mode=spec.mode,
             policy=spec.policy,
-            target_reclaim_mb=spec.target_reclaim_mb,
+            reclaim_limit_mb=spec.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
             kvc_backend=kvc_backend,
             scheduler=args.kvc_scheduler,
@@ -663,7 +658,9 @@ def fig4_metadata_fields(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def validate_policy_row(spec: PolicyRun, returncode: int, stats: Dict[str, Any]) -> Tuple[bool, str, bool]:
+def validate_policy_row(
+    spec: PolicyRun, returncode: int, stats: Dict[str, Any]
+) -> Tuple[bool, str, bool]:
     reasons: List[str] = []
     limited_by_workload = False
     if returncode != 0:
@@ -746,13 +743,17 @@ def validate_fig4_dataset_row(
     return valid, reason
 
 
-def run_policy(args: argparse.Namespace, spec: PolicyRun, output_dir: Path) -> Dict[str, Any]:
+def run_policy(
+    args: argparse.Namespace, spec: PolicyRun, output_dir: Path
+) -> Dict[str, Any]:
     if args.backend == "server":
         return run_policy_server(args, spec, output_dir)
     return run_policy_bench(args, spec, output_dir)
 
 
-def run_policy_bench(args: argparse.Namespace, spec: PolicyRun, output_dir: Path) -> Dict[str, Any]:
+def run_policy_bench(
+    args: argparse.Namespace, spec: PolicyRun, output_dir: Path
+) -> Dict[str, Any]:
     result_path = output_dir / f"{spec.scenario}.jsonl"
     result_path.unlink(missing_ok=True)
     cmd = policy_command(args, spec, result_path)
@@ -796,14 +797,22 @@ def run_policy_bench(args: argparse.Namespace, spec: PolicyRun, output_dir: Path
             "max_running_requests": args.max_running_requests,
             "mem_fraction_static": args.mem_fraction_static,
             "scenario": spec.scenario,
-            "layerkv_mode": spec.mode if spec.mode == "off" else final_stats.get("layerkv_mode", spec.mode),
-            "layerkv_policy": spec.policy if spec.mode == "off" else final_stats.get("layerkv_policy", spec.policy),
+            "layerkv_mode": (
+                spec.mode
+                if spec.mode == "off"
+                else final_stats.get("layerkv_mode", spec.mode)
+            ),
+            "layerkv_policy": (
+                spec.policy
+                if spec.mode == "off"
+                else final_stats.get("layerkv_policy", spec.policy)
+            ),
             "returncode": result["returncode"],
             "valid": valid,
             "validation_reason": reason,
-            "target_reclaim_mb": spec.target_reclaim_mb,
-            "configured_target_reclaim_mb": final_stats.get(
-                "configured_target_reclaim_mb", spec.target_reclaim_mb
+            "reclaim_limit_mb": spec.reclaim_limit_mb,
+            "configured_reclaim_limit_mb": final_stats.get(
+                "configured_reclaim_limit_mb", spec.reclaim_limit_mb
             ),
             "planned_reclaim_mb": planned_reclaim,
             "actual_reclaim_mb": actual_reclaim,
@@ -824,7 +833,9 @@ def run_policy_bench(args: argparse.Namespace, spec: PolicyRun, output_dir: Path
     return row
 
 
-def run_policy_server(args: argparse.Namespace, spec: PolicyRun, output_dir: Path) -> Dict[str, Any]:
+def run_policy_server(
+    args: argparse.Namespace, spec: PolicyRun, output_dir: Path
+) -> Dict[str, Any]:
     stdout_path = output_dir / f"{spec.scenario}.server.stdout.log"
     stderr_path = output_dir / f"{spec.scenario}.server.stderr.log"
     response_path = output_dir / f"{spec.scenario}.response.json"
@@ -906,7 +917,9 @@ def run_policy_server(args: argparse.Namespace, spec: PolicyRun, output_dir: Pat
     stats = parse_layerkv_stats(combined)
     final_stats = stats[-1] if stats else {}
     response_ok = not (isinstance(response, dict) and "error" in response)
-    effective_returncode = 0 if response_ok and proc.returncode in (-9, -15, -3, 0) else proc.returncode
+    effective_returncode = (
+        0 if response_ok and proc.returncode in (-9, -15, -3, 0) else proc.returncode
+    )
     valid, reason, limited_by_workload = validate_policy_row(
         spec, effective_returncode, final_stats
     )
@@ -926,7 +939,9 @@ def run_policy_server(args: argparse.Namespace, spec: PolicyRun, output_dir: Pat
         _to_float(final_stats.get("physical_kvc_reclaim_mb"))
         + _to_float(final_stats.get("physical_expert_reclaim_mb")),
     )
-    response_count = len(response) if isinstance(response, list) else (1 if response_ok else 0)
+    response_count = (
+        len(response) if isinstance(response, list) else (1 if response_ok else 0)
+    )
     response_latency = _response_latency_stats(response, args.output_len)
     output_throughput = (
         response_count * args.output_len / (request_wall_ms / 1000.0)
@@ -957,9 +972,9 @@ def run_policy_server(args: argparse.Namespace, spec: PolicyRun, output_dir: Pat
             "returncode": proc.returncode,
             "valid": valid,
             "validation_reason": reason,
-            "target_reclaim_mb": spec.target_reclaim_mb,
-            "configured_target_reclaim_mb": final_stats.get(
-                "configured_target_reclaim_mb", spec.target_reclaim_mb
+            "reclaim_limit_mb": spec.reclaim_limit_mb,
+            "configured_reclaim_limit_mb": final_stats.get(
+                "configured_reclaim_limit_mb", spec.reclaim_limit_mb
             ),
             "planned_reclaim_mb": planned_reclaim,
             "actual_reclaim_mb": actual_reclaim,
@@ -984,11 +999,24 @@ def classify_joint_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if _to_bool(row.get("valid"), False) and _to_bool(row.get("comparable"), True)
     ]
     if not comparable:
-        return {"best_policy": "", "joint_wins": False, "joint_loss_reason": "no_comparable_rows"}
+        return {
+            "best_policy": "",
+            "joint_wins": False,
+            "joint_loss_reason": "no_comparable_rows",
+        }
 
-    comparable.sort(key=lambda row: _to_float(row.get("benchmark_decode0_latency_ms"), float("inf")))
+    comparable.sort(
+        key=lambda row: _to_float(row.get("benchmark_decode0_latency_ms"), float("inf"))
+    )
     best = comparable[0]
-    joint = next((row for row in comparable if row.get("scenario") in ("coresid", "layer_aware_joint_dp")), None)
+    joint = next(
+        (
+            row
+            for row in comparable
+            if row.get("scenario") in ("coresid", "layer_aware_joint_dp")
+        ),
+        None,
+    )
     if joint is None:
         return {
             "best_policy": best.get("scenario", ""),
@@ -1003,9 +1031,10 @@ def classify_joint_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
     if _to_bool(joint.get("actual_reclaim_limited_by_workload"), False):
         reason = "workload_too_small"
-    elif _to_float(joint.get("expert_materialize_mb_total")) > 0.0 or _to_float(
-        joint.get("kvc_reload_mb_total")
-    ) > 0.0:
+    elif (
+        _to_float(joint.get("expert_materialize_mb_total")) > 0.0
+        or _to_float(joint.get("kvc_reload_mb_total")) > 0.0
+    ):
         reason = "runtime_recovery"
     else:
         reason = "planner_split"
@@ -1138,7 +1167,7 @@ def main() -> int:
         "batch_size": args.batch_size,
         "input_len": args.input_len,
         "output_len": args.output_len,
-        "fig4_target_reclaim_mb": FIG4_TARGET_RECLAIM_MB,
+        "fig4_reclaim_limit_mb": FIG4_RECLAIM_LIMIT_MB,
         "fig4_dataset_name": args.fig4_dataset_name,
         "fig4_dataset_path": args.fig4_dataset_path,
         **fig4_metadata_fields(args),

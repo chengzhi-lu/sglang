@@ -20,7 +20,7 @@ from urllib import error, request
 
 from layerkv_eval_common import (
     DEFAULT_MODEL_PATH,
-    FIG4_TARGET_RECLAIM_MB,
+    FIG4_RECLAIM_LIMIT_MB,
     layerkv_flags,
 )
 from layerkv_azure_trace_replay import parse_layerkv_stats
@@ -190,7 +190,6 @@ def _decode_layerkv_flags(args: argparse.Namespace) -> List[str]:
     flags = layerkv_flags(
         mode=args.layerkv_mode,
         policy=args.layerkv_policy,
-        target_reclaim_mb=None,
         kvc_block_tokens=args.layerkv_kvc_block_tokens,
         reclaim_limit_mb=reclaim_limit_mb,
         kvc_backend=args.layerkv_kvc_backend,
@@ -777,20 +776,9 @@ def main() -> int:
     parser.add_argument("--schedule-policy", default="")
     parser.add_argument("--log-level", default="")
     parser.add_argument(
-        "--layerkv-reclaim-limit-mb", type=float, default=FIG4_TARGET_RECLAIM_MB
-    )
-    parser.add_argument(
-        "--layerkv-target-reclaim-mb",
-        dest="layerkv_reclaim_limit_mb",
-        type=float,
-        default=argparse.SUPPRESS,
+        "--layerkv-reclaim-limit-mb", type=float, default=FIG4_RECLAIM_LIMIT_MB
     )
     parser.add_argument("--no-layerkv-reclaim-limit-mb", action="store_true")
-    parser.add_argument(
-        "--no-layerkv-target-reclaim-mb",
-        dest="no_layerkv_reclaim_limit_mb",
-        action="store_true",
-    )
     parser.add_argument("--layerkv-mode", default="kvc-expert")
     parser.add_argument("--layerkv-policy", default="coresid")
     parser.add_argument("--layerkv-kvc-block-tokens", type=int, default=16)

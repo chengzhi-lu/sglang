@@ -23,7 +23,7 @@ from urllib import request
 
 from layerkv_eval_common import (
     DEFAULT_MODEL_PATH,
-    FIG4_TARGET_RECLAIM_MB,
+    FIG4_RECLAIM_LIMIT_MB,
     _extract_sharegpt_user_text,
     _extract_wildchat_user_text,
     layerkv_flags,
@@ -32,19 +32,20 @@ from layerkv_eval_common import (
 )
 from layerkv_policy_eval import PolicyRun, _tail
 
-
 TRACE_PATH = "/4IR-dataset/common/request_dataset/AzureLLMInferenceTrace_conv.csv"
-SHAREGPT_PATH = "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_PATH = (
+    "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json"
+)
 WILDCHAT_PATH = "/data/wenyan/.cache/huggingface/allenai___wild_chat-1_m"
 
 POLICY_RUNS = [
-    PolicyRun("expert_first", "kvc-expert", "expert-first", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("kvc_first", "kvc-expert", "kv-first", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("ratio_25_75", "kvc-expert", "ratio-25-75", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("ratio_50_50", "kvc-expert", "ratio-50-50", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("ratio_75_25", "kvc-expert", "ratio-75-25", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("coresid", "kvc-expert", "coresid", FIG4_TARGET_RECLAIM_MB),
-    PolicyRun("layer_aware_joint_dp", "kvc-expert", "coresid", FIG4_TARGET_RECLAIM_MB),
+    PolicyRun("expert_first", "kvc-expert", "expert-first", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("kvc_first", "kvc-expert", "kv-first", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("ratio_25_75", "kvc-expert", "ratio-25-75", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("ratio_50_50", "kvc-expert", "ratio-50-50", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("ratio_75_25", "kvc-expert", "ratio-75-25", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("coresid", "kvc-expert", "coresid", FIG4_RECLAIM_LIMIT_MB),
+    PolicyRun("layer_aware_joint_dp", "kvc-expert", "coresid", FIG4_RECLAIM_LIMIT_MB),
 ]
 
 
@@ -53,6 +54,7 @@ def is_coresid(spec: PolicyRun) -> bool:
         "coresid",
         "layer-aware-joint-dp",
     }
+
 
 PER_REQUEST_FIELDS = [
     "policy",
@@ -322,7 +324,9 @@ def fill_from_wildchat(
     import pyarrow.parquet as pq
 
     root = Path(path)
-    candidates = [root] if root.is_file() else sorted(x for x in root.rglob("*") if x.is_file())
+    candidates = (
+        [root] if root.is_file() else sorted(x for x in root.rglob("*") if x.is_file())
+    )
     files = []
     for item in candidates:
         try:
@@ -339,7 +343,9 @@ def fill_from_wildchat(
             break
         if kind == "parquet":
             pf = pq.ParquetFile(item)
-            batches = pf.iter_batches(batch_size=batch_size, columns=["conversation_hash", "conversation"])
+            batches = pf.iter_batches(
+                batch_size=batch_size, columns=["conversation_hash", "conversation"]
+            )
             for batch in batches:
                 if not outstanding:
                     break
@@ -350,7 +356,10 @@ def fill_from_wildchat(
                     if not text:
                         continue
                     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-                    rec_id = str(rec.get("conversation_hash") or hashlib.sha1(text.encode()).hexdigest()[:12])
+                    rec_id = str(
+                        rec.get("conversation_hash")
+                        or hashlib.sha1(text.encode()).hexdigest()[:12]
+                    )
                     _assign_prompt(outstanding, request_rows, ids, "wildchat", rec_id)
         else:
             with item.open("rb") as f:
@@ -373,10 +382,14 @@ def fill_from_wildchat(
                         if not text:
                             continue
                         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-                        _assign_prompt(outstanding, request_rows, ids, "wildchat", str(conv_hash))
+                        _assign_prompt(
+                            outstanding, request_rows, ids, "wildchat", str(conv_hash)
+                        )
 
 
-def build_payload(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def build_payload(
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     from transformers import AutoTokenizer
 
     rows = load_trace(
@@ -393,11 +406,18 @@ def build_payload(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[
     if outstanding:
         fill_from_wildchat(args.wildchat_path, tokenizer, outstanding, rows)
     if outstanding:
-        raise RuntimeError(f"failed to find contexts for {len(outstanding)} trace requests")
+        raise RuntimeError(
+            f"failed to find contexts for {len(outstanding)} trace requests"
+        )
     payload_hash = hashlib.sha256(
         json.dumps(
             [
-                [row["arrival_s"], row["target_context_tokens"], row["target_output_tokens"], row["input_ids"]]
+                [
+                    row["arrival_s"],
+                    row["target_context_tokens"],
+                    row["target_output_tokens"],
+                    row["input_ids"],
+                ]
                 for row in rows
             ]
         ).encode()
@@ -410,10 +430,12 @@ def build_payload(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[
         "payload_hash": payload_hash,
         "context_min": min(int(r["actual_context_tokens"]) for r in rows),
         "context_max": max(int(r["actual_context_tokens"]) for r in rows),
-        "context_mean": sum(int(r["actual_context_tokens"]) for r in rows) / max(1, len(rows)),
+        "context_mean": sum(int(r["actual_context_tokens"]) for r in rows)
+        / max(1, len(rows)),
         "output_min": min(int(r["target_output_tokens"]) for r in rows),
         "output_max": max(int(r["target_output_tokens"]) for r in rows),
-        "output_mean": sum(int(r["target_output_tokens"]) for r in rows) / max(1, len(rows)),
+        "output_mean": sum(int(r["target_output_tokens"]) for r in rows)
+        / max(1, len(rows)),
         "sharegpt_count": sum(1 for r in rows if r.get("prompt_source") == "sharegpt"),
         "wildchat_count": sum(1 for r in rows if r.get("prompt_source") == "wildchat"),
     }
@@ -432,7 +454,9 @@ def _payload_config(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def payload_cache_paths(args: argparse.Namespace, output_dir: Path) -> Tuple[Path, Path]:
+def payload_cache_paths(
+    args: argparse.Namespace, output_dir: Path
+) -> Tuple[Path, Path]:
     if args.payload_path:
         payload_path = Path(args.payload_path)
     else:
@@ -451,7 +475,9 @@ def _payload_hash(rows: List[Dict[str, Any]]) -> str:
         ]
         for row in rows
     ]
-    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()[:16]
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
 
 
 def load_payload_cache(
@@ -540,12 +566,10 @@ def get_or_build_payload(
     return rows, metadata
 
 
-def server_command(args: argparse.Namespace, spec: PolicyRun, port: int, runtime_profile: str) -> List[str]:
-    kvc_backend = (
-        args.dp_kvc_backend
-        if is_coresid(spec)
-        else args.baseline_kvc_backend
-    )
+def server_command(
+    args: argparse.Namespace, spec: PolicyRun, port: int, runtime_profile: str
+) -> List[str]:
+    kvc_backend = args.dp_kvc_backend if is_coresid(spec) else args.baseline_kvc_backend
     cmd = [
         sys.executable,
         "-m",
@@ -583,7 +607,7 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int, runtime
         layerkv_flags(
             mode=spec.mode,
             policy=spec.policy,
-            target_reclaim_mb=spec.target_reclaim_mb,
+            reclaim_limit_mb=spec.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
             kvc_backend=kvc_backend,
             dynamic_pressure_from_kvc=args.dynamic_pressure_from_kvc,
@@ -591,8 +615,14 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int, runtime
             runtime_profile=runtime_profile,
             debug_stats=True,
             profile_detail=True,
-            expert_backing_cache_mb=args.expert_backing_cache_mb if runtime_profile == "optimized" else 0.0,
-            expert_cpu_backing_mode=args.expert_cpu_backing_mode if runtime_profile == "optimized" else "none",
+            expert_backing_cache_mb=(
+                args.expert_backing_cache_mb if runtime_profile == "optimized" else 0.0
+            ),
+            expert_cpu_backing_mode=(
+                args.expert_cpu_backing_mode
+                if runtime_profile == "optimized"
+                else "none"
+            ),
             expert_install_layers_per_step=args.expert_install_layers_per_step,
             expert_install_budget_mb=args.expert_install_budget_mb,
             expert_install_target_steps=args.expert_install_target_steps,
@@ -601,7 +631,9 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int, runtime
     return cmd
 
 
-def stream_generate(base_url: str, row: Dict[str, Any], request_timeout_s: float) -> Dict[str, Any]:
+def stream_generate(
+    base_url: str, row: Dict[str, Any], request_timeout_s: float
+) -> Dict[str, Any]:
     payload = {
         "input_ids": row["input_ids"],
         "sampling_params": {
@@ -665,10 +697,14 @@ def stream_generate(base_url: str, row: Dict[str, Any], request_timeout_s: float
     }
 
 
-def replay_requests(args: argparse.Namespace, base_url: str, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
+def replay_requests(
+    args: argparse.Namespace, base_url: str, rows: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], float]:
     results: List[Dict[str, Any]] = []
     start = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_client_workers) as pool:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.max_client_workers
+    ) as pool:
         futures = []
         for row in rows:
             due = start + float(row["arrival_s"]) / max(1e-9, args.time_scale)
@@ -688,7 +724,9 @@ def replay_requests(args: argparse.Namespace, base_url: str, rows: List[Dict[str
     return results, wall_ms
 
 
-def validate_summary(spec: PolicyRun, returncode: int, stats: Dict[str, Any], failed_count: int) -> Tuple[bool, str]:
+def validate_summary(
+    spec: PolicyRun, returncode: int, stats: Dict[str, Any], failed_count: int
+) -> Tuple[bool, str]:
     reasons = []
     if failed_count:
         reasons.append(f"failed_requests={failed_count}")
@@ -717,7 +755,12 @@ def validate_summary(spec: PolicyRun, returncode: int, stats: Dict[str, Any], fa
     return not reasons, ";".join(reasons)
 
 
-def run_policy(args: argparse.Namespace, spec: PolicyRun, rows: List[Dict[str, Any]], output_dir: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+def run_policy(
+    args: argparse.Namespace,
+    spec: PolicyRun,
+    rows: List[Dict[str, Any]],
+    output_dir: Path,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     runtime_profile = args.dp_runtime_profile if is_coresid(spec) else "simple"
     port = _free_port()
     stdout_path = output_dir / f"{spec.scenario}.server.stdout.log"
@@ -731,7 +774,11 @@ def run_policy(args: argparse.Namespace, spec: PolicyRun, rows: List[Dict[str, A
     env["TMPDIR"] = args.tmpdir
     env["SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE"] = "0"
     repo_python = str(Path.cwd() / "python")
-    env["PYTHONPATH"] = repo_python if not env.get("PYTHONPATH") else repo_python + os.pathsep + env["PYTHONPATH"]
+    env["PYTHONPATH"] = (
+        repo_python
+        if not env.get("PYTHONPATH")
+        else repo_python + os.pathsep + env["PYTHONPATH"]
+    )
     with stdout_path.open("w") as stdout_f, stderr_path.open("w") as stderr_f:
         proc = subprocess.Popen(
             cmd,
@@ -756,7 +803,9 @@ def run_policy(args: argparse.Namespace, spec: PolicyRun, rows: List[Dict[str, A
                 raise RuntimeError(f"server exited before ready: {proc.returncode}")
             if not ready:
                 raise RuntimeError("server did not become ready before startup timeout")
-            request_rows, wall_ms = replay_requests(args, f"http://127.0.0.1:{port}", rows)
+            request_rows, wall_ms = replay_requests(
+                args, f"http://127.0.0.1:{port}", rows
+            )
         except Exception as exc:
             request_rows = [
                 {
@@ -786,12 +835,18 @@ def run_policy(args: argparse.Namespace, spec: PolicyRun, rows: List[Dict[str, A
     ttft = [_to_float(r.get("ttft_ms")) for r in success_rows]
     e2e = [_to_float(r.get("e2e_ms")) for r in success_rows]
     tpot = [_to_float(r.get("tpot_ms")) for r in success_rows]
-    total_output_tokens = sum(int(r.get("target_output_tokens", 0)) for r in success_rows)
-    planned_reclaim = _to_float(stats.get("planned_kvc_reclaim_mb")) + _to_float(stats.get("planned_expert_reclaim_mb"))
+    total_output_tokens = sum(
+        int(r.get("target_output_tokens", 0)) for r in success_rows
+    )
+    planned_reclaim = _to_float(stats.get("planned_kvc_reclaim_mb")) + _to_float(
+        stats.get("planned_expert_reclaim_mb")
+    )
     actual_reclaim = max(
         _to_float(stats.get("physical_total_reclaim_peak_mb")),
-        _to_float(stats.get("physical_kvc_reclaim_peak_mb")) + _to_float(stats.get("physical_expert_reclaim_mb")),
-        _to_float(stats.get("physical_kvc_reclaim_mb")) + _to_float(stats.get("physical_expert_reclaim_mb")),
+        _to_float(stats.get("physical_kvc_reclaim_peak_mb"))
+        + _to_float(stats.get("physical_expert_reclaim_mb")),
+        _to_float(stats.get("physical_kvc_reclaim_mb"))
+        + _to_float(stats.get("physical_expert_reclaim_mb")),
     )
     summary: Dict[str, Any] = {
         "policy": spec.scenario,
@@ -804,8 +859,12 @@ def run_policy(args: argparse.Namespace, spec: PolicyRun, rows: List[Dict[str, A
         "failed_count": failed_count,
         "trace_window_s": args.trace_window_s,
         "wall_ms": wall_ms,
-        "request_throughput_rps": len(success_rows) / (wall_ms / 1000.0) if wall_ms > 0 else 0.0,
-        "output_throughput_tok_s": total_output_tokens / (wall_ms / 1000.0) if wall_ms > 0 else 0.0,
+        "request_throughput_rps": (
+            len(success_rows) / (wall_ms / 1000.0) if wall_ms > 0 else 0.0
+        ),
+        "output_throughput_tok_s": (
+            total_output_tokens / (wall_ms / 1000.0) if wall_ms > 0 else 0.0
+        ),
         "actual_reclaim_mb": actual_reclaim,
         "planned_reclaim_mb": planned_reclaim,
         "stats_line_count": len(stats_lines),
@@ -831,7 +890,9 @@ def main() -> int:
     parser.add_argument("--trace-path", default=TRACE_PATH)
     parser.add_argument("--sharegpt-path", default=SHAREGPT_PATH)
     parser.add_argument("--wildchat-path", default=WILDCHAT_PATH)
-    parser.add_argument("--output-dir", default="outputs/layerkv/azure_trace_policy_eval")
+    parser.add_argument(
+        "--output-dir", default="outputs/layerkv/azure_trace_policy_eval"
+    )
     parser.add_argument("--gpu", default="1")
     parser.add_argument("--trace-window-start-s", type=float, default=0.0)
     parser.add_argument("--trace-window-s", type=float, default=300.0)
@@ -880,7 +941,9 @@ def main() -> int:
         help="KVC backend for layer-aware-joint-dp. per-layer-arena is required for true per-layer KVC choices.",
     )
     parser.add_argument("--kvc-scheduler", default="async-deadline")
-    parser.add_argument("--dp-runtime-profile", choices=["simple", "optimized"], default="optimized")
+    parser.add_argument(
+        "--dp-runtime-profile", choices=["simple", "optimized"], default="optimized"
+    )
     parser.add_argument(
         "--dynamic-pressure-from-kvc",
         action=argparse.BooleanOptionalAction,
@@ -891,7 +954,9 @@ def main() -> int:
         ),
     )
     parser.add_argument("--expert-backing-cache-mb", type=float, default=0.0)
-    parser.add_argument("--expert-cpu-backing-mode", choices=["none", "all"], default="none")
+    parser.add_argument(
+        "--expert-cpu-backing-mode", choices=["none", "all"], default="none"
+    )
     parser.add_argument("--expert-install-layers-per-step", type=int, default=1)
     parser.add_argument("--expert-install-budget-mb", type=float, default=128.0)
     parser.add_argument("--expert-install-target-steps", type=int, default=16)
@@ -900,24 +965,39 @@ def main() -> int:
     parser.add_argument("--startup-timeout-s", type=float, default=1200.0)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
     parser.add_argument("--watchdog-timeout-s", type=int, default=3600)
-    parser.add_argument("--policies", nargs="+", default=[p.scenario for p in POLICY_RUNS], choices=[p.scenario for p in POLICY_RUNS])
+    parser.add_argument(
+        "--policies",
+        nargs="+",
+        default=[p.scenario for p in POLICY_RUNS],
+        choices=[p.scenario for p in POLICY_RUNS],
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows, metadata = get_or_build_payload(args, output_dir)
-    (output_dir / "run_config.json").write_text(json.dumps({**vars(args), **metadata}, indent=2, sort_keys=True))
-    payload_rows = [
-        {k: v for k, v in row.items() if k != "input_ids"}
-        for row in rows
-    ]
-    write_csv(output_dir / "trace_payload.csv", payload_rows, [
-        "request_id", "arrival_s", "target_context_tokens", "actual_context_tokens",
-        "target_output_tokens", "prompt_source", "prompt_record_id",
-    ])
+    (output_dir / "run_config.json").write_text(
+        json.dumps({**vars(args), **metadata}, indent=2, sort_keys=True)
+    )
+    payload_rows = [{k: v for k, v in row.items() if k != "input_ids"} for row in rows]
+    write_csv(
+        output_dir / "trace_payload.csv",
+        payload_rows,
+        [
+            "request_id",
+            "arrival_s",
+            "target_context_tokens",
+            "actual_context_tokens",
+            "target_output_tokens",
+            "prompt_source",
+            "prompt_record_id",
+        ],
+    )
     if args.prepare_payload_only:
         result = {
-            "payload_path": metadata.get("payload_path", str(payload_cache_paths(args, output_dir)[0])),
+            "payload_path": metadata.get(
+                "payload_path", str(payload_cache_paths(args, output_dir)[0])
+            ),
             "payload_hash": metadata.get("payload_hash", ""),
             "payload_reused": metadata.get("payload_reused", False),
             "request_count": len(rows),
@@ -966,7 +1046,11 @@ def main() -> int:
         write_partial_outputs()
 
     valid_rows = [r for r in summary_rows if str(r.get("valid")) == "True"]
-    best = max(valid_rows, key=lambda r: _to_float(r.get("output_throughput_tok_s")), default={})
+    best = max(
+        valid_rows,
+        key=lambda r: _to_float(r.get("output_throughput_tok_s")),
+        default={},
+    )
     result = {
         "summary_csv": str(output_dir / "policy_summary.csv"),
         "per_request_csv": str(output_dir / "per_request.csv"),
@@ -976,7 +1060,9 @@ def main() -> int:
         "all_valid": len(valid_rows) == len(summary_rows),
         "rows": summary_rows,
     }
-    (output_dir / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+    (output_dir / "summary.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True)
+    )
     write_csv(output_dir / "per_request.csv", all_request_rows, PER_REQUEST_FIELDS)
     write_csv(output_dir / "policy_summary.csv", summary_rows, SUMMARY_FIELDS)
     print(json.dumps(result, indent=2, sort_keys=True))

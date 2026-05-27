@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 
 from layerkv_eval_common import (
     DEFAULT_MODEL_PATH,
-    FIG4_TARGET_RECLAIM_MB,
+    FIG4_RECLAIM_LIMIT_MB,
     FIG4_WORKLOADS,
     apply_fig4_workload,
     base_command,
@@ -23,7 +23,6 @@ from layerkv_eval_common import (
     run_bench_command,
     write_csv,
 )
-
 
 CSV_FIELDS = [
     "workload",
@@ -45,7 +44,7 @@ CSV_FIELDS = [
     "layerkv_enabled",
     "layerkv_mode",
     "layerkv_policy",
-    "layerkv_target_reclaim_mb",
+    "layerkv_reclaim_limit_mb",
     "layerkv_physical_kvc_supported",
     "layerkv_physical_expert_supported",
     "planned_kvc_reclaim_mb",
@@ -116,42 +115,42 @@ def scenario_command(
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="kv-first",
-            target_reclaim_mb=args.target_reclaim_mb,
+            reclaim_limit_mb=args.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_expert_first":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="expert-first",
-            target_reclaim_mb=args.target_reclaim_mb,
+            reclaim_limit_mb=args.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_ratio_50_50":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="ratio-50-50",
-            target_reclaim_mb=args.target_reclaim_mb,
+            reclaim_limit_mb=args.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_ratio_25_75":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="ratio-25-75",
-            target_reclaim_mb=args.target_reclaim_mb,
+            reclaim_limit_mb=args.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_ratio_75_25":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="ratio-75-25",
-            target_reclaim_mb=args.target_reclaim_mb,
+            reclaim_limit_mb=args.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     if scenario == "kvc_expert_joint_dp":
         return cmd + layerkv_flags(
             mode="kvc-expert",
             policy="layer-aware-joint-dp",
-            target_reclaim_mb=args.target_reclaim_mb,
+            reclaim_limit_mb=args.reclaim_limit_mb,
             kvc_block_tokens=args.kvc_block_tokens,
         )
     raise ValueError(f"unknown scenario: {scenario}")
@@ -179,7 +178,10 @@ def validate_scenario(
             reasons.append(f"expert_guard_failed:{stats.get('expert_guard_reason')}")
         planned_expert = float(stats.get("planned_expert_reclaim_mb", 0.0) or 0.0)
         planned_kvc = float(stats.get("planned_kvc_reclaim_mb", 0.0) or 0.0)
-        if planned_expert > 0 and int(stats.get("expert_slot_rebind_count", 0) or 0) <= 0:
+        if (
+            planned_expert > 0
+            and int(stats.get("expert_slot_rebind_count", 0) or 0) <= 0
+        ):
             reasons.append("no_expert_slot_rebind")
         physical = float(stats.get("physical_expert_reclaim_mb", 0.0) or 0.0)
         if planned_expert > 0 and physical + 1e-3 < planned_expert:
@@ -246,7 +248,9 @@ def run_scenario(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--output-dir", default="outputs/layerkv/real_qwen3_30b_a3b_validation")
+    parser.add_argument(
+        "--output-dir", default="outputs/layerkv/real_qwen3_30b_a3b_validation"
+    )
     parser.add_argument("--gpu", default="1")
     parser.add_argument(
         "--workload",
@@ -260,7 +264,7 @@ def main() -> int:
     parser.add_argument("--max-total-tokens", type=int, default=0)
     parser.add_argument("--max-running-requests", type=int, default=0)
     parser.add_argument("--mem-fraction-static", type=float, default=0.0)
-    parser.add_argument("--target-reclaim-mb", type=float, default=FIG4_TARGET_RECLAIM_MB)
+    parser.add_argument("--reclaim-limit-mb", type=float, default=FIG4_RECLAIM_LIMIT_MB)
     parser.add_argument("--kvc-block-tokens", type=int, default=16)
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
@@ -313,7 +317,7 @@ def main() -> int:
         "batch_size": args.batch_size,
         "input_len": args.input_len,
         "output_len": args.output_len,
-        "fig4_target_reclaim_mb": args.target_reclaim_mb,
+        "fig4_reclaim_limit_mb": args.reclaim_limit_mb,
         "fig4_dataset_name": args.fig4_dataset_name,
         "fig4_dataset_path": args.fig4_dataset_path,
         "max_total_tokens": args.max_total_tokens,

@@ -36,7 +36,7 @@ class ServerScenario:
     enable_layerkv: bool
     mode: str = "off"
     policy: str = "none"
-    target_reclaim_mb: float = 0.0
+    reclaim_limit_mb: float = 0.0
 
 
 SCENARIOS = {
@@ -189,7 +189,7 @@ def launch_command(
             layerkv_flags(
                 mode=scenario.mode,
                 policy=scenario.policy,
-                target_reclaim_mb=scenario.target_reclaim_mb,
+                reclaim_limit_mb=scenario.reclaim_limit_mb,
                 kvc_block_tokens=args.kvc_block_tokens,
                 scheduler=args.kvc_scheduler,
                 debug_stats=True,
@@ -235,7 +235,9 @@ def validate_summary(
         reasons.append("no_kvc_evict")
     if planned_kvc > 0 and int(stats.get("kvc_reload_count_total", 0) or 0) <= 0:
         reasons.append("no_kvc_reload")
-    if planned_expert > 0 and not bool(stats.get("layerkv_physical_expert_supported", False)):
+    if planned_expert > 0 and not bool(
+        stats.get("layerkv_physical_expert_supported", False)
+    ):
         reasons.append("physical_expert_unsupported")
     if planned_expert > 0 and int(stats.get("expert_slot_rebind_count", 0) or 0) <= 0:
         reasons.append("no_expert_slot_rebind")
@@ -325,7 +327,10 @@ def run_server_scenario(
                 )
                 response_path.write_text(json.dumps(response, indent=2, sort_keys=True))
         except error.HTTPError as exc:
-            response = {"http_error": exc.code, "body": exc.read().decode("utf-8", "replace")}
+            response = {
+                "http_error": exc.code,
+                "body": exc.read().decode("utf-8", "replace"),
+            }
         except Exception as exc:
             response = {"error": repr(exc)}
         finally:
@@ -372,7 +377,9 @@ def summary_to_row(summary: Dict[str, Any]) -> Dict[str, Any]:
             "ready": summary.get("ready", False),
             "returncode": summary.get("returncode", ""),
             "stats_line_count": summary.get("stats_line_count", 0),
-            "response_text": response.get("text", "") if isinstance(response, dict) else "",
+            "response_text": (
+                response.get("text", "") if isinstance(response, dict) else ""
+            ),
             "actual_reclaim_limited_by_workload": limited_by_workload,
             "summary_path": summary.get("summary_path", ""),
             "stdout_path": summary.get("stdout_path", ""),
@@ -408,10 +415,12 @@ def main() -> int:
         ),
     )
     parser.add_argument("--max-new-tokens", type=int, default=4)
-    parser.add_argument("--enable-layerkv", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--enable-layerkv", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--layerkv-mode", default="kvc-expert")
     parser.add_argument("--layerkv-policy", default="layer-aware-joint-dp")
-    parser.add_argument("--target-reclaim-mb", type=float, default=512.0)
+    parser.add_argument("--reclaim-limit-mb", type=float, default=512.0)
     parser.add_argument("--schedule-policy", default="fcfs")
     parser.add_argument("--kvc-block-tokens", type=int, default=16)
     parser.add_argument("--kvc-scheduler", default="async-deadline")
@@ -465,7 +474,7 @@ def main() -> int:
         enable_layerkv=bool(args.enable_layerkv),
         mode=args.layerkv_mode,
         policy=args.layerkv_policy,
-        target_reclaim_mb=args.target_reclaim_mb,
+        reclaim_limit_mb=args.reclaim_limit_mb,
     )
     summary = run_server_scenario(args, scenario, root_output_dir)
     print(json.dumps(summary, indent=2, sort_keys=True))

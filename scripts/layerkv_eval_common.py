@@ -21,7 +21,7 @@ DEFAULT_MODEL_PATH = (
     "snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
 )
 
-FIG4_TARGET_RECLAIM_MB = 4096.0
+FIG4_RECLAIM_LIMIT_MB = 4096.0
 
 FIG4_WORKLOADS = {
     "batch-heavy": {
@@ -505,9 +505,8 @@ def layerkv_flags(
     *,
     mode: str,
     policy: str,
-    target_reclaim_mb: Optional[float],
+    reclaim_limit_mb: Optional[float],
     kvc_block_tokens: int,
-    reclaim_limit_mb: Optional[float] = None,
     kvc_backend: str = "token-slot",
     dynamic_pressure_from_kvc: bool = False,
     scheduler: str = "async-deadline",
@@ -545,9 +544,8 @@ def layerkv_flags(
         "--layerkv-expert-install-target-steps",
         str(expert_install_target_steps),
     ]
-    limit_mb = reclaim_limit_mb if reclaim_limit_mb is not None else target_reclaim_mb
-    if limit_mb is not None:
-        flags.extend(["--layerkv-reclaim-limit-mb", str(limit_mb)])
+    if reclaim_limit_mb is not None:
+        flags.extend(["--layerkv-reclaim-limit-mb", str(reclaim_limit_mb)])
     if dynamic_pressure_from_kvc:
         flags.append("--layerkv-dynamic-pressure-from-kvc")
     if debug_stats:

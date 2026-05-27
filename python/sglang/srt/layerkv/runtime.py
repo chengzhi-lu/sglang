@@ -31,7 +31,6 @@ class LayerKVConfig:
     mode: str = "off"
     policy: str = "none"
     reclaim_limit_mb: float = 0.0
-    target_reclaim_mb: float = 0.0
     dynamic_pressure_from_kvc: bool = False
     kvc_block_tokens: int = 16
     kvc_backend: str = "token-slot"
@@ -48,24 +47,17 @@ class LayerKVConfig:
     expert_install_target_steps: int = 0
     worker_role: str = "standalone"
 
-    def __post_init__(self) -> None:
-        # Backward-compatible alias for older tests/scripts.
-        if self.reclaim_limit_mb <= 0.0 and self.target_reclaim_mb > 0.0:
-            self.reclaim_limit_mb = float(self.target_reclaim_mb)
-        self.target_reclaim_mb = float(self.reclaim_limit_mb)
-
     @classmethod
     def from_server_args(cls, server_args: Any) -> "LayerKVConfig":
         disaggregation_mode = str(getattr(server_args, "disaggregation_mode", "null"))
         worker_role = "pd-decode" if disaggregation_mode == "decode" else "standalone"
-        reclaim_limit_mb = getattr(server_args, "layerkv_reclaim_limit_mb", None)
-        if reclaim_limit_mb is None:
-            reclaim_limit_mb = getattr(server_args, "layerkv_target_reclaim_mb", 0.0)
         return cls(
             enabled=bool(getattr(server_args, "enable_layerkv", False)),
             mode=str(getattr(server_args, "layerkv_mode", "off")),
             policy=str(getattr(server_args, "layerkv_policy", "none")),
-            reclaim_limit_mb=float(reclaim_limit_mb or 0.0),
+            reclaim_limit_mb=float(
+                getattr(server_args, "layerkv_reclaim_limit_mb", 0.0) or 0.0
+            ),
             dynamic_pressure_from_kvc=bool(
                 getattr(server_args, "layerkv_dynamic_pressure_from_kvc", False)
             ),
@@ -133,7 +125,6 @@ class LayerKVStats:
     kvc_get_kv_count: int = 0
     kvc_tokens_written: int = 0
     kvc_bytes_written: int = 0
-    configured_target_reclaim_mb: float = 0.0
     configured_reclaim_limit_mb: float = 0.0
     effective_reclaim_target_mb: float = 0.0
     needed_pressure_mb: float = 0.0
@@ -4070,7 +4061,6 @@ class LayerKVRuntime:
             not self.config.dynamic_pressure_from_kvc and effective + 1e-3 < configured
         ):
             reason = "available_reclaim_below_configured_limit"
-        self.stats.configured_target_reclaim_mb = configured
         self.stats.configured_reclaim_limit_mb = configured
         self.stats.needed_pressure_mb = needed_pressure
         self.stats.available_kvc_reclaim_mb = available_kvc
@@ -8716,7 +8706,7 @@ class LayerKVRuntime:
                 int(x) for x in self._planned_kvc_tokens_by_layer.values()
             )
         elif self.config.kvc_backend == "per-layer-arena":
-            target_tokens = self._target_offloaded_per_layer_tokens(
+            target_tokens = self._limit_offloaded_per_layer_tokens(
                 effective_kvc_reclaim_mb
             )
         else:
@@ -8724,7 +8714,7 @@ class LayerKVRuntime:
             # token-to-KV pool, one token slot owns K/V for all layers, so
             # evicting N token slots reclaims the same N-token prefix/suffix
             # from every layer instead of making layer-specific choices.
-            target_tokens = self._target_offloaded_tokens(effective_kvc_reclaim_mb)
+            target_tokens = self._limit_offloaded_tokens(effective_kvc_reclaim_mb)
         pending_evict_tokens = (
             self._pending_evict_token_count()
             if self.config.kvc_backend == "virtual-arena"
@@ -8906,16 +8896,16 @@ class LayerKVRuntime:
         self.stats.layerkv_tasks_built += 1
         self._refresh_kvc_residency_stats()
 
-    def _target_offloaded_tokens(self, target_reclaim_mb: float) -> int:
-        target_bytes = int(target_reclaim_mb * 1024 * 1024)
+    def _limit_offloaded_tokens(self, reclaim_limit_mb: float) -> int:
+        target_bytes = int(reclaim_limit_mb * 1024 * 1024)
         raw_tokens = max(1, target_bytes // self._bytes_per_token_all_layers)
         return max(self._page_size, self._align_tokens_up(raw_tokens))
 
-    def _target_offloaded_per_layer_tokens(self, target_reclaim_mb: float) -> int:
+    def _limit_offloaded_per_layer_tokens(self, reclaim_limit_mb: float) -> int:
         bytes_per_token = self._bytes_per_kvc_token_per_layer()
         if bytes_per_token <= 0:
             return 0
-        target_bytes = int(target_reclaim_mb * 1024 * 1024)
+        target_bytes = int(reclaim_limit_mb * 1024 * 1024)
         raw_tokens = max(1, target_bytes // bytes_per_token)
         return max(self._page_size, self._align_tokens_up(raw_tokens))
 
@@ -9878,7 +9868,7 @@ class LayerKVRuntime:
     ) -> Dict[str, Any]:
         t0 = time.perf_counter() if self.config.debug_stats else 0.0
         if (
-            self.stats.configured_target_reclaim_mb <= 0.0
+            self.stats.configured_reclaim_limit_mb <= 0.0
             and self.config.reclaim_limit_mb > 0.0
         ):
             self._refresh_reclaim_target_stats(self._last_forward_batch)
@@ -9906,7 +9896,6 @@ class LayerKVRuntime:
                 "layerkv_mode": self.config.mode,
                 "layerkv_policy": self.config.policy,
                 "layerkv_reclaim_limit_mb": self.config.reclaim_limit_mb,
-                "layerkv_target_reclaim_mb": self.config.reclaim_limit_mb,
                 "layerkv_kvc_backend": self.config.kvc_backend,
                 "layerkv_kvc_scheduler": self.config.kvc_scheduler,
                 "layerkv_runtime_profile": self.config.runtime_profile,

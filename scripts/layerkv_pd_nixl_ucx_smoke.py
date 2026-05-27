@@ -218,7 +218,7 @@ def _decode_extra_flags(args: argparse.Namespace) -> List[str]:
             layerkv_flags(
                 mode=args.layerkv_mode,
                 policy=args.layerkv_policy,
-                target_reclaim_mb=args.layerkv_target_reclaim_mb,
+                reclaim_limit_mb=args.layerkv_reclaim_limit_mb,
                 kvc_block_tokens=args.layerkv_kvc_block_tokens,
                 kvc_backend=args.layerkv_kvc_backend,
                 scheduler=args.layerkv_kvc_scheduler,
@@ -504,7 +504,7 @@ def main() -> int:
     parser.add_argument("--enable-layerkv", action="store_true")
     parser.add_argument("--layerkv-mode", default="kvc-expert")
     parser.add_argument("--layerkv-policy", default="layer-aware-joint-dp")
-    parser.add_argument("--layerkv-target-reclaim-mb", type=float, default=512.0)
+    parser.add_argument("--layerkv-reclaim-limit-mb", type=float, default=512.0)
     parser.add_argument("--layerkv-kvc-block-tokens", type=int, default=16)
     parser.add_argument("--layerkv-kvc-backend", default="per-layer-arena")
     parser.add_argument("--layerkv-kvc-scheduler", default="async-deadline")

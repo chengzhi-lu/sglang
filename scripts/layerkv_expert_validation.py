@@ -27,7 +27,6 @@ from sglang.srt.layerkv.runtime import LayerKVConfig, LayerKVRuntime
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
-
 POLICIES = [
     "expert-first",
     "kv-first",
@@ -50,9 +49,10 @@ def _hotness_contains_expert(summary: Dict[str, Any], expert_id: int) -> bool:
                     return True
     return False
 
+
 CSV_FIELDS = [
     "policy",
-    "target_reclaim_mb",
+    "reclaim_limit_mb",
     "valid",
     "validation_reason",
     "policy_kvc_fraction",
@@ -174,12 +174,14 @@ class FakeRunner:
         self.model = FakeModel(layers)
 
 
-def _runtime(policy: str, target_reclaim_mb: float, runtime_profile: str) -> LayerKVRuntime:
+def _runtime(
+    policy: str, reclaim_limit_mb: float, runtime_profile: str
+) -> LayerKVRuntime:
     args = Namespace(
         enable_layerkv=True,
         layerkv_mode="kvc-expert",
         layerkv_policy=policy,
-        layerkv_target_reclaim_mb=target_reclaim_mb,
+        layerkv_reclaim_limit_mb=reclaim_limit_mb,
         layerkv_kvc_block_tokens=16,
         layerkv_kvc_scheduler="async-deadline",
         layerkv_runtime_profile=runtime_profile,
@@ -194,14 +196,16 @@ def _runtime(policy: str, target_reclaim_mb: float, runtime_profile: str) -> Lay
     return LayerKVRuntime(LayerKVConfig.from_server_args(args))
 
 
-def _exercise_policy(policy: str, target_reclaim_mb: float, runtime_profile: str) -> Dict[str, Any]:
+def _exercise_policy(
+    policy: str, reclaim_limit_mb: float, runtime_profile: str
+) -> Dict[str, Any]:
     runner = FakeRunner(
         [
             FakeFusedMoE(layer_id=0),
             FakeFusedMoE(layer_id=1),
         ]
     )
-    rt = _runtime(policy, target_reclaim_mb, runtime_profile)
+    rt = _runtime(policy, reclaim_limit_mb, runtime_profile)
     rt.install_on_runner(runner)
     topk = StandardTopKOutput(
         topk_weights=torch.ones((2, 2), dtype=torch.float32),
@@ -284,7 +288,7 @@ def _exercise_policy(policy: str, target_reclaim_mb: float, runtime_profile: str
     row.update(
         {
             "policy": policy,
-            "target_reclaim_mb": target_reclaim_mb,
+            "reclaim_limit_mb": reclaim_limit_mb,
             "valid": not reasons,
             "validation_reason": ";".join(reasons),
         }
@@ -292,11 +296,13 @@ def _exercise_policy(policy: str, target_reclaim_mb: float, runtime_profile: str
     return row
 
 
-def _exercise_unsupported(target_reclaim_mb: float, runtime_profile: str) -> Dict[str, Any]:
+def _exercise_unsupported(
+    reclaim_limit_mb: float, runtime_profile: str
+) -> Dict[str, Any]:
     runner = FakeRunner(
         [FakeFusedMoE(layer_id=0, quant_method=UnsupportedQuantMethod())]
     )
-    rt = _runtime("kv-first", target_reclaim_mb, runtime_profile)
+    rt = _runtime("kv-first", reclaim_limit_mb, runtime_profile)
     rt.install_on_runner(runner)
     rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
     summary = rt.summary()
@@ -311,7 +317,7 @@ def _exercise_unsupported(target_reclaim_mb: float, runtime_profile: str) -> Dic
     row.update(
         {
             "policy": "kv-first-unsupported-quant",
-            "target_reclaim_mb": target_reclaim_mb,
+            "reclaim_limit_mb": reclaim_limit_mb,
             "valid": not reasons,
             "validation_reason": ";".join(reasons),
         }
@@ -330,7 +336,7 @@ def write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="outputs/layerkv")
-    parser.add_argument("--target-reclaim-mb", type=float, default=0.00035)
+    parser.add_argument("--reclaim-limit-mb", type=float, default=0.00035)
     parser.add_argument(
         "--runtime-profile",
         choices=["simple", "optimized"],
@@ -342,10 +348,10 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows = [
-        _exercise_policy(policy, args.target_reclaim_mb, args.runtime_profile)
+        _exercise_policy(policy, args.reclaim_limit_mb, args.runtime_profile)
         for policy in POLICIES
     ]
-    rows.append(_exercise_unsupported(args.target_reclaim_mb, args.runtime_profile))
+    rows.append(_exercise_unsupported(args.reclaim_limit_mb, args.runtime_profile))
 
     csv_path = output_dir / "expert_validation.csv"
     summary_path = output_dir / "expert_validation_summary.json"
