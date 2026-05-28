@@ -697,6 +697,9 @@ class ServerArgs:
     layerkv_disallow_destructive_fallback: bool = True
     layerkv_expert_backing_cache_mb: float = 0.0
     layerkv_expert_cpu_backing_mode: Literal["none", "all"] = "none"
+    layerkv_expert_forward_hooks: bool = True
+    layerkv_expert_collector_only: bool = False
+    layerkv_expert_hotness_sample_interval: int = 16
     layerkv_expert_install_layers_per_step: int = 1
     layerkv_expert_install_budget_mb: float = 128.0
     layerkv_expert_install_target_steps: int = 0
@@ -3583,6 +3586,8 @@ class ServerArgs:
             raise ValueError(
                 "--layerkv-expert-cpu-backing-mode must be one of: none, all"
             )
+        if self.layerkv_expert_hotness_sample_interval <= 0:
+            raise ValueError("--layerkv-expert-hotness-sample-interval must be positive")
 
         # v1 recovery is scheduled outside graph capture.
         if not self.disable_cuda_graph:
@@ -6548,6 +6553,31 @@ class ServerArgs:
             choices=["none", "all"],
             default=ServerArgs.layerkv_expert_cpu_backing_mode,
             help="Preload expert CPU backing. 'all' keeps one CPU copy of every supported expert to avoid decode-time D2H install backup.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-forward-hooks",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.layerkv_expert_forward_hooks,
+            help=(
+                "Install LayerKV expert forward hooks for hotness tracking, "
+                "topk remapping, and expert materialization. Disable only for "
+                "KVC-only ablation of expert hook overhead."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-expert-collector-only",
+            action="store_true",
+            help=(
+                "Collect LayerKV expert activation hotness without installing "
+                "expert slot-remap/materialization hooks. Intended for collector "
+                "overhead measurements."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-expert-hotness-sample-interval",
+            type=int,
+            default=ServerArgs.layerkv_expert_hotness_sample_interval,
+            help="Sample one LayerKV expert hotness record every N decode steps after the warmup window.",
         )
         parser.add_argument(
             "--layerkv-expert-install-layers-per-step",

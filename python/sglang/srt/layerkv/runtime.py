@@ -42,6 +42,9 @@ class LayerKVConfig:
     disallow_destructive_fallback: bool = True
     expert_backing_cache_mb: float = 0.0
     expert_cpu_backing_mode: str = "none"
+    expert_forward_hooks: bool = True
+    expert_collector_only: bool = False
+    expert_hotness_sample_interval: int = 16
     expert_install_layers_per_step: int = 1
     expert_install_budget_mb: float = 128.0
     expert_install_target_steps: int = 0
@@ -91,6 +94,21 @@ class LayerKVConfig:
                 getattr(server_args, "layerkv_expert_cpu_backing_mode", "none")
                 or "none"
             ),
+            expert_forward_hooks=bool(
+                getattr(server_args, "layerkv_expert_forward_hooks", True)
+            ),
+            expert_collector_only=bool(
+                getattr(server_args, "layerkv_expert_collector_only", False)
+            ),
+            expert_hotness_sample_interval=max(
+                1,
+                int(
+                    getattr(
+                        server_args, "layerkv_expert_hotness_sample_interval", 16
+                    )
+                    or 16
+                ),
+            ),
             expert_install_layers_per_step=max(
                 1,
                 int(
@@ -135,6 +153,13 @@ class LayerKVStats:
     dynamic_pressure_budget_tokens: int = 0
     dynamic_pressure_shortage_tokens: int = 0
     dynamic_pressure_token_usage_ratio: float = 0.0
+    dynamic_pressure_active_steps: int = 0
+    dynamic_pressure_skip_steps: int = 0
+    kvc_evict_without_pressure_count: int = 0
+    kvc_topup_skip_count: int = 0
+    kvc_topup_apply_count: int = 0
+    kvc_topup_pressure_mb: float = 0.0
+    kvc_topup_margin_mb: float = 0.0
     pre_retract_reclaim_attempt_count: int = 0
     pre_retract_reclaim_success_count: int = 0
     pre_retract_reclaim_needed_tokens: int = 0
@@ -185,6 +210,20 @@ class LayerKVStats:
     kvc_layerwise_required_index_scan_count: int = 0
     kvc_layerwise_required_index_stale_count: int = 0
     kvc_layerwise_required_selected_token_count: int = 0
+    kvc_required_cache_hit: int = 0
+    kvc_required_cache_miss: int = 0
+    kvc_required_cache_fallback: int = 0
+    kvc_required_scanned_keys: int = 0
+    kvc_evict_selector_fast_hit: int = 0
+    kvc_evict_selector_fallback: int = 0
+    kvc_evict_selector_scanned_entries: int = 0
+    kvc_evict_selector_selected_entries: int = 0
+    kvc_task_coalesced_count: int = 0
+    kvc_avg_task_tokens: float = 0.0
+    kvc_avg_task_bytes: float = 0.0
+    kvc_task_token_sum: int = 0
+    kvc_task_byte_sum: int = 0
+    kvc_metadata_dirty_guard_skip_count: int = 0
     kvc_layerwise_scheduler_deadline_reject_count: int = 0
     kvc_layerwise_scheduler_dynamic_budget_count: int = 0
     kvc_layerwise_cost_observation_count: int = 0
@@ -254,6 +293,12 @@ class LayerKVStats:
     layerkv_kvc_backend_limited: bool = False
     layerkv_kvc_backend_ready: bool = False
     layerkv_kvc_backend_reason: str = ""
+    layerkv_expert_forward_hooks_enabled: bool = True
+    layerkv_expert_collector_only: bool = False
+    layerkv_no_pressure_fastpath_count: int = 0
+    layerkv_no_pressure_expert_skip_count: int = 0
+    layerkv_no_pressure_scheduler_skip_count: int = 0
+    layerkv_no_pressure_kvc_skip_count: int = 0
     kvc_per_layer_metadata_rewrite_count: int = 0
     kvc_per_layer_metadata_rewrite_skip_count: int = 0
     kvc_per_layer_metadata_rewrite_unsupported_count: int = 0
@@ -292,6 +337,15 @@ class LayerKVStats:
     expert_materialize_count: int = 0
     expert_topk_rewrite_count: int = 0
     expert_core_hook_count: int = 0
+    expert_hotness_record_count: int = 0
+    expert_hotness_sample_skip_count: int = 0
+    expert_hotness_snapshot_count: int = 0
+    expert_hotness_sync_fallback_count: int = 0
+    expert_hotness_record_fast_count: int = 0
+    expert_hotness_record_safe_count: int = 0
+    expert_hotness_snapshot_deferred_count: int = 0
+    expert_hotness_snapshot_forced_count: int = 0
+    expert_hotness_ones_reuse_count: int = 0
     expert_materialize_mb_total: float = 0.0
     expert_materialize_ms: float = 0.0
     expert_materialize_async_count: int = 0
@@ -462,6 +516,9 @@ class LayerKVStats:
     profile_workload_stats_ms: float = 0.0
     profile_apply_expert_plan_ms: float = 0.0
     profile_expert_prefetch_ms: float = 0.0
+    profile_expert_prefetch_scan_ms: float = 0.0
+    profile_recovery_task_build_ms: float = 0.0
+    profile_recovery_task_schedule_ms: float = 0.0
     profile_kvc_reload_required_ms: float = 0.0
     profile_kvc_evict_to_target_ms: float = 0.0
     profile_kvc_select_required_ms: float = 0.0
@@ -476,6 +533,9 @@ class LayerKVStats:
     profile_kvc_evict_staging_alloc_ms: float = 0.0
     profile_kvc_evict_commit_ms: float = 0.0
     profile_expert_unique_ms: float = 0.0
+    profile_expert_hotness_record_ms: float = 0.0
+    profile_expert_hotness_snapshot_ms: float = 0.0
+    profile_expert_topk_rewrite_ms: float = 0.0
     profile_expert_materialize_control_ms: float = 0.0
     profile_expert_materialize_metadata_ms: float = 0.0
     profile_expert_materialize_choose_slot_ms: float = 0.0
@@ -1358,6 +1418,12 @@ class LayerKVRuntime:
         self.stats.layerkv_runtime_profile = str(self.config.runtime_profile)
         self.stats.layerkv_worker_role = str(self.config.worker_role)
         self.stats.layerkv_kvc_backend = str(self.config.kvc_backend)
+        self.stats.layerkv_expert_forward_hooks_enabled = bool(
+            self.config.expert_forward_hooks
+        )
+        self.stats.layerkv_expert_collector_only = bool(
+            self.config.expert_collector_only
+        )
         if self.config.kvc_backend == "token-slot":
             self.stats.layerkv_kvc_backend_semantics = "global_token_slot_layer_average"
             self.stats.layerkv_kvc_backend_limited = True
@@ -1392,6 +1458,12 @@ class LayerKVRuntime:
         ] = {}
         self._per_layer_offloaded_keys: Set[Tuple[int, int, int]] = set()
         self._per_layer_offloaded_keys_by_req: Dict[int, Set[Tuple[int, int, int]]] = {}
+        self._per_layer_offloaded_token_count_by_layer: Dict[int, int] = {}
+        self._per_layer_offloaded_version: int = 0
+        self._per_layer_offloaded_sorted_by_req: Dict[
+            int, Tuple[int, Tuple[Tuple[int, int, int], ...]]
+        ] = {}
+        self._per_layer_offloaded_dirty_reqs: Set[int] = set()
         self._resident_groups: Dict[
             _LayerKVResidencyKey, _LayerKVResidentTensorGroup
         ] = {}
@@ -1406,6 +1478,17 @@ class LayerKVRuntime:
         self._expert_hotness_prefill: Dict[int, Dict[int, int]] = {}
         self._expert_hotness_decode: Dict[int, Dict[int, int]] = {}
         self._expert_hotness_version: int = 0
+        self._expert_hotness_gpu_prefill: Dict[int, torch.Tensor] = {}
+        self._expert_hotness_gpu_decode: Dict[int, torch.Tensor] = {}
+        self._expert_hotness_pending_snapshots: List[
+            Tuple[str, int, torch.Tensor, Any]
+        ] = []
+        self._expert_hotness_pending_snapshot_keys: Set[Tuple[str, int]] = set()
+        self._expert_hotness_last_snapshot_step: Dict[Tuple[str, int], int] = {}
+        self._expert_hotness_ones_cache: Dict[Tuple[str, int], torch.Tensor] = {}
+        self._expert_hotness_sampled_layers_step: int = -1
+        self._expert_hotness_sampled_layers: Optional[Set[int]] = None
+        self._expert_hotness_sample_skip_pending: int = 0
         self._expert_plan_applied: bool = False
         self._expert_install_queue: List[_LayerKVExpertInstallItem] = []
         self._expert_install_state: str = ""
@@ -1430,6 +1513,8 @@ class LayerKVRuntime:
         self._expert_prepare_done: bool = False
         self._last_scheduler_context: Dict[str, Any] = {}
         self._last_scheduled_req_lens: List[Tuple[int, int]] = []
+        self._current_forward_req_lens_batch_id: Optional[int] = None
+        self._current_forward_req_lens: List[Tuple[int, int]] = []
         self._planned_kvc_token_target: int = 0
         self._planned_kvc_tokens_by_layer: Dict[int, int] = {}
         self._planned_expert_slot_capacities_by_layer: Dict[int, int] = {}
@@ -1455,6 +1540,8 @@ class LayerKVRuntime:
         self._pending_virtual_kvc_materialize: Dict[
             Tuple[Any, ...], _LayerKVPendingVirtualMaterialize
         ] = {}
+        self._per_layer_req_to_token_versions: Dict[int, int] = {}
+        self._per_layer_kvc_current_metadata_key: Optional[Tuple[Any, ...]] = None
         self._virtual_materialize_plan: Optional[_LayerKVVirtualMaterializePlan] = None
         self._virtual_materialize_plans_by_layer: Dict[
             int, _LayerKVVirtualMaterializePlan
@@ -2170,6 +2257,11 @@ class LayerKVRuntime:
             if not self.unsupported_reason:
                 self.unsupported_reason = "no supported standard FusedMoE layers found"
             return
+        if not self.config.expert_forward_hooks:
+            self.physical_expert_supported = False
+            if not self.unsupported_reason:
+                self.unsupported_reason = "expert forward hooks disabled"
+            return
         for layer_id, module in supported:
             reason = self._expert_layer_unsupported_reason(module)
             if reason:
@@ -2184,6 +2276,11 @@ class LayerKVRuntime:
         self.physical_expert_supported = True
         for layer_id, module in supported:
             self._install_expert_hotness_probe(module, layer_id)
+        if self.config.expert_collector_only:
+            self.physical_expert_supported = False
+            if not self.unsupported_reason:
+                self.unsupported_reason = "expert collector-only mode"
+            return
         if self.config.expert_cpu_backing_mode == "all":
             self._preload_all_expert_cpu_backing()
 
@@ -2229,12 +2326,16 @@ class LayerKVRuntime:
         def wrapped_run_moe_core(dispatch_output: Any, *args, **kwargs):
             topk_output = getattr(dispatch_output, "topk_output", None)
             topk_ids = getattr(topk_output, "topk_ids", None)
-            if topk_ids is not None:
+            if topk_ids is not None and self._should_collect_expert_hotness_layer(
+                layer_id
+            ):
                 self._record_expert_hotness_for_layer(
                     layer_id=layer_id,
                     full_num_experts=full_num_experts,
                     topk_ids=topk_ids,
                 )
+            elif topk_ids is not None:
+                self._expert_hotness_sample_skip_pending += 1
             return orig_run_moe_core(dispatch_output, *args, **kwargs)
 
         module._layerkv_hotness_orig_run_moe_core = orig_run_moe_core
@@ -2270,7 +2371,12 @@ class LayerKVRuntime:
         return ""
 
     def _avg_prefix_len(self, forward_batch: Any) -> float:
-        pairs = self._batch_req_indices_and_lens(forward_batch)
+        pairs = (
+            list(self._current_forward_req_lens)
+            if forward_batch is not None
+            and self._current_forward_req_lens_batch_id == id(forward_batch)
+            else self._batch_req_indices_and_lens(forward_batch)
+        )
         if not pairs:
             return 0.0
         return sum(max(0, seq_len - 1) for _, seq_len in pairs) / float(len(pairs))
@@ -2281,6 +2387,8 @@ class LayerKVRuntime:
             policy = "layer-aware-joint-dp"
         if policy == "none":
             return 0.0, 0.0, True, "policy=none disables LayerKV physical reclaim"
+        if self.config.expert_collector_only and self.config.mode == "kvc-expert":
+            return 1.0, 0.0, True, "expert_collector_only"
         if self.config.mode == "kvc-only":
             if policy in (
                 "expert-first",
@@ -2388,6 +2496,8 @@ class LayerKVRuntime:
             )
             return 1.0, 0.0, False, reason
 
+        if target_mb > 1e-3:
+            self._ensure_expert_hotness_cpu_view(mode=None)
         has_hotness = self._has_expert_hotness()
         if not has_hotness:
             kvc_fraction = self._context_heuristic_kvc_fraction(forward_batch)
@@ -3932,9 +4042,14 @@ class LayerKVRuntime:
             return 0.0
         token_count = 0
         pairs = (
-            self._batch_req_indices_and_lens(forward_batch)
+            list(self._current_forward_req_lens)
             if forward_batch is not None
-            else []
+            and self._current_forward_req_lens_batch_id == id(forward_batch)
+            else (
+                self._batch_req_indices_and_lens(forward_batch)
+                if forward_batch is not None
+                else []
+            )
         )
         for _req_idx, seq_len in pairs:
             token_count += self._align_tokens_down(max(0, seq_len - 1))
@@ -4007,6 +4122,8 @@ class LayerKVRuntime:
         )
 
     def _available_expert_reclaim_mb(self) -> float:
+        if self.config.expert_collector_only:
+            return 0.0
         if not self.physical_expert_supported:
             return 0.0
         total = 0
@@ -4071,6 +4188,60 @@ class LayerKVRuntime:
         self._cached_reclaim_target_key = cache_key
         self._cached_reclaim_target_value = effective
         return effective
+
+    def _set_no_pressure_reclaim_stats(self, configured: float) -> None:
+        self.stats.configured_reclaim_limit_mb = float(configured)
+        self.stats.needed_pressure_mb = 0.0
+        self.stats.effective_reclaim_target_mb = 0.0
+        self.stats.target_limited_reason = "no_runtime_pressure"
+        self.stats.requested_total_reclaim_mb = 0.0
+        self.stats.effective_kvc_reclaim_mb = 0.0
+        self.stats.planned_kvc_reclaim_mb = 0.0
+        self.stats.planned_expert_reclaim_mb = 0.0
+        self.stats.policy_kvc_fraction = 0.0
+        self.stats.policy_expert_fraction = 0.0
+        self.stats.full_policy_semantics_supported = True
+        self.stats.policy_semantics_reason = ""
+        if self.config.mode == "kvc-expert" and not self._expert_plan_applied:
+            self._expert_install_state = "waiting_for_pressure"
+            self.stats.expert_install_state = self._expert_install_state
+
+    def _dynamic_runtime_pressure_mb(self, forward_batch: Any = None) -> float:
+        if not self.config.dynamic_pressure_from_kvc:
+            return max(0.0, float(self.config.reclaim_limit_mb))
+        configured = max(0.0, float(self.config.reclaim_limit_mb))
+        dynamic_needed = max(0.0, float(self._dynamic_needed_pressure_mb(forward_batch)))
+        return min(configured, dynamic_needed) if configured > 0.0 else dynamic_needed
+
+    def _no_pressure_fast_path_active(self, forward_batch: Any = None) -> bool:
+        if not self.config.dynamic_pressure_from_kvc:
+            return False
+        if self.config.mode not in ("kvc-only", "kvc-expert"):
+            return False
+        if self._current_forward_mode != "decode":
+            return False
+        if self._pending_kvc_reload_events or self._pending_kvc_evict_events:
+            return False
+        if self._pending_virtual_kvc_materialize:
+            return False
+        if self._pending_expert_copy_events or self._pending_expert_d2h_events:
+            return False
+        if self._expert_install_queue or self._expert_plan_applied:
+            return False
+        if self._has_offloaded_kvc_entries():
+            return False
+        if (
+            self.stats.physical_kvc_reclaim_mb > 1e-3
+            or self.stats.physical_expert_reclaim_mb > 1e-3
+        ):
+            return False
+
+        configured = max(0.0, float(self.config.reclaim_limit_mb))
+        needed = self._dynamic_runtime_pressure_mb(forward_batch)
+        if needed > 1e-3:
+            return False
+        self._set_no_pressure_reclaim_stats(configured)
+        return True
 
     def _refresh_physical_reclaim_peaks(
         self, *, record_step_sample: bool = False
@@ -4382,6 +4553,22 @@ class LayerKVRuntime:
 
     def _apply_expert_plan_once(self, forward_batch: Any) -> None:
         if self.config.mode != "kvc-expert":
+            return
+        if self.config.expert_collector_only:
+            self.stats.planned_expert_reclaim_mb = 0.0
+            self.stats.policy_expert_fraction = 0.0
+            return
+        if (
+            self.config.dynamic_pressure_from_kvc
+            and not self._expert_install_queue
+            and self._dynamic_runtime_pressure_mb(forward_batch) <= 1e-3
+        ):
+            self._set_no_pressure_reclaim_stats(
+                max(0.0, float(self.config.reclaim_limit_mb))
+            )
+            return
+        if self._no_pressure_fast_path_active(forward_batch):
+            self.stats.layerkv_no_pressure_expert_skip_count += 1
             return
         target_mb = self._effective_expert_reclaim_mb(forward_batch)
         expert_target_mb = target_mb
@@ -5667,11 +5854,13 @@ class LayerKVRuntime:
             or self._expert_install_queue
             or not self.physical_expert_supported
             or not self._expert_modules
-            or not self._has_decode_expert_hotness()
         ):
             return
         target_mb = self._effective_expert_reclaim_mb(forward_batch)
         if target_mb <= 0:
+            return
+        self._ensure_expert_hotness_cpu_view(mode="decode")
+        if not self._has_decode_expert_hotness():
             return
         self._expert_prepare_started = True
         with self._profile("profile_prepare_expert_backing_ms"):
@@ -5753,6 +5942,8 @@ class LayerKVRuntime:
         self, state: _LayerKVExpertLayerState, topk_output: Any
     ) -> bool:
         if not self._dynamic_expert_churn_policy_enabled():
+            return False
+        if int(state.slot_capacity) >= int(state.full_num_experts):
             return False
         topk_ids = getattr(topk_output, "topk_ids", None)
         if topk_ids is None or int(state.slot_capacity) <= 0:
@@ -5874,6 +6065,23 @@ class LayerKVRuntime:
         topk_ids = getattr(topk_output, "topk_ids", None)
         if topk_ids is None:
             return topk_output
+        if int(state.slot_capacity) >= int(state.full_num_experts):
+            if self._should_collect_expert_hotness_layer(int(state.layer_id)):
+                self._record_expert_hotness_for_layer(
+                    state.layer_id, state.full_num_experts, topk_ids
+                )
+            else:
+                self._expert_hotness_sample_skip_pending += 1
+            return topk_output
+        with self._profile("profile_expert_topk_rewrite_ms"):
+            return self._prepare_expert_layer_for_topk_remap(state, topk_output)
+
+    def _prepare_expert_layer_for_topk_remap(
+        self, state: _LayerKVExpertLayerState, topk_output: Any
+    ) -> Any:
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        if topk_ids is None:
+            return topk_output
         valid = (topk_ids >= 0) & (topk_ids < state.full_num_experts)
         safe_ids = topk_ids.clamp(min=0, max=state.full_num_experts - 1).long()
         remap = state.remap_tensor
@@ -5884,8 +6092,9 @@ class LayerKVRuntime:
             raise RuntimeError(reason)
         mapped_ids = remap[safe_ids]
         if self._optimized_profile_enabled() and self._expert_plan_applied:
-            # Avoid a CPU torch.unique synchronization for the common steady-state
-            # case where every routed expert is already in a GPU slot.
+            # Common pressure steady state: one or a few cold experts are
+            # offloaded, but this token routes only to resident experts. Avoid
+            # CPU unique/materialize work and only rewrite logical ids to slots.
             if not bool((valid & (mapped_ids < 0)).any().item()):
                 rewritten_ids = torch.where(
                     valid, mapped_ids.to(topk_ids.dtype), topk_ids
@@ -5902,7 +6111,7 @@ class LayerKVRuntime:
         if self._current_forward_mode == "decode":
             state.last_decode_logical_ids = logical_ids
             self._expert_prefetch_dirty_layers.add(int(state.layer_id))
-        rewritten_ids = torch.where(valid, remap[safe_ids].to(topk_ids.dtype), topk_ids)
+        rewritten_ids = torch.where(valid, mapped_ids.to(topk_ids.dtype), topk_ids)
         self.stats.expert_topk_rewrite_count += 1
         return topk_output._replace(topk_ids=rewritten_ids)
 
@@ -5915,11 +6124,228 @@ class LayerKVRuntime:
             topk_ids=topk_ids,
         )
 
-    def _record_expert_hotness_for_layer(
+    def _should_sample_expert_hotness(self, layer_id: int) -> bool:
+        if self._current_forward_mode != "decode":
+            return True
+        step = max(0, int(self._decode_step))
+        if step <= 4:
+            return True
+        if self._expert_hotness_sampled_layers_step == step:
+            sampled = self._expert_hotness_sampled_layers
+            return sampled is None or int(layer_id) in sampled
+        interval = self._effective_expert_hotness_sample_interval()
+        return ((step + int(layer_id)) % interval) == 0
+
+    def _effective_expert_hotness_sample_interval(self) -> int:
+        interval = max(1, int(self.config.expert_hotness_sample_interval))
+        if (
+            self.config.dynamic_pressure_from_kvc
+            and self._current_forward_mode == "decode"
+            and self._expert_plan_applied
+            and not self._expert_install_queue
+            and float(self.stats.effective_reclaim_target_mb) <= 1e-3
+            and float(self.stats.needed_pressure_mb) <= 1e-3
+            and int(self._decode_step) > 32
+        ):
+            return interval * 16
+        if self._defer_expert_hotness_snapshot() and int(self._decode_step) > 32:
+            return interval * 4
+        return interval
+
+    def _prepare_expert_hotness_sampling_for_step(self) -> None:
+        if self._current_forward_mode != "decode":
+            self._expert_hotness_sampled_layers = None
+            self._expert_hotness_sampled_layers_step = int(self._decode_step)
+            return
+        step = max(0, int(self._decode_step))
+        self._expert_hotness_sampled_layers_step = step
+        if step <= 4:
+            self._expert_hotness_sampled_layers = None
+            return
+        interval = self._effective_expert_hotness_sample_interval()
+        self._expert_hotness_sampled_layers = {
+            int(layer_id)
+            for layer_id, _module in self._expert_modules
+            if ((step + int(layer_id)) % interval) == 0
+        }
+
+    def _should_collect_expert_hotness_layer(self, layer_id: int) -> bool:
+        if self._current_forward_mode != "decode":
+            return True
+        if self._decode_step <= 0:
+            return True
+        return self._should_sample_expert_hotness(layer_id)
+
+    def _flush_expert_hotness_sample_skip_count(self) -> None:
+        pending = int(self._expert_hotness_sample_skip_pending)
+        if pending <= 0:
+            return
+        self.stats.expert_hotness_sample_skip_count += pending
+        self._expert_hotness_sample_skip_pending = 0
+
+    def _expert_hotness_gpu_counts(
+        self, mode: str, layer_id: int, full_num_experts: int, device: torch.device
+    ) -> torch.Tensor:
+        store = (
+            self._expert_hotness_decode
+            if mode == "decode"
+            else self._expert_hotness_prefill
+        )
+        store.setdefault(int(layer_id), {})
+        gpu_store = (
+            self._expert_hotness_gpu_decode
+            if mode == "decode"
+            else self._expert_hotness_gpu_prefill
+        )
+        buf = gpu_store.get(int(layer_id))
+        if (
+            buf is None
+            or int(buf.numel()) != int(full_num_experts)
+            or buf.device != device
+        ):
+            buf = torch.zeros(
+                (int(full_num_experts),), dtype=torch.int32, device=device
+            )
+            gpu_store[int(layer_id)] = buf
+        return buf
+
+    def _expert_hotness_ones(
+        self, device: torch.device, numel: int
+    ) -> torch.Tensor:
+        key = (str(device), int(numel))
+        cached = self._expert_hotness_ones_cache.get(key)
+        if cached is not None and cached.device == device and int(cached.numel()) == int(
+            numel
+        ):
+            self.stats.expert_hotness_ones_reuse_count += 1
+            return cached
+        ones = torch.ones((int(numel),), dtype=torch.int32, device=device)
+        self._expert_hotness_ones_cache[key] = ones
+        return ones
+
+    def _defer_expert_hotness_snapshot(self) -> bool:
+        return (
+            self.config.dynamic_pressure_from_kvc
+            and self._current_forward_mode == "decode"
+            and not self._expert_install_queue
+            and float(self.stats.effective_reclaim_target_mb) <= 1e-3
+            and float(self.stats.needed_pressure_mb) <= 1e-3
+        )
+
+    def _maybe_issue_expert_hotness_snapshot(
+        self, mode: str, layer_id: int, counts: torch.Tensor
+    ) -> None:
+        if counts.device.type != "cuda":
+            return
+        if self._defer_expert_hotness_snapshot():
+            self.stats.expert_hotness_snapshot_deferred_count += 1
+            return
+        key = (str(mode), int(layer_id))
+        if key in self._expert_hotness_pending_snapshot_keys:
+            return
+        step = max(0, int(self._decode_step))
+        last = int(self._expert_hotness_last_snapshot_step.get(key, -1))
+        interval = max(4, int(self.config.expert_hotness_sample_interval) * 4)
+        if step > 4 and last >= 0 and step - last < interval:
+            return
+        try:
+            cpu_counts = torch.empty_like(counts, device="cpu", pin_memory=True)
+        except Exception:
+            cpu_counts = torch.empty_like(counts, device="cpu")
+        cpu_counts.copy_(counts, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device=counts.device))
+        self._expert_hotness_pending_snapshots.append(
+            (str(mode), int(layer_id), cpu_counts, event)
+        )
+        self._expert_hotness_pending_snapshot_keys.add(key)
+        self._expert_hotness_last_snapshot_step[key] = step
+
+    def _finalize_expert_hotness_snapshots(self, *, block: bool = False) -> None:
+        if not self._expert_hotness_pending_snapshots:
+            return
+        t0 = time.perf_counter() if self.config.profile_detail else 0.0
+        remaining = []
+        for mode, layer_id, cpu_counts, event in self._expert_hotness_pending_snapshots:
+            key = (str(mode), int(layer_id))
+            try:
+                if block:
+                    event.synchronize()
+                elif not event.query():
+                    remaining.append((mode, layer_id, cpu_counts, event))
+                    continue
+                target = (
+                    self._expert_hotness_decode.setdefault(int(layer_id), {})
+                    if mode == "decode"
+                    else self._expert_hotness_prefill.setdefault(int(layer_id), {})
+                )
+                target.clear()
+                nonzero = torch.nonzero(cpu_counts, as_tuple=False).flatten()
+                if int(nonzero.numel()) > 0:
+                    expert_ids = nonzero.tolist()
+                    counts = cpu_counts[nonzero].tolist()
+                    for expert_id, count in zip(expert_ids, counts):
+                        target[int(expert_id)] = int(count)
+                    self.stats.expert_hotness_observed = True
+                    self._expert_hotness_version += 1
+                self.stats.expert_hotness_snapshot_count += 1
+            except Exception:
+                self.stats.expert_hotness_sync_fallback_count += 1
+            finally:
+                self._expert_hotness_pending_snapshot_keys.discard(key)
+        self._expert_hotness_pending_snapshots = remaining
+        if self.config.profile_detail:
+            self._add_profile(
+                "profile_expert_hotness_snapshot_ms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
+
+    def _materialize_expert_hotness_gpu_counts(
+        self, *, mode: Optional[str] = None
+    ) -> None:
+        stores: List[Tuple[str, Dict[int, torch.Tensor], Dict[int, Dict[int, int]]]] = []
+        if mode in (None, "prefill"):
+            stores.append(
+                ("prefill", self._expert_hotness_gpu_prefill, self._expert_hotness_prefill)
+            )
+        if mode in (None, "decode"):
+            stores.append(
+                ("decode", self._expert_hotness_gpu_decode, self._expert_hotness_decode)
+            )
+        if not any(gpu_store for _mode, gpu_store, _cpu_store in stores):
+            return
+        t0 = time.perf_counter() if self.config.profile_detail else 0.0
+        for _mode, gpu_store, cpu_store in stores:
+            for layer_id, counts in gpu_store.items():
+                try:
+                    cpu_counts = counts.detach().cpu()
+                    target = cpu_store.setdefault(int(layer_id), {})
+                    target.clear()
+                    nonzero = torch.nonzero(cpu_counts, as_tuple=False).flatten()
+                    if int(nonzero.numel()) > 0:
+                        expert_ids = nonzero.tolist()
+                        values = cpu_counts[nonzero].tolist()
+                        for expert_id, count in zip(expert_ids, values):
+                            target[int(expert_id)] = int(count)
+                        self.stats.expert_hotness_observed = True
+                    self.stats.expert_hotness_snapshot_forced_count += 1
+                    self.stats.expert_hotness_snapshot_count += 1
+                except Exception:
+                    self.stats.expert_hotness_sync_fallback_count += 1
+        self._expert_hotness_version += 1
+        if self.config.profile_detail:
+            self._add_profile(
+                "profile_expert_hotness_snapshot_ms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
+
+    def _ensure_expert_hotness_cpu_view(self, *, mode: Optional[str] = None) -> None:
+        self._finalize_expert_hotness_snapshots(block=True)
+        self._materialize_expert_hotness_gpu_counts(mode=mode)
+
+    def _record_expert_hotness_cpu(
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
     ) -> None:
-        if topk_ids.numel() == 0:
-            return
         ids = topk_ids.detach()
         ids = ids[(ids >= 0) & (ids < full_num_experts)]
         if ids.numel() == 0:
@@ -5944,6 +6370,51 @@ class LayerKVRuntime:
         else:
             self.stats.expert_prefill_call_count_total += total
         self.stats.expert_hotness_observed = True
+
+    def _record_expert_hotness_for_layer(
+        self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
+    ) -> None:
+        if topk_ids.numel() == 0:
+            return
+        if not self._should_sample_expert_hotness(layer_id):
+            self._expert_hotness_sample_skip_pending += 1
+            return
+        with self._profile("profile_expert_hotness_record_ms"):
+            ids = topk_ids.detach().reshape(-1)
+            if ids.numel() == 0:
+                return
+            mode = (
+                "decode" if self._current_forward_mode == "decode" else "prefill"
+            )
+            if ids.device.type == "cuda":
+                counts = self._expert_hotness_gpu_counts(
+                    mode, int(layer_id), int(full_num_experts), ids.device
+                )
+                if self._defer_expert_hotness_snapshot():
+                    safe_ids = ids.reshape(-1).long()
+                    ones = self._expert_hotness_ones(ids.device, int(safe_ids.numel()))
+                    counts.scatter_add_(0, safe_ids, ones)
+                    self.stats.expert_hotness_record_fast_count += 1
+                else:
+                    valid = (ids >= 0) & (ids < int(full_num_experts))
+                    safe_ids = ids.masked_fill(~valid, 0).long()
+                    counts.scatter_add_(0, safe_ids, valid.to(dtype=counts.dtype))
+                    self.stats.expert_hotness_record_safe_count += 1
+                approx_total = int(ids.numel())
+                self.stats.expert_call_count_total += approx_total
+                if mode == "decode":
+                    self.stats.expert_decode_call_count_total += approx_total
+                else:
+                    self.stats.expert_prefill_call_count_total += approx_total
+                self.stats.expert_hotness_record_count += 1
+                self.stats.expert_hotness_observed = True
+                self._maybe_issue_expert_hotness_snapshot(mode, int(layer_id), counts)
+            else:
+                self.stats.expert_hotness_sync_fallback_count += 1
+                self.stats.expert_hotness_record_count += 1
+                self._record_expert_hotness_cpu(
+                    int(layer_id), int(full_num_experts), ids
+                )
 
     def _refresh_expert_ready_before_use_ratio(self) -> None:
         total = self.stats.expert_ready_use_check_count
@@ -6061,31 +6532,12 @@ class LayerKVRuntime:
         ids = ids[(ids >= 0) & (ids < state.full_num_experts)]
         if ids.numel() == 0:
             return []
-        with self._profile("profile_expert_unique_ms"):
-            if record_hotness:
-                values, counts = torch.unique(ids.cpu(), return_counts=True)
-            else:
-                values = torch.unique(ids).detach().cpu()
-                counts = None
         if record_hotness:
-            total = 0
-            target = (
-                self._expert_hotness_decode.setdefault(state.layer_id, {})
-                if self._current_forward_mode == "decode"
-                else self._expert_hotness_prefill.setdefault(state.layer_id, {})
+            self._record_expert_hotness_for_layer(
+                state.layer_id, state.full_num_experts, topk_ids
             )
-            for expert_id, count in zip(values.tolist(), counts.tolist()):
-                expert_id = int(expert_id)
-                count = int(count)
-                target[expert_id] = target.get(expert_id, 0) + count
-                total += count
-            self.stats.expert_call_count_total += total
-            if self._current_forward_mode == "decode":
-                self.stats.expert_decode_call_count_total += total
-            else:
-                self.stats.expert_prefill_call_count_total += total
-            self.stats.expert_hotness_observed = True
-            return [int(x) for x in values.tolist()]
+        with self._profile("profile_expert_unique_ms"):
+            values = torch.unique(ids).detach().cpu()
         return [int(x) for x in values.tolist()]
 
     def _materialize_experts(
@@ -6472,9 +6924,14 @@ class LayerKVRuntime:
             return 0.0
         budget_tokens = int(total_tokens)
         pairs = (
-            self._batch_req_indices_and_lens(forward_batch)
+            list(self._current_forward_req_lens)
             if forward_batch is not None
-            else []
+            and self._current_forward_req_lens_batch_id == id(forward_batch)
+            else (
+                self._batch_req_indices_and_lens(forward_batch)
+                if forward_batch is not None
+                else []
+            )
         )
         batch_size = len(pairs)
         live_tokens = sum(max(0, int(seq_len)) for _req_idx, seq_len in pairs)
@@ -6603,8 +7060,34 @@ class LayerKVRuntime:
             # layer-specific mapping. Keep this cheap and explicit.
             self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
             return
+        try:
+            table = getattr(self._req_to_token_pool, "req_to_token", None)
+            if table is not None and int(override.data_ptr()) == int(table.data_ptr()):
+                metadata_key = (
+                    "canonical",
+                    int(table.data_ptr()),
+                    tuple(self._current_forward_req_lens),
+                    int(self._decode_step),
+                )
+            else:
+                metadata_key = (
+                    "layer",
+                    int(layer_id),
+                    int(override.data_ptr()),
+                    int(self._per_layer_req_to_token_versions.get(layer_id, 0)),
+                    tuple(self._current_forward_req_lens),
+                    int(self._decode_step),
+                )
+            if self._per_layer_kvc_current_metadata_key == metadata_key:
+                self.stats.kvc_metadata_dirty_guard_skip_count += 1
+                self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
+                return
+        except Exception:
+            metadata_key = None
         ok = self._rewrite_attention_metadata_for_layer(layer_id, override)
         if ok:
+            if metadata_key is not None:
+                self._per_layer_kvc_current_metadata_key = metadata_key
             self.stats.kvc_per_layer_metadata_rewrite_count += 1
         else:
             self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
@@ -7399,6 +7882,25 @@ class LayerKVRuntime:
         self.stats.kvc_per_layer_override_layer_count = len(
             self._per_layer_req_to_token_overrides
         )
+        self._mark_canonical_per_layer_metadata_current()
+
+    def _mark_canonical_per_layer_metadata_current(self) -> None:
+        if not self._uses_per_layer_attention_override():
+            return
+        if self._req_to_token_pool is None:
+            return
+        table = getattr(self._req_to_token_pool, "req_to_token", None)
+        if table is None:
+            return
+        try:
+            self._per_layer_kvc_current_metadata_key = (
+                "canonical",
+                int(table.data_ptr()),
+                tuple(self._current_forward_req_lens),
+                int(self._decode_step),
+            )
+        except Exception:
+            self._per_layer_kvc_current_metadata_key = None
 
     def _ensure_owned_per_layer_req_to_token(
         self, layer_id: int
@@ -7446,6 +7948,9 @@ class LayerKVRuntime:
         req_tensor = torch.tensor(req_indices, dtype=torch.int64, device=device)
         pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
         table[req_tensor, pos_tensor] = new_locs.to(device=device, dtype=table.dtype)
+        self._per_layer_req_to_token_versions[int(layer_id)] = (
+            int(self._per_layer_req_to_token_versions.get(int(layer_id), 0)) + 1
+        )
         self.stats.kvc_per_layer_slot_override_count += 1
         self.stats.kvc_per_layer_slot_override_token_count += int(new_locs.numel())
         return True
@@ -7578,22 +8083,54 @@ class LayerKVRuntime:
                 self.stats.kvc_ready_before_use_count / float(total)
             )
 
-    def _track_per_layer_offloaded_key(self, key: Tuple[int, int, int]) -> None:
+    def _track_per_layer_offloaded_key(
+        self, key: Tuple[int, int, int], token_count: Optional[int] = None
+    ) -> None:
         layer_id, req_idx, pos = (int(key[0]), int(key[1]), int(key[2]))
         norm_key = (layer_id, req_idx, pos)
+        if norm_key in self._per_layer_offloaded_keys:
+            return
         self._per_layer_offloaded_keys.add(norm_key)
         self._per_layer_offloaded_keys_by_req.setdefault(req_idx, set()).add(norm_key)
+        tokens = token_count
+        if tokens is None:
+            entry = self._per_layer_residency.get(norm_key)
+            tokens = int(entry.token_count) if entry is not None else 0
+        self._per_layer_offloaded_token_count_by_layer[layer_id] = max(
+            0,
+            int(self._per_layer_offloaded_token_count_by_layer.get(layer_id, 0))
+            + int(tokens or 0),
+        )
+        self._per_layer_offloaded_version += 1
+        self._per_layer_offloaded_dirty_reqs.add(req_idx)
+        self._per_layer_offloaded_sorted_by_req.pop(req_idx, None)
 
-    def _untrack_per_layer_offloaded_key(self, key: Tuple[int, int, int]) -> None:
+    def _untrack_per_layer_offloaded_key(
+        self, key: Tuple[int, int, int], token_count: Optional[int] = None
+    ) -> None:
         layer_id, req_idx, pos = (int(key[0]), int(key[1]), int(key[2]))
         norm_key = (layer_id, req_idx, pos)
+        if norm_key not in self._per_layer_offloaded_keys:
+            return
         self._per_layer_offloaded_keys.discard(norm_key)
         by_req = self._per_layer_offloaded_keys_by_req.get(req_idx)
-        if by_req is None:
-            return
-        by_req.discard(norm_key)
-        if not by_req:
-            self._per_layer_offloaded_keys_by_req.pop(req_idx, None)
+        if by_req is not None:
+            by_req.discard(norm_key)
+            if not by_req:
+                self._per_layer_offloaded_keys_by_req.pop(req_idx, None)
+        tokens = token_count
+        if tokens is None:
+            entry = self._per_layer_residency.get(norm_key)
+            tokens = int(entry.token_count) if entry is not None else 0
+        current = int(self._per_layer_offloaded_token_count_by_layer.get(layer_id, 0))
+        next_count = max(0, current - int(tokens or 0))
+        if next_count:
+            self._per_layer_offloaded_token_count_by_layer[layer_id] = next_count
+        else:
+            self._per_layer_offloaded_token_count_by_layer.pop(layer_id, None)
+        self._per_layer_offloaded_version += 1
+        self._per_layer_offloaded_dirty_reqs.add(req_idx)
+        self._per_layer_offloaded_sorted_by_req.pop(req_idx, None)
 
     def _record_kvc_layer_cost_observations(
         self, entries: List[_LayerKVResidencyEntry], elapsed_ms: float, *, kind: str
@@ -7681,7 +8218,8 @@ class LayerKVRuntime:
                 entry.state = "resident"
                 if self.config.kvc_backend == "per-layer-arena":
                     self._untrack_per_layer_offloaded_key(
-                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
+                        token_count=int(entry.token_count),
                     )
                 entry.ready_start_event = None
                 entry.ready_event = None
@@ -7789,26 +8327,47 @@ class LayerKVRuntime:
         self._virtual_materialize_plans_by_layer.clear()
         self._virtual_kvc_demands.clear()
         self._kvc_demand_signature_eval_step = None
+        self._per_layer_kvc_current_metadata_key = None
         self._refresh_per_layer_kvc_overrides()
         with self._profile("profile_workload_stats_ms"):
             self._refresh_workload_stats(forward_batch)
-        with self._profile("profile_finalize_expert_ms"):
-            self._finalize_expert_d2h_events(block=False)
-            self._finalize_expert_materialize_events(block=False)
-        with self._profile("profile_finalize_kvc_ms"):
-            self._finalize_kvc_evictions(block=False)
-            self._finalize_reloaded_entries(block=False)
-            self._finalize_virtual_materialize_events(block=False)
+        self._mark_canonical_per_layer_metadata_current()
+        if (
+            self._expert_hotness_pending_snapshots
+            or self._pending_expert_d2h_events
+            or self._pending_expert_copy_events
+        ):
+            with self._profile("profile_finalize_expert_ms"):
+                self._finalize_expert_hotness_snapshots(block=False)
+                self._finalize_expert_d2h_events(block=False)
+                self._finalize_expert_materialize_events(block=False)
+        if (
+            self._pending_kvc_evict_events
+            or self._pending_kvc_reload_events
+            or self._pending_virtual_kvc_materialize
+        ):
+            with self._profile("profile_finalize_kvc_ms"):
+                self._finalize_kvc_evictions(block=False)
+                self._finalize_reloaded_entries(block=False)
+                self._finalize_virtual_materialize_events(block=False)
         if mode == "decode":
-            with self._profile("profile_apply_expert_plan_ms"):
-                self._apply_expert_plan_once(forward_batch)
-            self._advance_expert_install_budgeted()
-            if self._expert_plan_applied and not self._expert_install_queue:
-                self._check_current_coresid_plan_match(context="post_install")
+            fast_path = self._no_pressure_fast_path_active(forward_batch)
+            if fast_path:
+                self.stats.layerkv_no_pressure_expert_skip_count += 1
+            else:
+                with self._profile("profile_apply_expert_plan_ms"):
+                    self._apply_expert_plan_once(forward_batch)
+                self._advance_expert_install_budgeted()
+                if self._expert_plan_applied and not self._expert_install_queue:
+                    self._check_current_coresid_plan_match(context="post_install")
             self.stats.forward_decode_count += 1
             self._decode_step += 1
             self.stats.decode_steps = self._decode_step
-            self._run_deadline_scheduler(forward_batch)
+            self._prepare_expert_hotness_sampling_for_step()
+            if fast_path:
+                self.stats.layerkv_no_pressure_scheduler_skip_count += 1
+            else:
+                self._run_deadline_scheduler(forward_batch)
         else:
             self.stats.forward_extend_count += 1
             self._drop_entries_for_reqs(forward_batch)
@@ -7818,6 +8377,9 @@ class LayerKVRuntime:
         self._add_profile("profile_forward_begin_ms", elapsed_ms)
 
     def _run_deadline_scheduler(self, forward_batch: Any) -> None:
+        if self._no_pressure_fast_path_active(forward_batch):
+            self.stats.layerkv_no_pressure_scheduler_skip_count += 1
+            return
         if self._simple_profile_enabled():
             with self._profile("profile_kvc_reload_required_ms"):
                 self._reload_required_kvc(forward_batch)
@@ -7828,9 +8390,17 @@ class LayerKVRuntime:
         ):
             self.stats.virtual_kvc_scheduler_skip_count += 1
             return
-        with self._profile("profile_expert_prefetch_ms"):
-            tasks = self._build_recovery_tasks(forward_batch)
-            self._schedule_recovery_tasks(tasks)
+        build_t0 = time.perf_counter()
+        tasks = self._build_recovery_tasks(
+            forward_batch, max_kvc_tasks=self._kvc_recovery_task_build_limit()
+        )
+        build_ms = (time.perf_counter() - build_t0) * 1000.0
+        self._add_profile("profile_recovery_task_build_ms", build_ms)
+        schedule_t0 = time.perf_counter()
+        self._schedule_recovery_tasks(tasks)
+        schedule_ms = (time.perf_counter() - schedule_t0) * 1000.0
+        self._add_profile("profile_recovery_task_schedule_ms", schedule_ms)
+        self._add_profile("profile_expert_prefetch_ms", build_ms + schedule_ms)
         total = self.stats.scheduler_ready_use_check_count
         if total <= 0:
             self.stats.scheduler_ready_before_use_ratio = 1.0
@@ -7838,6 +8408,21 @@ class LayerKVRuntime:
             self.stats.scheduler_ready_before_use_ratio = (
                 self.stats.scheduler_ready_before_use_count / float(total)
             )
+
+    def _kvc_recovery_task_build_limit(self) -> Optional[int]:
+        if not (
+            self._optimized_profile_enabled()
+            and self.config.kvc_backend == "per-layer-arena"
+        ):
+            return None
+        hard_cap = 4
+        pending = sum(
+            1
+            for pending_reload in self._pending_kvc_reload_events
+            if not getattr(pending_reload, "waited_on_main_stream", False)
+        )
+        available = max(1, hard_cap - pending)
+        return max(1, min(hard_cap, available + 1))
 
     def try_reclaim_kvc_before_retract(
         self,
@@ -7998,7 +8583,7 @@ class LayerKVRuntime:
         return tasks[0] if tasks else None
 
     def _build_kvc_recovery_tasks(
-        self, forward_batch: Any
+        self, forward_batch: Any, max_tasks: Optional[int] = None
     ) -> List[_LayerKVRecoveryTask]:
         if self.config.mode not in ("kvc-only", "kvc-expert"):
             return []
@@ -8036,9 +8621,7 @@ class LayerKVRuntime:
             if not tasks:
                 self.stats.virtual_kvc_scheduler_skip_count += 1
             return tasks
-        effective_kvc_reclaim_mb = self._effective_kvc_reclaim_mb(forward_batch)
-        if effective_kvc_reclaim_mb <= 0:
-            self._refresh_kvc_residency_stats()
+        if not self._has_offloaded_kvc_entries():
             return []
         if not self.physical_kvc_supported:
             self.stats.comparable = False
@@ -8050,12 +8633,39 @@ class LayerKVRuntime:
         with self._profile("profile_kvc_select_required_ms"):
             selected = self._select_required_offloaded_entries(forward_batch)
         if not selected:
-            self._refresh_kvc_residency_stats()
             return []
         if self.config.kvc_backend == "per-layer-arena":
             by_layer: Dict[int, List[_LayerKVResidencyEntry]] = {}
+            skipped_layers: Set[int] = set()
+            max_layer_tasks = (
+                max(1, int(max_tasks)) if max_tasks is not None else None
+            )
             for entry in selected:
-                by_layer.setdefault(int(entry.layer_id), []).append(entry)
+                layer_id = int(entry.layer_id)
+                if (
+                    max_layer_tasks is not None
+                    and layer_id not in by_layer
+                    and len(by_layer) >= max_layer_tasks
+                ):
+                    skipped_layers.add(layer_id)
+                    continue
+                by_layer.setdefault(layer_id, []).append(entry)
+            if skipped_layers:
+                self.stats.scheduler_kvc_deferred_count += len(skipped_layers)
+            if (
+                self._optimized_profile_enabled()
+                and self.config.kvc_backend == "per-layer-arena"
+            ):
+                merged: List[_LayerKVResidencyEntry] = []
+                for _layer_id, entries in sorted(by_layer.items()):
+                    merged.extend(entries)
+                if merged:
+                    self.stats.kvc_task_coalesced_count += max(
+                        0, len(by_layer) - 1
+                    )
+                    first_layer = min(int(entry.layer_id) for entry in merged)
+                    return [self._make_kvc_recovery_task(first_layer, merged)]
+                return []
             return [
                 self._make_kvc_recovery_task(int(layer_id), entries)
                 for layer_id, entries in sorted(by_layer.items())
@@ -8094,10 +8704,22 @@ class LayerKVRuntime:
             if self.config.kvc_backend == "per-layer-arena"
             else self._bytes_per_token_all_layers
         )
+        task_bytes = int(token_count * max(1, bytes_per_token))
+        if len(selected) > 1:
+            self.stats.kvc_task_coalesced_count += 1
+        self.stats.kvc_task_token_sum += int(token_count)
+        self.stats.kvc_task_byte_sum += int(task_bytes)
+        task_count = max(1, int(self.stats.scheduler_kvc_task_count) + 1)
+        self.stats.kvc_avg_task_tokens = self.stats.kvc_task_token_sum / float(
+            task_count
+        )
+        self.stats.kvc_avg_task_bytes = self.stats.kvc_task_byte_sum / float(
+            task_count
+        )
         return _LayerKVRecoveryTask(
             kind="kvc",
             layer_id=int(demand_layer),
-            bytes=int(token_count * bytes_per_token),
+            bytes=task_bytes,
             deadline_layer=max(0, int(demand_layer)),
             demand_signature=demand_signature,
             kvc_demand=kvc_demand,
@@ -8122,9 +8744,13 @@ class LayerKVRuntime:
             f"|last{int(last.req_idx)}:{int(last.pos)}:{int(last.layer_id)}"
         )
 
-    def _build_recovery_tasks(self, forward_batch: Any) -> List[_LayerKVRecoveryTask]:
+    def _build_recovery_tasks(
+        self, forward_batch: Any, max_kvc_tasks: Optional[int] = None
+    ) -> List[_LayerKVRecoveryTask]:
         tasks: List[_LayerKVRecoveryTask] = []
-        tasks.extend(self._build_kvc_recovery_tasks(forward_batch))
+        tasks.extend(
+            self._build_kvc_recovery_tasks(forward_batch, max_tasks=max_kvc_tasks)
+        )
         if not self._expert_plan_applied or not self._expert_layers:
             return tasks
         if (
@@ -8141,6 +8767,7 @@ class LayerKVRuntime:
         else:
             expert_items = sorted(self._expert_layers.items())
         next_dirty_layers: Set[int] = set()
+        expert_scan_t0 = time.perf_counter()
         for layer_id, state in expert_items:
             if state.prefetched_logical_ids:
                 stale = [
@@ -8153,6 +8780,15 @@ class LayerKVRuntime:
                     state.prefetched_logical_ids.difference_update(stale)
             if not state.last_decode_logical_ids:
                 self.stats.expert_prefetch_hit_count += 0
+                continue
+            if (
+                self._coresid_optimized_policy_enabled()
+                and state.resident_count >= state.full_num_experts
+                and not state.prefetched_logical_ids
+            ):
+                self.stats.expert_prefetch_hit_count += len(
+                    state.last_decode_logical_ids
+                )
                 continue
             missing = [
                 int(expert_id)
@@ -8214,6 +8850,10 @@ class LayerKVRuntime:
             )
         if self._coresid_optimized_policy_enabled():
             self._expert_prefetch_dirty_layers = next_dirty_layers
+        self._add_profile(
+            "profile_expert_prefetch_scan_ms",
+            (time.perf_counter() - expert_scan_t0) * 1000.0,
+        )
         return tasks
 
     def _schedule_recovery_tasks(self, tasks: List[_LayerKVRecoveryTask]) -> None:
@@ -8383,7 +9023,11 @@ class LayerKVRuntime:
         return int(budget)
 
     def _recovery_task_ready_rank(self, task: _LayerKVRecoveryTask) -> int:
-        if task.kind == "kvc" and task.kvc_demand is not None:
+        if (
+            task.kind == "kvc"
+            and self.config.kvc_backend == "virtual-arena"
+            and task.kvc_demand is not None
+        ):
             if (
                 self._lookup_virtual_scratch_cache(task.kvc_demand, record_stats=False)
                 is not None
@@ -8445,7 +9089,14 @@ class LayerKVRuntime:
         return 0.0
 
     def _refresh_workload_stats(self, forward_batch: Any) -> None:
-        pairs = self._batch_req_indices_and_lens(forward_batch)
+        pairs = (
+            list(self._last_scheduled_req_lens)
+            if self._current_forward_mode == "decode"
+            and self._last_scheduled_req_lens
+            else self._batch_req_indices_and_lens(forward_batch)
+        )
+        self._current_forward_req_lens_batch_id = id(forward_batch)
+        self._current_forward_req_lens = list(pairs)
         self.stats.observed_batch_size = len(pairs)
         if pairs:
             self.stats.avg_prefix_len = sum(
@@ -8465,11 +9116,17 @@ class LayerKVRuntime:
         if self.config.kvc_backend == "virtual-arena":
             self._refresh_kvc_residency_stats()
             return
-        if selected_entries is None:
-            effective_kvc_reclaim_mb = self._effective_kvc_reclaim_mb(forward_batch)
-            if effective_kvc_reclaim_mb <= 0:
-                self._refresh_kvc_residency_stats()
+        selected: Optional[List[_LayerKVResidencyEntry]] = None
+        if selected_entries is not None:
+            selected = [
+                entry
+                for entry in selected_entries
+                if entry.state == "offloaded" and entry.host_slot_list()
+            ]
+            if not selected:
                 return
+        elif not self._has_offloaded_kvc_entries():
+            return
         if not self.physical_kvc_supported:
             self.stats.comparable = False
             self.stats.comparability_reason = self.unsupported_reason
@@ -8481,14 +9138,7 @@ class LayerKVRuntime:
             self._prune_entries_for_active_lengths(forward_batch)
             with self._profile("profile_kvc_select_required_ms"):
                 selected = self._select_required_offloaded_entries(forward_batch)
-        else:
-            selected = [
-                entry
-                for entry in selected_entries
-                if entry.state == "offloaded" and entry.host_slot_list()
-            ]
         if not selected:
-            self._refresh_kvc_residency_stats()
             return
 
         token_count = sum(entry.token_count for entry in selected)
@@ -8564,7 +9214,8 @@ class LayerKVRuntime:
                     entry.state = "reloading"
                     if self.config.kvc_backend == "per-layer-arena":
                         self._untrack_per_layer_offloaded_key(
-                            (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                            (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
+                            token_count=int(entry.token_count),
                         )
                         self._per_layer_offloaded_token_count_fast = max(
                             0,
@@ -8578,7 +9229,8 @@ class LayerKVRuntime:
                     entry.state = "resident"
                     if self.config.kvc_backend == "per-layer-arena":
                         self._untrack_per_layer_offloaded_key(
-                            (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                            (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
+                            token_count=int(entry.token_count),
                         )
                         self._per_layer_offloaded_token_count_fast = max(
                             0,
@@ -8647,16 +9299,36 @@ class LayerKVRuntime:
             return
         if force_additional_tokens is None:
             effective_kvc_reclaim_mb = self._effective_kvc_reclaim_mb(forward_batch)
+            if self.config.dynamic_pressure_from_kvc:
+                runtime_pressure_mb = max(
+                    0.0,
+                    float(
+                        self.stats.needed_pressure_mb
+                        or self._dynamic_runtime_pressure_mb(forward_batch)
+                    ),
+                )
+                if runtime_pressure_mb <= 1e-3:
+                    self.stats.dynamic_pressure_skip_steps += 1
+                    self.stats.kvc_topup_skip_count += 1
+                    return
+                self.stats.dynamic_pressure_active_steps += 1
+                self.stats.kvc_topup_pressure_mb = runtime_pressure_mb
             if effective_kvc_reclaim_mb <= 0:
-                self._refresh_kvc_residency_stats()
                 return
         else:
             force_additional_tokens = self._align_tokens_up(
                 max(0, int(force_additional_tokens))
             )
             if force_additional_tokens <= 0:
-                self._refresh_kvc_residency_stats()
                 return
+            if self.config.dynamic_pressure_from_kvc:
+                runtime_pressure_mb = self._dynamic_runtime_pressure_mb(forward_batch)
+                if (
+                    runtime_pressure_mb <= 1e-3
+                    and force_reason != "pre_retract_decode_mem"
+                ):
+                    self.stats.kvc_evict_without_pressure_count += 1
+                    return
             bytes_per_token = (
                 self._bytes_per_kvc_token_per_layer()
                 if self.config.kvc_backend == "per-layer-arena"
@@ -8720,12 +9392,26 @@ class LayerKVRuntime:
             if self.config.kvc_backend == "virtual-arena"
             else 0
         )
+        if self.config.dynamic_pressure_from_kvc and force_additional_tokens is None:
+            offloaded_or_pending = self._offloaded_token_count() + pending_evict_tokens
+            margin_tokens = self._dynamic_pressure_hysteresis_tokens()
+            lower_bound = (
+                int(target_tokens)
+                if int(target_tokens) <= int(margin_tokens)
+                else max(0, int(target_tokens) - int(margin_tokens))
+            )
+            if offloaded_or_pending > 0 and offloaded_or_pending >= lower_bound:
+                self.stats.kvc_topup_skip_count += 1
+                self.stats.kvc_eviction_skipped_count += 1
+                return
+            if margin_tokens > 0:
+                target_tokens = int(target_tokens) + int(margin_tokens)
+            self.stats.kvc_topup_apply_count += 1
         need_tokens = max(
             0, target_tokens - self._offloaded_token_count() - pending_evict_tokens
         )
         if need_tokens <= 0:
             self.stats.kvc_eviction_skipped_count += 1
-            self._refresh_kvc_residency_stats()
             return
 
         with self._profile("profile_kvc_select_evict_ms"):
@@ -8734,7 +9420,6 @@ class LayerKVRuntime:
             )
         if not selected:
             self.stats.kvc_eviction_skipped_count += 1
-            self._refresh_kvc_residency_stats()
             return
 
         token_count = sum(entry.token_count for entry in selected)
@@ -8854,7 +9539,8 @@ class LayerKVRuntime:
                     self.stats.virtual_kvc_evict_count += int(entry.token_count)
                 if self.config.kvc_backend == "per-layer-arena":
                     self._track_per_layer_offloaded_key(
-                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
+                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
+                        token_count=int(entry.token_count),
                     )
                     self._per_layer_offloaded_token_count_fast += int(entry.token_count)
                 entry.host_slots = [int(x) for x in page_host_slots]
@@ -8909,6 +9595,30 @@ class LayerKVRuntime:
         raw_tokens = max(1, target_bytes // bytes_per_token)
         return max(self._page_size, self._align_tokens_up(raw_tokens))
 
+    def _dynamic_pressure_hysteresis_tokens(self) -> int:
+        bytes_per_token = (
+            self._bytes_per_kvc_token_per_layer()
+            if self.config.kvc_backend == "per-layer-arena"
+            else self._bytes_per_token_all_layers
+        )
+        if bytes_per_token <= 0:
+            return 0
+        block_tokens = (
+            self._per_layer_kvc_block_page_size()
+            if self.config.kvc_backend == "per-layer-arena"
+            else max(
+                self._page_size,
+                self._align_tokens_up(int(self.config.kvc_block_tokens or 0)),
+            )
+        )
+        four_mb_tokens = int((4.0 * 1024.0 * 1024.0) // float(bytes_per_token))
+        margin_tokens = max(int(block_tokens) * 4, four_mb_tokens)
+        margin_tokens = self._align_tokens_up(margin_tokens)
+        self.stats.kvc_topup_margin_mb = (
+            margin_tokens * bytes_per_token / float(1024 * 1024)
+        )
+        return max(0, int(margin_tokens))
+
     def _offloaded_token_count(self) -> int:
         if self.config.kvc_backend == "per-layer-arena":
             if self._coresid_optimized_policy_enabled():
@@ -8922,6 +9632,19 @@ class LayerKVRuntime:
             entry.token_count
             for entry in self._residency.values()
             if entry.state == "offloaded"
+        )
+
+    def _has_offloaded_kvc_entries(self) -> bool:
+        if self.config.kvc_backend == "per-layer-arena":
+            if self._per_layer_offloaded_keys_by_req:
+                return True
+            return any(
+                entry.state == "offloaded" and bool(entry.host_slot_list())
+                for entry in self._per_layer_residency.values()
+            )
+        return any(
+            entry.state == "offloaded" and bool(entry.host_slot_list())
+            for entry in self._residency.values()
         )
 
     def _pending_evict_token_count(self) -> int:
@@ -9385,16 +10108,33 @@ class LayerKVRuntime:
             if not keys:
                 continue
             self.stats.kvc_layerwise_required_index_hit_count += 1
-            for key in list(keys):
+            cached = self._per_layer_offloaded_sorted_by_req.get(int(req_idx))
+            if (
+                cached is not None
+                and int(cached[0]) == int(self._per_layer_offloaded_version)
+                and int(req_idx) not in self._per_layer_offloaded_dirty_reqs
+            ):
+                sorted_keys = cached[1]
+                self.stats.kvc_required_cache_hit += 1
+            else:
+                sorted_keys = tuple(sorted(keys, key=lambda x: (int(x[2]), int(x[0]))))
+                self._per_layer_offloaded_sorted_by_req[int(req_idx)] = (
+                    int(self._per_layer_offloaded_version),
+                    sorted_keys,
+                )
+                self._per_layer_offloaded_dirty_reqs.discard(int(req_idx))
+                self.stats.kvc_required_cache_miss += 1
+            for key in sorted_keys:
                 scanned += 1
                 entry = self._per_layer_residency.get(key)
                 if entry is None or entry.state != "offloaded":
                     stale.append(key)
                     continue
                 if entry.pos + entry.token_count > required_prefix_len:
-                    continue
+                    break
                 selected.append(entry)
         self.stats.kvc_layerwise_required_index_scan_count += scanned
+        self.stats.kvc_required_scanned_keys += scanned
         for key in stale:
             self._untrack_per_layer_offloaded_key(key)
         self.stats.kvc_layerwise_required_index_stale_count += len(stale)
@@ -9593,10 +10333,8 @@ class LayerKVRuntime:
         selected_layers: Set[int] = set()
         for layer_id, target_tokens in sorted(plan.items()):
             layer_id = int(layer_id)
-            current = sum(
-                entry.token_count
-                for key, entry in self._per_layer_residency.items()
-                if key[0] == layer_id and entry.state == "offloaded"
+            current = int(
+                self._per_layer_offloaded_token_count_by_layer.get(layer_id, 0)
             )
             need_tokens = self._align_tokens_down(max(0, int(target_tokens) - current))
             if need_tokens <= 0:
@@ -9622,6 +10360,7 @@ class LayerKVRuntime:
                 pair_meta.append((req_idx, evictable_len, cursor))
             if not pair_meta:
                 continue
+            self.stats.kvc_evict_selector_fast_hit += 1
             round_offsets = {req_idx: 0 for req_idx, _seq_len, _cursor in pair_meta}
             while remaining >= block_size:
                 progressed = False
@@ -9633,6 +10372,7 @@ class LayerKVRuntime:
                         continue
                     key = (layer_id, req_idx, pos)
                     existing = self._per_layer_residency.get(key)
+                    self.stats.kvc_evict_selector_scanned_entries += 1
                     if existing is not None and existing.state in (
                         "offloaded",
                         "reloading",
@@ -9718,6 +10458,7 @@ class LayerKVRuntime:
         selected.sort(key=lambda x: (x.layer_id, x.pos, x.req_idx))
         selected_tokens = sum(entry.token_count for entry in selected)
         self.stats.kvc_evict_candidate_selected_tokens += selected_tokens
+        self.stats.kvc_evict_selector_selected_entries += len(selected)
         self.stats.kvc_layerwise_evict_selected_layer_count += len(selected_layers)
         self.stats.kvc_layerwise_evict_selected_token_count += selected_tokens
         return selected
@@ -9825,21 +10566,55 @@ class LayerKVRuntime:
             self._virtual_materialize_plans_by_layer.clear()
             self._virtual_kvc_demands.clear()
             self._kvc_demand_signature_eval_step = None
-            with self._profile("profile_finalize_expert_ms"):
-                self._finalize_expert_d2h_events(block=False)
-                self._finalize_expert_materialize_events(block=False)
-            self._maybe_prepare_expert_plan_after_decode(forward_batch)
-            with self._profile("profile_finalize_kvc_ms"):
-                self._finalize_kvc_evictions(block=False)
-                self._finalize_reloaded_entries(block=True)
-                self._finalize_virtual_materialize_events(block=True)
-            with self._profile("profile_kvc_evict_to_target_ms"):
-                self._evict_kvc_to_target(forward_batch)
-            self._refresh_physical_reclaim_peaks(record_step_sample=True)
-            self._refresh_resident_group_stats()
+            if (
+                self._expert_hotness_pending_snapshots
+                or self._pending_expert_d2h_events
+                or self._pending_expert_copy_events
+            ):
+                with self._profile("profile_finalize_expert_ms"):
+                    self._finalize_expert_hotness_snapshots(block=False)
+                    self._finalize_expert_d2h_events(block=False)
+                    self._finalize_expert_materialize_events(block=False)
+            fast_path = self._no_pressure_fast_path_active(forward_batch)
+            if fast_path:
+                self.stats.layerkv_no_pressure_fastpath_count += 1
+            else:
+                self._maybe_prepare_expert_plan_after_decode(forward_batch)
+            if (
+                self._pending_kvc_evict_events
+                or self._pending_kvc_reload_events
+                or self._pending_virtual_kvc_materialize
+            ):
+                with self._profile("profile_finalize_kvc_ms"):
+                    self._finalize_kvc_evictions(block=False)
+                    self._finalize_reloaded_entries(block=True)
+                    self._finalize_virtual_materialize_events(block=True)
+            if not fast_path:
+                fast_path = self._no_pressure_fast_path_active(forward_batch)
+            if fast_path:
+                self.stats.layerkv_no_pressure_kvc_skip_count += 1
+                self._refresh_physical_reclaim_peaks()
+            elif (
+                self.config.dynamic_pressure_from_kvc
+                and self._dynamic_runtime_pressure_mb(forward_batch) <= 1e-3
+            ):
+                self.stats.dynamic_pressure_skip_steps += 1
+                self.stats.kvc_topup_skip_count += 1
+                self.stats.kvc_eviction_skipped_count += 1
+                self._set_no_pressure_reclaim_stats(
+                    max(0.0, float(self.config.reclaim_limit_mb))
+                )
+                self._refresh_physical_reclaim_peaks(record_step_sample=True)
+                self._refresh_resident_group_stats()
+            else:
+                with self._profile("profile_kvc_evict_to_target_ms"):
+                    self._evict_kvc_to_target(forward_batch)
+                self._refresh_physical_reclaim_peaks(record_step_sample=True)
+                self._refresh_resident_group_stats()
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self.stats.layerkv_python_overhead_ms += elapsed_ms
             self._add_profile("profile_forward_end_ms", elapsed_ms)
+            self._flush_expert_hotness_sample_skip_count()
         elif mode == "extend":
             t0 = time.perf_counter()
             self._maybe_prepare_expert_plan_during_extend(forward_batch)
@@ -9867,6 +10642,7 @@ class LayerKVRuntime:
         self, *, include_planner_inputs: bool = True, validate: bool = True
     ) -> Dict[str, Any]:
         t0 = time.perf_counter() if self.config.debug_stats else 0.0
+        self._flush_expert_hotness_sample_skip_count()
         if (
             self.stats.configured_reclaim_limit_mb <= 0.0
             and self.config.reclaim_limit_mb > 0.0

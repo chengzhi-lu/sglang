@@ -182,6 +182,8 @@ def _server_cmd(
 
 
 def _decode_layerkv_flags(args: argparse.Namespace) -> List[str]:
+    if bool(getattr(args, "disable_layerkv", False)):
+        return []
     reclaim_limit_mb = (
         None
         if bool(getattr(args, "no_layerkv_reclaim_limit_mb", False))
@@ -200,6 +202,9 @@ def _decode_layerkv_flags(args: argparse.Namespace) -> List[str]:
         profile_detail=True,
         expert_backing_cache_mb=args.expert_backing_cache_mb,
         expert_cpu_backing_mode=args.expert_cpu_backing_mode,
+        expert_forward_hooks=args.layerkv_expert_forward_hooks,
+        expert_collector_only=args.layerkv_expert_collector_only,
+        expert_hotness_sample_interval=args.layerkv_expert_hotness_sample_interval,
         expert_install_layers_per_step=args.expert_install_layers_per_step,
         expert_install_budget_mb=args.expert_install_budget_mb,
         expert_install_target_steps=args.expert_install_target_steps,
@@ -520,14 +525,19 @@ def _summarize(
         reasons.append(f"failed_requests={failed_count}")
     if transfer_errors:
         reasons.append(f"transfer_errors={transfer_errors}")
-    if not stats:
+    layerkv_disabled = bool(getattr(args, "disable_layerkv", False))
+    if not layerkv_disabled and not stats:
         reasons.append("missing_layerkv_stats")
     if stats and str(stats.get("resident_group_state_error_count", 0)) not in (
         "0",
         "0.0",
     ):
         reasons.append("resident_group_state_error")
-    if stats and str(stats.get("layerkv_policy", "")) != str(args.layerkv_policy):
+    if (
+        not layerkv_disabled
+        and stats
+        and str(stats.get("layerkv_policy", "")) != str(args.layerkv_policy)
+    ):
         reasons.append(f"unexpected_layerkv_policy={stats.get('layerkv_policy')}")
 
     env_summary = {}
@@ -778,6 +788,7 @@ def main() -> int:
     parser.add_argument(
         "--layerkv-reclaim-limit-mb", type=float, default=FIG4_RECLAIM_LIMIT_MB
     )
+    parser.add_argument("--disable-layerkv", action="store_true")
     parser.add_argument("--no-layerkv-reclaim-limit-mb", action="store_true")
     parser.add_argument("--layerkv-mode", default="kvc-expert")
     parser.add_argument("--layerkv-policy", default="coresid")
@@ -793,6 +804,13 @@ def main() -> int:
     )
     parser.add_argument("--expert-backing-cache-mb", type=float, default=0.0)
     parser.add_argument("--expert-cpu-backing-mode", default="none")
+    parser.add_argument(
+        "--layerkv-expert-forward-hooks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--layerkv-expert-collector-only", action="store_true")
+    parser.add_argument("--layerkv-expert-hotness-sample-interval", type=int, default=16)
     parser.add_argument("--expert-install-layers-per-step", type=int, default=1)
     parser.add_argument("--expert-install-budget-mb", type=float, default=128.0)
     parser.add_argument("--expert-install-target-steps", type=int, default=16)

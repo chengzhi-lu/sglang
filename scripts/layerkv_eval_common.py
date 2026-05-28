@@ -515,6 +515,9 @@ def layerkv_flags(
     profile_detail: bool = False,
     expert_backing_cache_mb: float = 0.0,
     expert_cpu_backing_mode: str = "none",
+    expert_forward_hooks: bool = True,
+    expert_collector_only: bool = False,
+    expert_hotness_sample_interval: int = 16,
     expert_install_layers_per_step: int = 1,
     expert_install_budget_mb: float = 128.0,
     expert_install_target_steps: int = 0,
@@ -537,13 +540,23 @@ def layerkv_flags(
         str(expert_backing_cache_mb),
         "--layerkv-expert-cpu-backing-mode",
         expert_cpu_backing_mode,
-        "--layerkv-expert-install-layers-per-step",
-        str(expert_install_layers_per_step),
-        "--layerkv-expert-install-budget-mb",
-        str(expert_install_budget_mb),
-        "--layerkv-expert-install-target-steps",
-        str(expert_install_target_steps),
     ]
+    if not expert_forward_hooks:
+        flags.append("--no-layerkv-expert-forward-hooks")
+    if expert_collector_only:
+        flags.append("--layerkv-expert-collector-only")
+    flags.extend(
+        [
+            "--layerkv-expert-hotness-sample-interval",
+            str(expert_hotness_sample_interval),
+            "--layerkv-expert-install-layers-per-step",
+            str(expert_install_layers_per_step),
+            "--layerkv-expert-install-budget-mb",
+            str(expert_install_budget_mb),
+            "--layerkv-expert-install-target-steps",
+            str(expert_install_target_steps),
+        ]
+    )
     if reclaim_limit_mb is not None:
         flags.extend(["--layerkv-reclaim-limit-mb", str(reclaim_limit_mb)])
     if dynamic_pressure_from_kvc:
