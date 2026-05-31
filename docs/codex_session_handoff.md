@@ -327,3 +327,307 @@ Stage B, copy descriptor instrumentation:
     `profile_kvc_select_evict_ms=3531.7`,
     `profile_kvc_evict_to_target_ms=3929.1`,
     `kvc_evict_count_total=0`.
+
+Stage C.1, install backing D2H async attempt:
+
+- Output: `/data/wenyan/tmp/layerkv_stage_c1_wildchat_coresid`.
+- Install backing D2H is submitted on the copy stream and committed to
+  `state.cpu_params` only after the ready event is finalized.
+- Correctness/smoke:
+  - `python -m py_compile` passed for runtime/eval scripts.
+  - `scripts/layerkv_smoke.py` passed.
+  - CUDA micro test verified pending install D2H finalizes into exact CPU
+    backing tensors.
+- WildChat counters:
+  - `expert_install_d2h_async_count=122`.
+  - `expert_install_d2h_async_finalize_count=122`.
+  - `expert_install_d2h_async_mb=1098.0`.
+  - `expert_install_d2h_async_wait_count=1`.
+  - `expert_install_d2h_sync_fallback_count=0`.
+  - `layerkv_copy_stream_busy_ms=1191.2`.
+- Effect versus Stage B:
+  - wall `26676.7 -> 27656.0 ms`.
+  - decode0 `1667.3 -> 1728.5 ms`.
+  - throughput `4.798 -> 4.628 tok/s`.
+  - install blocking `1311.9 -> 1263.2 ms`.
+  - copy-to-CPU profile `1269.1 -> 1209.1 ms`.
+- Interpretation: the copy is now truly represented as async copy-stream work,
+  but C.1 does not yet remove the CPU submit/allocation work from the install
+  step and the D2H traffic overlaps with decode bandwidth. Stage C should next
+  move descriptor submission off the decode critical path or defer/slice install
+  D2H instead of launching full-layer backing copies during measured decode.
+
+Fig4 prompt cache:
+
+- `load_fig4_prompt_ids()` now caches tokenized Fig4 prompt IDs under
+  `/data/wenyan/tmp/layerkv_fig4_prompt_cache` by default.
+- Set `LAYERKV_FIG4_PROMPT_CACHE_DIR=0` to disable or point it to a different
+  cache directory.
+- Cache key includes dataset name/path, workload, batch size, min/max context,
+  input length, seed, tokenizer id, and cache version.
+- Validation for WildChat context-heavy:
+  - first load wrote cache in `68.473s`;
+  - second load hit cache in `0.021s`;
+  - payload hash stayed `746dfb4a0f323fad`.
+
+## Current Plan Snapshot
+
+Recorded: 2026-05-31T08:25:00Z
+
+Current branch state:
+
+- Last committed optimization commit:
+  `243b9f4e5 perf(layerkv): add copy descriptors`.
+- Uncommitted work in progress:
+  - Stage C.1 install backing D2H async attempt in
+    `python/sglang/srt/layerkv/runtime.py`.
+  - Fig4 prompt ID cache in `scripts/layerkv_eval_common.py` and eval logging
+    in `scripts/layerkv_policy_eval.py`.
+  - This handoff update.
+- Do not treat C.1 as a successful perf change yet; it is evidence that naive
+  async full-layer D2H is insufficient.
+
+Reorganized phase map:
+
+1. Phase 1, baseline and counters: complete.
+   - WildChat long-context Default vs CoResid standalone was run.
+   - Main bottlenecks were recorded: hotness sync, expert install/copy
+     blocking, KVC no-op selection overhead, and batching behavior.
+
+2. Phase 2, GPU hotness counting: complete and committed.
+   - Commit: `f0744a2e6`.
+   - Hotness record path uses GPU count buffers instead of CPU sync.
+
+3. Phase 3, async hotness snapshots: complete and committed.
+   - Commit: `f0744a2e6`.
+   - Pinned CPU snapshot buffers, CUDA stream/events, no decode-path blocking.
+
+4. Phase 4, GPU candidate selection: partially complete and committed.
+   - Commit: `243b9f4e5`.
+   - Expert candidate order snapshot is implemented and validated.
+   - Not done: KVC candidate scoring/filtering on GPU.
+   - GPU DP is explicitly out of scope for now.
+
+5. Phase 5, copy submitter: in progress.
+   - Stage B descriptor instrumentation is committed in `243b9f4e5`.
+   - Stage C.1 install backing D2H async was tested but not committed as a
+     standalone perf win.
+   - Stage C must be re-centered around budgeted descriptor scheduling, not
+     naive async copy.
+
+6. Phase 6, KVC cleanup: queued.
+   - Short-circuit KVC selection when no KVC task can execute.
+   - Current evidence shows `profile_kvc_select_evict_ms` around 3.5s while
+     `kvc_evict_count_total=0`.
+
+7. Phase 7, standalone/PD alignment: queued.
+   - Continue optimizing in standalone first.
+   - Later rerun Default and CoResid under matching PD topology: one P GPU and
+     one D GPU.
+
+Updated Stage C plan:
+
+- C.2 should be a descriptor-driven, chunked, budgeted copy scheduler.
+- Install stage should generate descriptors rather than immediately submitting
+  full-layer backing D2H.
+- Per decode step, submit only a bounded copy budget, initially something like
+  `64 MiB/step` with a `128 MiB` chunk cap, then tune from WildChat data.
+- Preserve large-copy bandwidth when outside the decode critical path, such as
+  prefill, idle windows, or explicit high-priority recovery.
+- Maintain metadata correctness:
+  - D2H ready before inserting into `state.cpu_params`.
+  - H2D ready before marking a slot resident or pointing remap at it, unless
+    the main stream has waited on the event.
+  - Pending-not-ready experts can use wait fallback first, with counters.
+
+Recommended next order:
+
+1. Commit the Fig4 prompt cache separately, because it is clearly beneficial.
+2. Decide whether to keep the C.1 code as scaffolding for C.2 or roll it back
+   before implementing the budgeted queue.
+3. Implement Stage C.2 budgeted descriptor queue for install backing D2H first.
+4. Rerun WildChat standalone CoResid-only using the prompt cache.
+5. Implement KVC no-op selection short-circuit if C.2 still leaves controller
+   overhead dominated by KVC scanning.
+6. Rerun standalone Default vs CoResid once the runtime path stabilizes.
+
+## Stage C Revised Scope
+
+Recorded: 2026-05-31T08:35:00Z
+
+Stage C goal:
+
+- Move expert copy out of the decode critical path.
+- Allow intermediate demand to raise priority or insert urgent copy work.
+- Preserve the original design boundary: the CPU copy submitter must not
+  understand expert hotness, planner policy, or expert semantics. It should
+  consume already ordered descriptors with source, destination, byte count,
+  priority/deadline, sequence/version, and dependency metadata.
+
+C.1: naive async install backing experiment.
+
+- Status: implemented as an uncommitted experiment, not a successful perf
+  optimization.
+- Scope:
+  - install backing GPU-to-CPU D2H is submitted on the copy stream.
+  - event-ready finalization commits copied tensors into `state.cpu_params`.
+- Result:
+  - async path worked functionally (`122` experts, `1098 MiB`, `0` sync
+    fallback);
+  - wall/decode0 regressed because large D2H, CPU allocation, `index_select`,
+    and submission still happen in the measured path.
+- Use going forward:
+  - keep/reuse pending event and finalize mechanics if useful;
+  - do not treat naive full-layer async D2H as the final Stage C design.
+
+C.2: D2H backing descriptor queue.
+
+- Scope: GPU-to-CPU expert backing only.
+- Includes:
+  - install backing D2H;
+  - evict backing D2H.
+- Excludes:
+  - CPU-to-GPU materialize H2D;
+  - remap/topk use-point readiness;
+  - expert core wait logic.
+- Desired behavior:
+  - install/shrink/evict stages generate D2H descriptors instead of immediately
+    submitting full-layer copies;
+  - descriptors enter an expert backing queue with priority, deadline, seq, and
+    version;
+  - each decode step submits only a bounded copy budget;
+  - chunk size is bounded so urgent demand waits at most for the current chunk,
+    not for an entire layer or full install queue;
+  - D2H ready event must fire before inserting backing into
+    `state.cpu_params`.
+- Intermediate demand handling:
+  - if demand needs an expert whose backing descriptor is queued, boost that
+    descriptor priority/deadline;
+  - if backing D2H is already pending, wait fallback is allowed first for
+    correctness and must be counted;
+  - if backing is ready, consume it directly;
+  - if no descriptor exists, create an urgent descriptor or fall back sync.
+- Acceptance:
+  - `expert_install_blocking_ms` decreases;
+  - `profile_copy_expert_to_cpu_ms` is no longer concentrated in install;
+  - queue length, submitted bytes, finalized bytes, wait count, and fallback
+    count are observable;
+  - wall/decode0 do not regress versus Stage B.
+
+C.3: H2D materialize descriptors and use-point guard.
+
+- Scope: CPU-to-GPU expert materialization only.
+- Includes:
+  - on-demand materialize;
+  - prefetch materialize;
+  - dependencies on C.2 backing readiness;
+  - readiness checks before expert core consumes remapped slots.
+- Desired behavior:
+  - generate H2D descriptors for materialize work;
+  - allow urgent on-demand descriptors to outrank prefetch descriptors;
+  - H2D ready event must fire, or the main stream must wait on it, before remap
+    points execution at the target slot;
+  - backing-not-ready materialize should boost or wait on the corresponding
+    C.2 D2H descriptor.
+- Acceptance:
+  - materialize async counters increase;
+  - ready-before-use improves;
+  - copy-stream waits and deadline misses stay bounded;
+  - no correctness guard failures from reading incomplete weights.
+
+C.4: unified metadata commit rules.
+
+- D2H complete before `state.cpu_params` insertion.
+- H2D complete, or explicit main-stream wait, before resident/remap commit.
+- Descriptor seq/version prevents stale copy completion from overwriting newer
+  residency state.
+- Pending/cancelled descriptors are cleaned up without leaking residency state.
+
+C.5: tuning and regression.
+
+- Tune chunk size and per-step copy budget, initially comparing values around
+  `32`, `64`, and `128 MiB`.
+- Track bandwidth as submitted/finalized MB over copy-stream busy time, but do
+  not optimize bandwidth at the expense of decode0/wall latency.
+- Regression order:
+  1. micro tests for descriptor dependency and finalize;
+  2. `scripts/layerkv_smoke.py`;
+  3. WildChat standalone CoResid-only using prompt cache;
+  4. standalone Default vs CoResid once expert path stabilizes;
+  5. PD alignment later, after standalone behavior is stable.
+
+## Stage C.2 Implementation Progress
+
+Recorded: 2026-05-31T09:15:00Z
+
+Implemented:
+
+- Expert install backing D2H now uses a descriptor-style queue before physical
+  slot install.
+- New server/runtime knobs:
+  - `--layerkv-expert-copy-budget-mb`, default `64`;
+  - `--layerkv-expert-copy-chunk-mb`, default `128`.
+- Each decode safe point submits only the configured expert D2H budget.
+- Install queue waits for backing readiness before invoking the slot shrink and
+  install path.
+- D2H completion commits copied tensors into the install item's pending CPU
+  backing map only after the CUDA ready event is finalized.
+- CPU/non-optimized smoke paths keep the old synchronous fallback.
+- Policy eval CSV now records install D2H queue, async, finalize, fallback,
+  budget, and chunk counters. Fig4 prompt tokenization is cached for repeat
+  WildChat runs.
+
+Current limitation:
+
+- C.2 currently budgets install-backing D2H. Expert eviction backing already has
+  an async D2H event path, but it is not yet folded into the same budgeted
+  install queue. That is acceptable for the expert-side first pass because the
+  blocking regression we measured was dominated by install backing.
+- H2D materialization/use-point readiness remains Stage C.3.
+
+Validation:
+
+- `python -m py_compile` passed for runtime/server args/eval scripts.
+- `scripts/layerkv_smoke.py` passed.
+- CUDA micro test verified queued install D2H finalizes exact CPU backing
+  tensors.
+- WildChat context-heavy prompt cache hit reduced prompt load to milliseconds
+  in repeat runs.
+
+WildChat standalone CoResid results:
+
+- Stage B baseline:
+  - wall `26676.7 ms`, decode0 `1667.3 ms`, throughput `4.798 tok/s`;
+  - `expert_install_blocking_ms=1311.9`;
+  - `profile_copy_expert_to_cpu_ms=1269.1`;
+  - completed install layers `15`, physical expert reclaim `1098 MiB`.
+- C.1 naive full-layer async D2H:
+  - wall `27656.0 ms`, decode0 `1728.5 ms`, throughput `4.628 tok/s`;
+  - not a perf win.
+- C.2, `64 MiB/step`, `128 MiB` chunk:
+  - output `/data/wenyan/tmp/layerkv_stage_c2_wildchat_coresid`;
+  - wall `25059.2 ms`, decode0 `1566.2 ms`, throughput `5.108 tok/s`;
+  - `expert_install_blocking_ms=129.0`;
+  - `profile_copy_expert_to_cpu_ms=657.4`;
+  - `layerkv_copy_stream_busy_ms=588.0`;
+  - queued/submitted/finalized experts `57/53/45`, queue remaining `4`;
+  - completed install layers `6`, physical expert reclaim `405 MiB`.
+- C.2, `128 MiB/step`, `128 MiB` chunk:
+  - output `/data/wenyan/tmp/layerkv_stage_c2_128mb_wildchat_coresid`;
+  - wall `25790.0 ms`, decode0 `1611.9 ms`, throughput `4.963 tok/s`;
+  - `expert_install_blocking_ms=282.8`;
+  - `profile_copy_expert_to_cpu_ms=964.4`;
+  - `layerkv_copy_stream_busy_ms=844.2`;
+  - queued/submitted/finalized experts `69/69/57`, queue remaining `0`;
+  - completed install layers `7`, physical expert reclaim `513 MiB`.
+
+Interpretation:
+
+- C.2 achieves the intended first-order effect: expert install blocking drops
+  from about `1.31s` to `0.13s` at `64 MiB/step`.
+- `64 MiB/step` is the better latency point in the current short 16-token
+  decode window.
+- The tradeoff is under-installing during short requests: reclaim drops from
+  `1098 MiB` in Stage B to `405-513 MiB` in C.2. This means the next expert-side
+  work should either add an idle/prefill drain mode or tune budget by remaining
+  decode horizon, rather than blindly raising the per-step budget.

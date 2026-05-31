@@ -703,6 +703,8 @@ class ServerArgs:
     layerkv_expert_install_layers_per_step: int = 1
     layerkv_expert_install_budget_mb: float = 128.0
     layerkv_expert_install_target_steps: int = 0
+    layerkv_expert_copy_budget_mb: float = 64.0
+    layerkv_expert_copy_chunk_mb: float = 128.0
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3582,6 +3584,10 @@ class ServerArgs:
             raise ValueError(
                 "--layerkv-expert-install-target-steps must be non-negative"
             )
+        if self.layerkv_expert_copy_budget_mb < 0:
+            raise ValueError("--layerkv-expert-copy-budget-mb must be non-negative")
+        if self.layerkv_expert_copy_chunk_mb <= 0:
+            raise ValueError("--layerkv-expert-copy-chunk-mb must be positive")
         if self.layerkv_expert_cpu_backing_mode not in ("none", "all"):
             raise ValueError(
                 "--layerkv-expert-cpu-backing-mode must be one of: none, all"
@@ -6596,6 +6602,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.layerkv_expert_install_target_steps,
             help="If positive, dynamically raises per-step expert install layers so the queued install completes within this many decode steps.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-copy-budget-mb",
+            type=float,
+            default=ServerArgs.layerkv_expert_copy_budget_mb,
+            help="Maximum expert D2H backing copy MB to submit at each decode safe point.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-copy-chunk-mb",
+            type=float,
+            default=ServerArgs.layerkv_expert_copy_chunk_mb,
+            help="Maximum expert D2H backing copy chunk MB submitted as one async copy batch.",
         )
 
         # Hierarchical sparse attention

@@ -48,6 +48,8 @@ class LayerKVConfig:
     expert_install_layers_per_step: int = 1
     expert_install_budget_mb: float = 128.0
     expert_install_target_steps: int = 0
+    expert_copy_budget_mb: float = 64.0
+    expert_copy_chunk_mb: float = 128.0
     worker_role: str = "standalone"
 
     @classmethod
@@ -127,6 +129,20 @@ class LayerKVConfig:
                 0,
                 int(
                     getattr(server_args, "layerkv_expert_install_target_steps", 0) or 0
+                ),
+            ),
+            expert_copy_budget_mb=max(
+                0.0,
+                float(
+                    getattr(server_args, "layerkv_expert_copy_budget_mb", 64.0)
+                    or 0.0
+                ),
+            ),
+            expert_copy_chunk_mb=max(
+                1.0,
+                float(
+                    getattr(server_args, "layerkv_expert_copy_chunk_mb", 128.0)
+                    or 128.0
                 ),
             ),
             worker_role=worker_role,
@@ -468,6 +484,16 @@ class LayerKVStats:
     expert_install_blocking_ms: float = 0.0
     expert_install_reclaim_mb_progress: float = 0.0
     expert_install_not_comparable_step_count: int = 0
+    expert_install_d2h_async_count: int = 0
+    expert_install_d2h_async_mb: float = 0.0
+    expert_install_d2h_async_finalize_count: int = 0
+    expert_install_d2h_async_wait_count: int = 0
+    expert_install_d2h_sync_fallback_count: int = 0
+    expert_install_d2h_queued_count: int = 0
+    expert_install_d2h_queue_length: int = 0
+    expert_install_d2h_submit_step_count: int = 0
+    expert_install_d2h_budget_mb: float = 0.0
+    expert_install_d2h_chunk_mb: float = 0.0
     expert_lazy_backing_enabled: bool = True
     expert_lazy_backing_skipped_count: int = 0
     expert_lazy_backing_skipped_mb: float = 0.0
@@ -836,6 +862,21 @@ class _LayerKVPendingExpertD2H:
     layer_id: int
     copied: Dict[int, Dict[str, torch.Tensor]]
     bytes: int
+    reason: str = "evict_backing_async"
+    source_refs: Tuple[torch.Tensor, ...] = ()
+    target_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+
+
+@dataclasses.dataclass
+class _LayerKVExpertInstallD2HJob:
+    seq: int
+    layer_id: int
+    module: Any
+    param_names: List[str]
+    expert_ids: List[int]
+    target_cpu_params: Dict[int, Dict[str, torch.Tensor]]
+    priority: int = 0
+    deadline_step: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -897,6 +938,8 @@ class _LayerKVExpertInstallItem:
     slot_capacity: int
     initial_resident: Optional[List[int]]
     prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+    backing_queued: bool = False
+    pending_cpu_experts: Set[int] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1627,6 +1670,8 @@ class LayerKVRuntime:
         self._expert_hotness_sample_skip_pending: int = 0
         self._expert_plan_applied: bool = False
         self._expert_install_queue: List[_LayerKVExpertInstallItem] = []
+        self._expert_install_d2h_queue: List[_LayerKVExpertInstallD2HJob] = []
+        self._expert_install_d2h_job_seq: int = 0
         self._expert_install_state: str = ""
         self._expert_install_target_mb: float = 0.0
         self._expert_install_layers_per_step: int = int(
@@ -4648,7 +4693,11 @@ class LayerKVRuntime:
             return False
         if self._pending_virtual_kvc_materialize:
             return False
-        if self._pending_expert_copy_events or self._pending_expert_d2h_events:
+        if (
+            self._pending_expert_copy_events
+            or self._pending_expert_d2h_events
+            or self._expert_install_d2h_queue
+        ):
             return False
         if self._expert_install_queue or self._expert_plan_applied:
             return False
@@ -5465,9 +5514,21 @@ class LayerKVRuntime:
 
     def _refresh_expert_install_progress(self) -> None:
         pending = len(self._expert_install_queue)
+        queued_install_d2h = sum(
+            len(job.expert_ids) for job in self._expert_install_d2h_queue
+        )
+        pending_install_d2h = sum(
+            len(pending_copy.copied)
+            for pending_copy in self._pending_expert_d2h_events
+            if str(pending_copy.reason).startswith("install")
+        )
         completed = len(self._expert_layers)
         state = self._expert_install_state
-        if self._expert_plan_applied:
+        if queued_install_d2h > 0:
+            state = "queued_backing"
+        elif pending_install_d2h > 0:
+            state = "installing_backing"
+        elif self._expert_plan_applied:
             state = "complete"
         elif pending > 0 and not state:
             state = "queued"
@@ -5479,15 +5540,173 @@ class LayerKVRuntime:
         )
         self.stats.expert_install_budget_mb = float(self._expert_install_budget_mb)
         self.stats.expert_install_target_steps = int(self._expert_install_target_steps)
+        self.stats.expert_install_d2h_queue_length = int(queued_install_d2h)
+        self.stats.expert_install_d2h_budget_mb = float(
+            self.config.expert_copy_budget_mb
+        )
+        self.stats.expert_install_d2h_chunk_mb = float(
+            self.config.expert_copy_chunk_mb
+        )
         self.stats.expert_install_reclaim_mb_progress = float(
             self.stats.physical_expert_reclaim_mb
         )
-        if pending > 0:
+        if pending > 0 or queued_install_d2h > 0 or pending_install_d2h > 0:
             self.stats.comparable = False
             self.stats.comparability_reason = "INSTALL_IN_PROGRESS_NOT_COMPARABLE"
         elif self.stats.comparability_reason == "INSTALL_IN_PROGRESS_NOT_COMPARABLE":
             self.stats.comparable = True
             self.stats.comparability_reason = ""
+
+    def _enqueue_expert_install_d2h_job(
+        self,
+        *,
+        layer_id: int,
+        module: Any,
+        param_names: List[str],
+        expert_ids: List[int],
+        target_cpu_params: Dict[int, Dict[str, torch.Tensor]],
+        priority: int = 0,
+        deadline_step: Optional[int] = None,
+    ) -> None:
+        expert_ids = [int(expert_id) for expert_id in expert_ids]
+        if not expert_ids:
+            return
+        self._expert_install_d2h_job_seq += 1
+        self._expert_install_d2h_queue.append(
+            _LayerKVExpertInstallD2HJob(
+                seq=int(self._expert_install_d2h_job_seq),
+                layer_id=int(layer_id),
+                module=module,
+                param_names=list(param_names),
+                expert_ids=expert_ids,
+                target_cpu_params=target_cpu_params,
+                priority=int(priority),
+                deadline_step=(
+                    int(deadline_step)
+                    if deadline_step is not None
+                    else int(self._decode_step + 1)
+                ),
+            )
+        )
+        self.stats.expert_install_d2h_queued_count += len(expert_ids)
+        self._refresh_expert_install_progress()
+
+    def _prepare_expert_install_item_backing(
+        self, item: _LayerKVExpertInstallItem
+    ) -> bool:
+        if item.prepared_cpu_params is None:
+            item.prepared_cpu_params = {}
+        if item.backing_queued:
+            item.pending_cpu_experts = {
+                int(expert_id)
+                for expert_id in item.pending_cpu_experts
+                if int(expert_id) not in item.prepared_cpu_params
+            }
+            return not item.pending_cpu_experts
+
+        module = item.module
+        layer_id = int(item.layer_id)
+        param_names = self._expert_param_names(module)
+        full_num_experts = int(module.w13_weight.data.shape[0])
+        resident_set = set(int(x) for x in (item.initial_resident or []))
+        missing_cpu_experts: List[int] = []
+        for expert_id in range(full_num_experts):
+            if int(expert_id) in resident_set:
+                continue
+            if int(expert_id) in item.prepared_cpu_params:
+                self.stats.expert_prepared_backing_hit_count += 1
+                continue
+            global_params = (
+                self._global_expert_backing(layer_id, expert_id)
+                if self._expert_global_cpu_backing
+                else None
+            )
+            if global_params is not None:
+                item.prepared_cpu_params[int(expert_id)] = global_params
+                self.stats.expert_prepared_backing_hit_count += 1
+                continue
+            self.stats.expert_prepared_backing_miss_count += 1
+            missing_cpu_experts.append(int(expert_id))
+        if missing_cpu_experts:
+            device = getattr(module, param_names[0]).data.device if param_names else None
+            if (
+                not self._optimized_profile_enabled()
+                or device is None
+                or device.type != "cuda"
+            ):
+                return True
+            item.pending_cpu_experts = set(missing_cpu_experts)
+            item.backing_queued = True
+            self._enqueue_expert_install_d2h_job(
+                layer_id=layer_id,
+                module=module,
+                param_names=param_names,
+                expert_ids=missing_cpu_experts,
+                target_cpu_params=item.prepared_cpu_params,
+                priority=0,
+                deadline_step=self._decode_step + 1,
+            )
+            return False
+        item.pending_cpu_experts.clear()
+        item.backing_queued = True
+        return True
+
+    def _submit_expert_install_d2h_budgeted(self) -> None:
+        if not self._expert_install_d2h_queue:
+            return
+        budget_bytes = int(max(0.0, float(self.config.expert_copy_budget_mb)) * 1024 * 1024)
+        if budget_bytes <= 0:
+            return
+        chunk_cap_bytes = int(
+            max(1.0, float(self.config.expert_copy_chunk_mb)) * 1024 * 1024
+        )
+        submitted_bytes = 0
+        submitted_experts = 0
+        made_progress = False
+        self._expert_install_d2h_queue.sort(
+            key=lambda job: (
+                int(job.deadline_step),
+                -int(job.priority),
+                int(job.seq),
+            )
+        )
+        while self._expert_install_d2h_queue and submitted_bytes < budget_bytes:
+            job = self._expert_install_d2h_queue[0]
+            if not job.expert_ids:
+                self._expert_install_d2h_queue.pop(0)
+                continue
+            expert_bytes = max(1, int(self._expert_bytes(job.module)))
+            remaining_budget = max(0, budget_bytes - submitted_bytes)
+            chunk_budget = max(1, min(chunk_cap_bytes, remaining_budget))
+            take = max(1, min(len(job.expert_ids), chunk_budget // expert_bytes))
+            expert_ids = [int(x) for x in job.expert_ids[:take]]
+            copied_bytes = self._copy_experts_to_cpu_for_install_batched_async(
+                job.module,
+                job.param_names,
+                expert_ids,
+                layer_id=int(job.layer_id),
+                target_cpu_params=job.target_cpu_params,
+            )
+            if copied_bytes < 0:
+                copied = self._copy_experts_to_cpu_for_install_batched(
+                    job.module,
+                    job.param_names,
+                    expert_ids,
+                    layer_id=int(job.layer_id),
+                )
+                job.target_cpu_params.update(copied)
+                copied_bytes = sum(
+                    self._expert_backing_bytes(params) for params in copied.values()
+                )
+            job.expert_ids = [int(x) for x in job.expert_ids[take:]]
+            if not job.expert_ids:
+                self._expert_install_d2h_queue.pop(0)
+            submitted_bytes += max(1, int(copied_bytes))
+            submitted_experts += len(expert_ids)
+            made_progress = True
+        if made_progress:
+            self.stats.expert_install_d2h_submit_step_count += 1
+            self._refresh_expert_install_progress()
 
     def _advance_expert_install_budgeted(self) -> None:
         if self.config.mode != "kvc-expert" or not self._expert_install_queue:
@@ -5533,6 +5752,8 @@ class LayerKVRuntime:
         with self._profile(install_profile):
             while self._expert_install_queue and installed < max_layers:
                 item = self._expert_install_queue[0]
+                if not self._prepare_expert_install_item_backing(item):
+                    break
                 layer_reclaim_mb = max(
                     0.0,
                     (
@@ -5772,6 +5993,9 @@ class LayerKVRuntime:
                 self.stats.expert_prepared_backing_miss_count += 1
                 missing_cpu_experts.append(expert_id)
             if missing_cpu_experts:
+                self.stats.expert_install_d2h_sync_fallback_count += len(
+                    missing_cpu_experts
+                )
                 cpu_params.update(
                     self._copy_experts_to_cpu_for_install_batched(
                         module,
@@ -6070,6 +6294,95 @@ class LayerKVRuntime:
         self._refresh_expert_host_backing_stat()
         return copied
 
+    def _copy_experts_to_cpu_for_install_batched_async(
+        self,
+        module: Any,
+        param_names: List[str],
+        expert_ids: List[int],
+        *,
+        layer_id: int = -1,
+        target_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+    ) -> int:
+        if not expert_ids or not param_names:
+            return 0
+        device = getattr(module, param_names[0]).data.device
+        if device.type != "cuda":
+            return -1
+        active_stream = self._copy_stream or torch.cuda.current_stream(device=device)
+        expert_ids = [int(expert_id) for expert_id in expert_ids]
+        copied: Dict[int, Dict[str, torch.Tensor]] = {
+            int(expert_id): {} for expert_id in expert_ids
+        }
+        copied_bytes = 0
+        source_refs: List[torch.Tensor] = []
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        try:
+            with self._profile("profile_copy_expert_to_cpu_ms"):
+                with torch.no_grad(), torch.cuda.stream(active_stream):
+                    start.record(active_stream)
+                    for name in param_names:
+                        param = getattr(module, name).data
+                        max_chunk_bytes = 256 * 1024 * 1024
+                        per_expert_bytes = max(1, int(param[0].nbytes))
+                        chunk_size = max(1, max_chunk_bytes // per_expert_bytes)
+                        for begin in range(0, len(expert_ids), chunk_size):
+                            chunk = expert_ids[begin : begin + chunk_size]
+                            idx = torch.tensor(
+                                chunk,
+                                dtype=torch.long,
+                                device=param.device,
+                            )
+                            selected = param.index_select(0, idx).detach()
+                            dst = torch.empty(
+                                tuple(selected.shape),
+                                dtype=selected.dtype,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            dst.copy_(selected, non_blocking=True)
+                            copied_bytes += int(dst.nbytes)
+                            source_refs.extend([idx, selected])
+                            for offset, expert_id in enumerate(chunk):
+                                copied[int(expert_id)][name] = dst[offset]
+                    end.record(active_stream)
+        except Exception:
+            try:
+                active_stream.synchronize()
+            except Exception:
+                pass
+            self.stats.expert_install_d2h_sync_fallback_count += len(expert_ids)
+            return -1
+        pending = _LayerKVPendingExpertD2H(
+            start_event=start,
+            ready_event=end,
+            layer_id=int(layer_id),
+            copied=copied,
+            bytes=int(copied_bytes),
+            reason="install_backing_async",
+            source_refs=tuple(source_refs),
+            target_cpu_params=target_cpu_params,
+        )
+        self._pending_expert_d2h_events.append(pending)
+        for expert_id in copied:
+            self._pending_expert_d2h_by_key[(int(layer_id), int(expert_id))] = pending
+        for expert_id, params in copied.items():
+            self._record_expert_copy_descriptor(
+                direction="D2H",
+                reason="install_backing_async",
+                layer_id=int(layer_id),
+                logical_id=int(expert_id),
+                src_slot=int(expert_id),
+                dst_slot=int(expert_id),
+                nbytes=self._expert_backing_bytes(params),
+                param_count=len(params),
+            )
+        self.stats.expert_install_d2h_async_count += len(expert_ids)
+        self.stats.expert_install_d2h_async_mb += copied_bytes / float(1024 * 1024)
+        self.stats.expert_copy_stream_launch_count += 1
+        self.stats.layerkv_copy_event_record_count += 1
+        return int(copied_bytes)
+
     def _copy_slot_to_cpu(
         self, state: _LayerKVExpertLayerState, slot_id: int
     ) -> Dict[str, torch.Tensor]:
@@ -6271,6 +6584,7 @@ class LayerKVRuntime:
         if not self._pending_expert_d2h_events:
             return
         remaining: List[_LayerKVPendingExpertD2H] = []
+        finalized_install = 0
         for pending in self._pending_expert_d2h_events:
             try:
                 if block:
@@ -6286,22 +6600,36 @@ class LayerKVRuntime:
                 except Exception:
                     pass
                 state = self._expert_layers.get(int(pending.layer_id))
-                if state is not None:
-                    for logical_id, params in pending.copied.items():
-                        logical_id = int(logical_id)
+                target_cpu_params = pending.target_cpu_params
+                if state is None and target_cpu_params is None:
+                    remaining.append(pending)
+                    continue
+                for logical_id, params in pending.copied.items():
+                    logical_id = int(logical_id)
+                    if target_cpu_params is not None:
+                        target_cpu_params[logical_id] = params
+                    elif state is not None:
                         state.cpu_params[logical_id] = params
                         state.backing_lru[logical_id] = self._decode_step
-                        key = (int(pending.layer_id), logical_id)
-                        if self._pending_expert_d2h_by_key.get(key) is pending:
-                            self._pending_expert_d2h_by_key.pop(key, None)
+                    key = (int(pending.layer_id), logical_id)
+                    if self._pending_expert_d2h_by_key.get(key) is pending:
+                        self._pending_expert_d2h_by_key.pop(key, None)
                 self._expert_host_backing_bytes += int(pending.bytes)
-                self.stats.expert_eviction_d2h_async_finalize_count += len(
-                    pending.copied
-                )
+                if str(pending.reason).startswith("install"):
+                    self.stats.expert_install_d2h_async_finalize_count += len(
+                        pending.copied
+                    )
+                    finalized_install += len(pending.copied)
+                else:
+                    self.stats.expert_eviction_d2h_async_finalize_count += len(
+                        pending.copied
+                    )
             except Exception:
                 remaining.append(pending)
         self._pending_expert_d2h_events = remaining
         self._refresh_expert_host_backing_stat()
+        if finalized_install:
+            self._refresh_expert_install_progress()
 
     def _wait_for_pending_expert_backing(
         self, state: _LayerKVExpertLayerState, logical_id: int
@@ -6310,7 +6638,10 @@ class LayerKVRuntime:
         pending = self._pending_expert_d2h_by_key.get(key)
         if pending is None:
             return None
-        self.stats.expert_eviction_d2h_async_wait_count += 1
+        if str(pending.reason).startswith("install"):
+            self.stats.expert_install_d2h_async_wait_count += 1
+        else:
+            self.stats.expert_eviction_d2h_async_wait_count += 1
         pending.ready_event.synchronize()
         self._finalize_expert_d2h_events(block=False)
         return state.cpu_params.get(int(logical_id))
@@ -13194,6 +13525,7 @@ class LayerKVRuntime:
                 self.stats.layerkv_no_pressure_fastpath_count += 1
             else:
                 self._maybe_prepare_expert_plan_after_decode(forward_batch)
+                self._submit_expert_install_d2h_budgeted()
             if (
                 self._pending_kvc_evict_events
                 or self._pending_kvc_reload_events

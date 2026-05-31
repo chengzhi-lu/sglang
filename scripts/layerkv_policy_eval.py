@@ -238,6 +238,16 @@ CSV_FIELDS = [
     "expert_install_blocking_ms",
     "expert_install_reclaim_mb_progress",
     "expert_install_not_comparable_step_count",
+    "expert_install_d2h_async_count",
+    "expert_install_d2h_async_mb",
+    "expert_install_d2h_async_finalize_count",
+    "expert_install_d2h_async_wait_count",
+    "expert_install_d2h_sync_fallback_count",
+    "expert_install_d2h_queued_count",
+    "expert_install_d2h_queue_length",
+    "expert_install_d2h_submit_step_count",
+    "expert_install_d2h_budget_mb",
+    "expert_install_d2h_chunk_mb",
     "expert_lazy_backing_enabled",
     "expert_lazy_backing_skipped_count",
     "expert_lazy_backing_skipped_mb",
@@ -258,6 +268,10 @@ CSV_FIELDS = [
     "expert_eviction_d2h_batched_count",
     "expert_eviction_d2h_batched_mb",
     "expert_eviction_d2h_fallback_count",
+    "expert_eviction_d2h_async_count",
+    "expert_eviction_d2h_async_mb",
+    "expert_eviction_d2h_async_wait_count",
+    "expert_eviction_d2h_async_finalize_count",
     "expert_copy_stream_launch_count",
     "expert_copy_stream_wait_count",
     "expert_ready_before_use_count",
@@ -454,6 +468,8 @@ def policy_command(
         expert_install_layers_per_step=args.expert_install_layers_per_step,
         expert_install_budget_mb=args.expert_install_budget_mb,
         expert_install_target_steps=args.expert_install_target_steps,
+        expert_copy_budget_mb=args.expert_copy_budget_mb,
+        expert_copy_chunk_mb=args.expert_copy_chunk_mb,
     )
 
 
@@ -660,6 +676,8 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int) -> List
             expert_install_layers_per_step=args.expert_install_layers_per_step,
             expert_install_budget_mb=args.expert_install_budget_mb,
             expert_install_target_steps=args.expert_install_target_steps,
+            expert_copy_budget_mb=args.expert_copy_budget_mb,
+            expert_copy_chunk_mb=args.expert_copy_chunk_mb,
         )
     )
     return cmd
@@ -1123,6 +1141,8 @@ def main() -> int:
     parser.add_argument("--expert-install-layers-per-step", type=int, default=1)
     parser.add_argument("--expert-install-budget-mb", type=float, default=128.0)
     parser.add_argument("--expert-install-target-steps", type=int, default=0)
+    parser.add_argument("--expert-copy-budget-mb", type=float, default=64.0)
+    parser.add_argument("--expert-copy-chunk-mb", type=float, default=128.0)
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--timeout-s", type=int, default=1200)
@@ -1161,7 +1181,8 @@ def main() -> int:
             f"n={len(args.fig4_input_ids)} "
             f"tokens=[{args.fig4_prompt_metadata['payload_input_len_min']},"
             f"{args.fig4_prompt_metadata['payload_input_len_max']}] "
-            f"hash={args.fig4_prompt_metadata['payload_input_ids_hash']}",
+            f"hash={args.fig4_prompt_metadata['payload_input_ids_hash']} "
+            f"cache_hit={bool(args.fig4_prompt_metadata.get('prompt_cache_hit'))}",
             flush=True,
         )
     else:

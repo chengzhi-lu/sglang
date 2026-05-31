@@ -188,6 +188,101 @@ def _prompt_metadata(
     }
 
 
+def _fig4_prompt_cache_dir() -> Optional[Path]:
+    raw = os.environ.get(
+        "LAYERKV_FIG4_PROMPT_CACHE_DIR",
+        "/data/wenyan/tmp/layerkv_fig4_prompt_cache",
+    )
+    if raw in ("", "0", "false", "False", "off", "OFF"):
+        return None
+    return Path(raw)
+
+
+def _fig4_tokenizer_cache_id(tokenizer: Any) -> str:
+    name = str(getattr(tokenizer, "name_or_path", "") or "")
+    cls = tokenizer.__class__.__name__
+    vocab_size = str(getattr(tokenizer, "vocab_size", "") or "")
+    return "|".join([cls, name, vocab_size])
+
+
+def _fig4_prompt_cache_key(args: Any, tokenizer: Any) -> Tuple[str, str]:
+    payload = {
+        "dataset_name": str(args.fig4_dataset_name),
+        "dataset_path": str(args.fig4_dataset_path),
+        "workload": str(getattr(args, "workload", "")),
+        "batch_size": int(args.batch_size),
+        "min_ctx": int(args.min_ctx),
+        "max_ctx": int(args.max_ctx),
+        "input_len": int(args.input_len),
+        "seed": int(args.seed),
+        "tokenizer": _fig4_tokenizer_cache_id(tokenizer),
+        "version": 1,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()[:24], encoded
+
+
+def _load_fig4_prompt_cache(
+    args: Any, tokenizer: Any
+) -> Optional[Tuple[List[List[int]], Dict[str, Any]]]:
+    cache_dir = _fig4_prompt_cache_dir()
+    if cache_dir is None:
+        return None
+    key, encoded = _fig4_prompt_cache_key(args, tokenizer)
+    path = cache_dir / f"{key}.json"
+    try:
+        with path.open("r") as f:
+            payload = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    if payload.get("cache_key_payload") != encoded:
+        return None
+    input_ids = payload.get("input_ids")
+    metadata = payload.get("metadata")
+    if not isinstance(input_ids, list) or not isinstance(metadata, dict):
+        return None
+    metadata = dict(metadata)
+    metadata["prompt_cache_hit"] = True
+    metadata["prompt_cache_path"] = str(path)
+    return input_ids, metadata
+
+
+def _write_fig4_prompt_cache(
+    args: Any,
+    tokenizer: Any,
+    input_ids: List[List[int]],
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    cache_dir = _fig4_prompt_cache_dir()
+    if cache_dir is None:
+        metadata["prompt_cache_hit"] = False
+        metadata["prompt_cache_path"] = ""
+        return metadata
+    key, encoded = _fig4_prompt_cache_key(args, tokenizer)
+    path = cache_dir / f"{key}.json"
+    metadata = dict(metadata)
+    metadata["prompt_cache_hit"] = False
+    metadata["prompt_cache_path"] = str(path)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w") as f:
+            json.dump(
+                {
+                    "cache_key_payload": encoded,
+                    "input_ids": input_ids,
+                    "metadata": metadata,
+                },
+                f,
+            )
+        tmp.replace(path)
+    except Exception:
+        metadata["prompt_cache_path"] = ""
+    return metadata
+
+
 def load_sharegpt_fig4_prompts(
     path: str,
     tokenizer: Any,
@@ -415,6 +510,9 @@ def load_fig4_prompt_ids(
 ) -> Tuple[List[List[int]], Dict[str, Any]]:
     if not getattr(args, "fig4_aligned", False):
         raise ValueError("Fig4 prompt loading requires a known Fig4 workload")
+    cached = _load_fig4_prompt_cache(args, tokenizer)
+    if cached is not None:
+        return cached
     if args.fig4_dataset_name == "WildChat-1M":
         prompts, metadata = load_wildchat_fig4_prompts(
             args.fig4_dataset_path,
@@ -450,6 +548,7 @@ def load_fig4_prompt_ids(
     metadata["payload_input_ids_hash"] = hashlib.sha256(
         json.dumps(input_ids).encode()
     ).hexdigest()[:16]
+    metadata = _write_fig4_prompt_cache(args, tokenizer, input_ids, metadata)
     return input_ids, metadata
 
 
@@ -521,6 +620,8 @@ def layerkv_flags(
     expert_install_layers_per_step: int = 1,
     expert_install_budget_mb: float = 128.0,
     expert_install_target_steps: int = 0,
+    expert_copy_budget_mb: float = 64.0,
+    expert_copy_chunk_mb: float = 128.0,
 ) -> List[str]:
     flags = [
         "--enable-layerkv",
@@ -555,6 +656,10 @@ def layerkv_flags(
             str(expert_install_budget_mb),
             "--layerkv-expert-install-target-steps",
             str(expert_install_target_steps),
+            "--layerkv-expert-copy-budget-mb",
+            str(expert_copy_budget_mb),
+            "--layerkv-expert-copy-chunk-mb",
+            str(expert_copy_chunk_mb),
         ]
     )
     if reclaim_limit_mb is not None:
