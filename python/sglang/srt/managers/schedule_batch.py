@@ -2158,7 +2158,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
+            return True
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        layerkv_runtime = getattr(
+            getattr(kv_pool, "layerkv_runtime", None),
+            "can_satisfy_decode_allocation",
+            None,
+        )
+        if layerkv_runtime is not None and layerkv_runtime(
+            num_tokens, for_prefill=False
+        ):
+            return True
+        return False
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -2246,9 +2258,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
-            req.offload_kv_cache(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
+            if getattr(req, "layerkv_per_layer_allocated", False):
+                layerkv_runtime = getattr(
+                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    "layerkv_runtime",
+                    None,
+                )
+                backup_fn = getattr(
+                    layerkv_runtime,
+                    "backup_retracted_request_for_native_resume",
+                    None,
+                )
+                if backup_fn is not None:
+                    backup_fn(
+                        req,
+                        self.req_to_token_pool,
+                        self.token_to_kv_pool_allocator,
+                    )
+            else:
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
         # TODO (csy): for preempted requests, we may want to insert into the tree
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.

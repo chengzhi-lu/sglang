@@ -275,6 +275,18 @@ class AutoWeightsLoader:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    layerkv_runtime = getattr(forward_batch.token_to_kv_pool, "layerkv_runtime", None)
+    if layerkv_runtime is not None:
+        requires_unfused = getattr(
+            layerkv_runtime, "requires_unfused_set_kv_buffer", None
+        )
+        if requires_unfused is not None:
+            if requires_unfused():
+                return False
+        elif getattr(
+            layerkv_runtime, "uses_per_layer_logical_allocator", lambda: False
+        )():
+            return False
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")

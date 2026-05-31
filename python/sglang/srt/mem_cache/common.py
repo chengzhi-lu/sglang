@@ -532,6 +532,28 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
+    kv_pool = batch.token_to_kv_pool_allocator.get_kvcache()
+    layerkv_runtime = getattr(
+        getattr(kv_pool, "layerkv_runtime", None),
+        "allocate_decode_slots_for_batch",
+        None,
+    )
+    if layerkv_runtime is not None:
+        out_cache_loc = layerkv_runtime(batch, token_per_req=token_per_req)
+        if out_cache_loc is not None:
+            if batch.model_config.is_encoder_decoder:
+                locs = batch.encoder_lens + batch.seq_lens
+            else:
+                locs = batch.seq_lens.clone()
+            batch.req_to_token_pool.write(
+                (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+            )
+            return out_cache_loc
+        runtime_owner = getattr(kv_pool, "layerkv_runtime", None)
+        if runtime_owner is not None and getattr(
+            runtime_owner, "uses_per_layer_logical_allocator", lambda: False
+        )():
+            raise RuntimeError("LayerKV per-layer decode allocation failed")
 
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation

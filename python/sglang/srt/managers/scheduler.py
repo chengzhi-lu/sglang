@@ -1422,8 +1422,17 @@ class Scheduler(
                 return
         token_allocator = getattr(self, "token_to_kv_pool_allocator", None)
         available_tokens = -1
+        used_tokens = 0
+        token_usage = 0.0
         if token_allocator is not None and hasattr(token_allocator, "available_size"):
             available_tokens = int(token_allocator.available_size())
+        try:
+            pool_stats = self.get_pool_stats()
+            used_tokens = int(pool_stats.full_num_used)
+            token_usage = float(pool_stats.full_token_usage)
+        except Exception:
+            used_tokens = 0
+            token_usage = 0.0
         layerkv_runtime.on_schedule_batch(
             schedule_batch=batch,
             scheduler_context={
@@ -1439,6 +1448,9 @@ class Scheduler(
                 ),
                 "new_token_ratio": float(getattr(self, "new_token_ratio", 0.0) or 0.0),
                 "kv_available_tokens": available_tokens,
+                "kv_used_tokens": used_tokens,
+                "kv_token_usage": token_usage,
+                "num_retracted_reqs": int(getattr(self, "num_retracted_reqs", 0) or 0),
                 "enable_overlap": bool(getattr(self, "enable_overlap", False)),
             },
         )
@@ -1457,11 +1469,20 @@ class Scheduler(
         if available_tokens >= required_tokens:
             return True
         try:
-            layerkv_runtime.try_reclaim_kvc_before_retract(
-                schedule_batch=batch,
-                required_tokens=required_tokens,
-                available_tokens=available_tokens,
-            )
+            if hasattr(layerkv_runtime, "prepare_reclaim_for_scheduler"):
+                layerkv_runtime.prepare_reclaim_for_scheduler(
+                    schedule_batch=batch,
+                    required_tokens=required_tokens,
+                    available_tokens=available_tokens,
+                    reason="pre_retract_decode_mem",
+                    wait=True,
+                )
+            else:
+                layerkv_runtime.try_reclaim_kvc_before_retract(
+                    schedule_batch=batch,
+                    required_tokens=required_tokens,
+                    available_tokens=available_tokens,
+                )
         except Exception:
             logger.warning(
                 "LayerKV pre-retraction KVC reclaim failed; falling back to request retraction.",

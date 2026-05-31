@@ -1,0 +1,8 @@
+{
+  "num_rounds": 4,
+  "num_clients": 256,
+  "round_ratios": [16, 8, 4, 2],
+  "mean_new_tokens_per_round": [256, 192, 128, 96],
+  "mean_return_tokens_per_round": [64, 64, 64, 64],
+  "mean_inter_round_interval": [2, 2, 2, 2]
+}

@@ -1096,6 +1096,10 @@ class DecodePreallocQueue:
             # can be freed on demand before allocation.
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self.tree_cache.evictable_size()
+            available_size += self._layerkv_admission_credit_tokens(
+                required_tokens=max(reserved_tokens, need_space_for_single_req),
+                available_tokens=available_size,
+            )
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
         )
@@ -1116,6 +1120,51 @@ class DecodePreallocQueue:
                 allocatable_tokens -= full_required
 
         return allocatable_tokens
+
+    def _layerkv_admission_credit_tokens(
+        self, *, required_tokens: int, available_tokens: int
+    ) -> int:
+        runtime = getattr(
+            getattr(getattr(self.scheduler, "tp_worker", None), "model_runner", None),
+            "layerkv_runtime",
+            None,
+        )
+        if runtime is None or not hasattr(
+            runtime, "get_scheduler_admission_credit_tokens"
+        ):
+            return 0
+        try:
+            credit = int(
+                runtime.get_scheduler_admission_credit_tokens(
+                    required_tokens=int(required_tokens),
+                    available_tokens=int(available_tokens),
+                    reason="decode_prealloc_admission",
+                )
+                or 0
+            )
+            if (
+                int(available_tokens) + int(credit) < int(required_tokens)
+                and hasattr(runtime, "prepare_reclaim_for_scheduler")
+                and len(getattr(self.scheduler.running_batch, "reqs", []) or []) > 0
+            ):
+                runtime.prepare_reclaim_for_scheduler(
+                    schedule_batch=self.scheduler.running_batch,
+                    required_tokens=int(required_tokens),
+                    available_tokens=int(available_tokens),
+                    reason="decode_prealloc_admission",
+                    wait=True,
+                )
+                credit = int(
+                    runtime.get_scheduler_admission_credit_tokens(
+                        required_tokens=int(required_tokens),
+                        available_tokens=int(available_tokens),
+                        reason="decode_prealloc_admission",
+                    )
+                    or 0
+                )
+            return credit
+        except Exception:
+            return 0
 
     def _swa_tail_allocatable_token_budget(
         self,
@@ -1273,7 +1322,20 @@ class DecodePreallocQueue:
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
+            layerkv_runtime = getattr(
+                getattr(self.token_to_kv_pool, "layerkv_runtime", None),
+                "allocate_per_layer_request_slots",
+                None,
+            )
+            kv_loc = None
+            if layerkv_runtime is not None and delta_len > 0:
+                kv_loc = layerkv_runtime(
+                    req=req,
+                    positions=list(range(prefix_len, prefix_len + delta_len)),
+                    common_physical_locs=True,
+                )
+            if kv_loc is None:
+                kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
             device = self.token_to_kv_pool_allocator.device
             last_loc = (

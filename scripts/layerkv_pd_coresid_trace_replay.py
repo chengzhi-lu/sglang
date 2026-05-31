@@ -9,6 +9,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import statistics
@@ -384,9 +385,33 @@ def _replay_requests(
                 submit_offset_s = time.perf_counter() - start
                 fut = pool.submit(_stream_generate, base_url, row, args)
                 fut.submit_offset_s = submit_offset_s  # type: ignore[attr-defined]
+                fut.request_row = row  # type: ignore[attr-defined]
                 futures.append(fut)
             for fut in concurrent.futures.as_completed(futures):
-                item = fut.result()
+                row = getattr(fut, "request_row", {})
+                try:
+                    item = fut.result()
+                except Exception as exc:
+                    item = {
+                        "request_id": row.get("request_id", ""),
+                        "arrival_s": row.get("arrival_s", ""),
+                        "target_context_tokens": row.get(
+                            "target_context_tokens", ""
+                        ),
+                        "actual_context_tokens": row.get(
+                            "actual_context_tokens", ""
+                        ),
+                        "target_output_tokens": row.get("target_output_tokens", ""),
+                        "actual_output_tokens": 0,
+                        "prompt_source": row.get("prompt_source", ""),
+                        "prompt_record_id": row.get("prompt_record_id", ""),
+                        "ttft_ms": 0.0,
+                        "e2e_ms": 0.0,
+                        "tpot_ms": 0.0,
+                        "success": False,
+                        "error": repr(exc),
+                        "last_obj": {},
+                    }
                 item["submit_offset_s"] = getattr(fut, "submit_offset_s", 0.0)
                 results.append(item)
                 out.write(json.dumps(item, separators=(",", ":")) + "\n")
@@ -427,6 +452,44 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _decode_scheduler_log_stats(text: str) -> Dict[str, Any]:
+    running: List[float] = []
+    tokens: List[float] = []
+    usages: List[float] = []
+    retracted_gauge: List[float] = []
+    retracted_events = 0
+    for line in text.splitlines():
+        match = re.search(
+            r"#running-req:?\s*(\d+).*?#token:?\s*(\d+).*?"
+            r"token usage:?\s*([0-9.]+).*?#retracted-req:?\s*(\d+)",
+            line,
+        )
+        if match:
+            running.append(float(match.group(1)))
+            tokens.append(float(match.group(2)))
+            usages.append(float(match.group(3)))
+            retracted_gauge.append(float(match.group(4)))
+            continue
+        retract_match = re.search(r"#retracted_reqs:?\s*(\d+)", line)
+        if retract_match:
+            retracted_events += int(retract_match.group(1))
+    stats: Dict[str, Any] = {
+        "scheduler_log_sample_count": len(running),
+        "scheduler_log_retracted_event_sum": retracted_events,
+        "scheduler_log_retracted_gauge_max": int(max(retracted_gauge or [0.0])),
+    }
+    for values, prefix in (
+        (running, "scheduler_log_running_req"),
+        (tokens, "scheduler_log_token"),
+        (usages, "scheduler_log_token_usage"),
+    ):
+        stats[f"{prefix}_avg"] = float(statistics.mean(values)) if values else 0.0
+        stats[f"{prefix}_p50"] = _percentile(values, 0.50)
+        stats[f"{prefix}_p95"] = _percentile(values, 0.95)
+        stats[f"{prefix}_max"] = float(max(values)) if values else 0.0
+    return stats
 
 
 def _count_patterns(text: str) -> Dict[str, int]:
@@ -484,6 +547,7 @@ def _summarize(
     decode_log = _tail(paths["decode"], 2_000_000)
     stats_lines = parse_layerkv_stats(decode_log)
     stats = stats_lines[-1] if stats_lines else {}
+    scheduler_log_stats = _decode_scheduler_log_stats(decode_log)
     pattern_counts = _count_patterns(combined_logs)
     success_rows = [row for row in results if row.get("success")]
     failed_count = len(results) - len(success_rows)
@@ -521,6 +585,8 @@ def _summarize(
         reasons.append("not_all_ready")
     if not smoke or not smoke.get("success"):
         reasons.append("smoke_failed")
+    if results and len(results) != len(rows):
+        reasons.append(f"incomplete_per_request={len(results)}/{len(rows)}")
     if failed_count:
         reasons.append(f"failed_requests={failed_count}")
     if transfer_errors:
@@ -583,6 +649,7 @@ def _summarize(
         "ready": ready,
         "smoke": smoke,
         "pattern_counts": pattern_counts,
+        "scheduler_log_stats": scheduler_log_stats,
         "stats_line_count": len(stats_lines),
         "layerkv_stats": stats,
         "ports": {

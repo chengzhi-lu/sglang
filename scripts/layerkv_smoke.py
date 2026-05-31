@@ -164,6 +164,7 @@ def main() -> int:
     assert expert_summary["planned_expert_reclaim_mb"] > 0.0
     assert expert_summary["comparable"] is True
     assert expert_summary["kvc_guard_pass"] is True
+    assert expert_summary["expert_zero_reconstruct_guard_pass"] is True
     assert expert_runner.model.moe.w13_weight.shape[0] == 4
     topk = TopKOut(
         topk_weights=torch.ones((1, 2), dtype=torch.float32),
@@ -186,9 +187,15 @@ def main() -> int:
         router_logits=torch.empty((1, 4), dtype=torch.float32),
     )
     expert_runner.model.moe(torch.zeros((1, 2), dtype=torch.float32), topk)
-    assert int(expert_rt.summary()["expert_materialize_count"]) >= 1
-    assert int(expert_rt.summary()["expert_core_hook_count"]) >= 1
-    assert int(expert_rt.summary()["expert_topk_rewrite_count"]) >= 1
+    expert_summary = expert_rt.summary()
+    assert int(expert_summary["expert_materialize_count"]) >= 1
+    assert int(expert_summary["expert_core_hook_count"]) >= 1
+    assert int(expert_summary["expert_topk_rewrite_count"]) >= 1
+    assert expert_summary["expert_zero_reconstruct_guard_pass"] is True
+    assert int(expert_summary["expert_terminal_slot_count"]) == int(
+        expert_runner.model.moe.w13_weight.shape[0]
+    )
+    assert int(expert_summary["expert_terminal_metadata_mapped_count"]) > 0
     assert (
         expert_runner.model.moe.last_topk_ids.max().item()
         < expert_runner.model.moe.w13_weight.shape[0]

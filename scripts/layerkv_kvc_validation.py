@@ -23,10 +23,15 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Tuple
 
-DEFAULT_MODEL_PATH = (
+_LOCAL_DEFAULT_MODEL_PATH = (
     "/data/wenyan/.cache/huggingface/hub/"
     "models--Qwen--Qwen2.5-0.5B-Instruct/"
     "snapshots/7ae557604adf67be50417f59c2c2f167def9a775"
+)
+DEFAULT_MODEL_PATH = (
+    _LOCAL_DEFAULT_MODEL_PATH
+    if Path(_LOCAL_DEFAULT_MODEL_PATH).exists()
+    else "Qwen/Qwen2.5-0.5B-Instruct"
 )
 
 POLICIES = [
@@ -72,6 +77,10 @@ CSV_FIELDS = [
     "layerkv_physical_expert_supported",
     "layerkv_expert_layer_count",
     "requested_total_reclaim_mb",
+    "available_kvc_reclaim_mb",
+    "available_expert_reclaim_mb",
+    "available_total_reclaim_mb",
+    "target_limited_reason",
     "effective_kvc_reclaim_mb",
     "policy_kvc_fraction",
     "policy_expert_fraction",
@@ -152,6 +161,23 @@ CSV_FIELDS = [
     "kvc_layerwise_cost_observation_count",
     "kvc_layerwise_reload_ewma_ms_per_mb",
     "kvc_layerwise_evict_ewma_ms_per_mb",
+    "kvc_per_layer_metadata_rewrite_count",
+    "kvc_per_layer_metadata_rewrite_skip_count",
+    "kvc_per_layer_metadata_rewrite_unsupported_count",
+    "kvc_per_layer_override_layer_count",
+    "kvc_per_layer_slot_override_count",
+    "kvc_per_layer_slot_override_token_count",
+    "kvc_per_layer_slot_override_skip_count",
+    "kvc_per_layer_slot_override_skip_token_count",
+    "kvc_per_layer_evict_count",
+    "kvc_per_layer_reload_count",
+    "kvc_per_layer_reload_mb_total",
+    "kvc_zero_reconstruct_guard_pass",
+    "kvc_zero_reconstruct_guard_reason",
+    "kvc_zero_reconstruct_violation_count",
+    "kvc_terminal_resident_token_count",
+    "kvc_terminal_offloaded_token_count",
+    "kvc_terminal_metadata_mapped_token_count",
     "kvc_ready_before_use_ratio",
     "kvc_ready_before_use_count",
     "kvc_ready_use_check_count",
@@ -219,7 +245,15 @@ def validate_run(
             f"policy_fraction_mismatch expected={expected_fraction} got={stats.get('policy_kvc_fraction')}"
         )
 
-    expected_effective = target * expected_fraction
+    requested_effective = target * expected_fraction
+    available_kvc = float(stats.get("available_kvc_reclaim_mb", 0.0) or 0.0)
+    target_limited = (
+        str(stats.get("target_limited_reason") or "")
+        == "available_reclaim_below_needed_pressure"
+    )
+    expected_effective = (
+        min(requested_effective, available_kvc) if target_limited else requested_effective
+    )
     if not _float_close(
         stats.get("effective_kvc_reclaim_mb"), expected_effective, tol=1e-3
     ):
@@ -231,6 +265,13 @@ def validate_run(
         reasons.append("physical_kvc_unsupported")
     if not bool(stats.get("kvc_guard_pass", False)):
         reasons.append(f"kvc_guard_failed:{stats.get('kvc_guard_reason')}")
+    if not bool(stats.get("kvc_zero_reconstruct_guard_pass", True)):
+        reasons.append(
+            "kvc_zero_reconstruct_guard_failed:"
+            f"{stats.get('kvc_zero_reconstruct_guard_reason')}"
+        )
+    if int(stats.get("kvc_zero_reconstruct_violation_count", 0) or 0) != 0:
+        reasons.append("kvc_zero_reconstruct_violation_count_nonzero")
     if int(stats.get("kvc_physical_failure_count", 0) or 0) != 0:
         reasons.append("kvc_physical_failure_count_nonzero")
     if int(stats.get("kvc_stale_entry_count", 0) or 0) != 0:

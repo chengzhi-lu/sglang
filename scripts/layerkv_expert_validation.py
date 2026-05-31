@@ -98,6 +98,12 @@ CSV_FIELDS = [
     "selected_expert_evictions_by_layer",
     "expert_guard_pass",
     "expert_guard_reason",
+    "expert_zero_reconstruct_guard_pass",
+    "expert_zero_reconstruct_guard_reason",
+    "expert_zero_reconstruct_violation_count",
+    "expert_terminal_slot_count",
+    "expert_terminal_offloaded_count",
+    "expert_terminal_metadata_mapped_count",
     "layerkv_runtime_profile",
     "layerkv_physical_expert_supported",
     "layerkv_expert_layer_count",
@@ -269,6 +275,17 @@ def _exercise_policy(
             reasons.append("insufficient_physical_expert_reclaim")
         if float(summary["expert_host_backing_mb"]) >= 0.000488:
             reasons.append("cpu_backing_should_be_sparse")
+        if not bool(summary["expert_zero_reconstruct_guard_pass"]):
+            reasons.append(
+                "expert_zero_reconstruct_failed:"
+                f"{summary['expert_zero_reconstruct_guard_reason']}"
+            )
+        if int(summary["expert_zero_reconstruct_violation_count"]) != 0:
+            reasons.append("expert_zero_reconstruct_violation_count_nonzero")
+        if int(summary["expert_terminal_slot_count"]) <= 0:
+            reasons.append("expert_terminal_slot_count_missing")
+        if int(summary["expert_terminal_metadata_mapped_count"]) <= 0:
+            reasons.append("expert_terminal_metadata_mapping_missing")
         for layer in runner.model.layers:
             if layer.last_topk_ids is None:
                 reasons.append(f"layer{layer.layer_id}_not_called")
