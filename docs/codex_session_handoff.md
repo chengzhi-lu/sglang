@@ -949,3 +949,90 @@ Interpretation:
 - The larger decode latency gap is not primarily from the two H2D use-point
   waits; controller/KVC no-op selection and install/shrink bookkeeping still
   dominate.
+
+## Phase 5.1-5.4 Expert Install Path
+
+Recorded: 2026-05-31T13:05:00Z
+
+Implemented:
+
+- Phase 5.1 install/shrink split counters:
+  - `expert_install_metadata_ms`;
+  - `expert_install_weight_alloc_ms`;
+  - `expert_install_weight_copy_ms`;
+  - `expert_install_param_swap_ms`;
+  - `expert_install_hook_ms`;
+  - `expert_install_prebuild_submit_ms`;
+  - `expert_install_prebuild_ready_count`;
+  - `expert_install_prebuild_pending_count`;
+  - `expert_install_prebuild_wait_count`;
+  - `expert_install_shrink_layer_count`;
+  - `expert_install_shrink_expert_count`.
+- Phase 5.2/5.3 compact-weight prebuild:
+  - added `_expert_install_stream`;
+  - install now builds compact resident-weight tensors as a prebuild object;
+  - GPU resident expert copies are submitted on the install stream with CUDA
+    events;
+  - commit waits only if forced to consume a not-ready prebuild;
+  - normal decode path commits ready builds by swapping `param.data` and
+    installing remap/hook metadata.
+- Non-CUDA/smoke fallback remains synchronous so existing CPU smoke semantics
+  stay intact.
+
+Validation:
+
+- `python -m py_compile` passed.
+- `git diff --check` passed.
+- `PYTHONNOUSERSITE=1 scripts/layerkv_smoke.py` passed.
+
+WildChat spot check:
+
+- Output: `/data/wenyan/tmp/layerkv_phase5_async_install_wildchat_coresid`.
+- Command used lookahead `4`, target steps `16`, max copy budget `128 MiB`,
+  default chunk `128 MiB`.
+- Result:
+  - wall `27736.7 ms`;
+  - decode0 `1733.5 ms`;
+  - throughput `4.615 tok/s`;
+  - completed layers `14`;
+  - reclaim `981 MiB`;
+  - install blocking `500.1 -> 240.3 ms` versus the previous wait-stall run;
+  - prepared-plan apply `494.2 -> 234.4 ms`;
+  - compact prebuild submit `218.9 ms`;
+  - compact tensor allocation `183.6 ms`;
+  - async compact weight copy `217.7 ms`;
+  - param swap `0.12 ms`;
+  - hook/metadata commit `2.98 ms`;
+  - prebuild ready/pending `14 / 0`.
+
+Interpretation:
+
+- The heavyweight resident-weight GPU copy is now measured separately and
+  issued through the install stream.
+- In this run the prebuilds were ready by commit time, so no install-stream
+  wait was exposed.
+- The remaining install cost is mostly CPU-side submit/allocation around
+  compact tensor creation. The actual commit is cheap.
+- End-to-end latency did not materially improve because KVC no-op selection and
+  controller overhead still dominate the decode profile.
+
+Phase 5.4 feasibility audit:
+
+- Avoiding physical shrink entirely is not a small runtime-only change in the
+  current fused MoE path.
+- The active MoE modules and dispatcher metadata assume a compact
+  `num_experts/num_local_experts` and dense weight rows. The runtime currently
+  satisfies that contract by replacing `param.data` and rewriting logical
+  expert ids to compact slot ids.
+- A true logical-indirection design would require one of:
+  - MoE kernels that accept a logical-to-physical slot table while keeping full
+    weights resident;
+  - a staging/slot-table path in the fused MoE runner;
+  - or a different module wrapper that decouples planner-visible residency from
+    kernel-visible expert rows.
+- Without kernel/runner support, pretending experts are offloaded while leaving
+  full weights resident would not reclaim GPU memory, and sparse logical access
+  to full rows would break the current compact-kernel assumption.
+- Recommendation: keep the async compact prebuild path for Phase 5, and treat
+  no-physical-shrink as a later kernel/runner design task rather than a local
+  runtime patch.

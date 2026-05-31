@@ -509,6 +509,17 @@ class LayerKVStats:
     expert_install_step_count: int = 0
     expert_install_step_ms: float = 0.0
     expert_install_blocking_ms: float = 0.0
+    expert_install_metadata_ms: float = 0.0
+    expert_install_weight_alloc_ms: float = 0.0
+    expert_install_weight_copy_ms: float = 0.0
+    expert_install_param_swap_ms: float = 0.0
+    expert_install_hook_ms: float = 0.0
+    expert_install_prebuild_submit_ms: float = 0.0
+    expert_install_prebuild_ready_count: int = 0
+    expert_install_prebuild_pending_count: int = 0
+    expert_install_prebuild_wait_count: int = 0
+    expert_install_shrink_layer_count: int = 0
+    expert_install_shrink_expert_count: int = 0
     expert_install_reclaim_mb_progress: float = 0.0
     expert_install_not_comparable_step_count: int = 0
     expert_install_d2h_async_count: int = 0
@@ -990,6 +1001,28 @@ class _LayerKVRecoveryTask:
 
 
 @dataclasses.dataclass
+class _LayerKVExpertInstallBuild:
+    layer_id: int
+    module: Any
+    slot_capacity: int
+    initial_resident: List[int]
+    full_num_experts: int
+    device: torch.device
+    dtype: torch.dtype
+    cpu_params: Dict[int, Dict[str, torch.Tensor]]
+    param_names: List[str]
+    logical_to_slot: Dict[int, int]
+    slot_to_logical: Dict[int, int]
+    lru: Dict[int, int]
+    expert_bytes: int
+    compact_params: Dict[str, torch.Tensor]
+    source_refs: Tuple[torch.Tensor, ...] = ()
+    start_event: Optional[Any] = None
+    ready_event: Optional[Any] = None
+    elapsed_recorded: bool = False
+
+
+@dataclasses.dataclass
 class _LayerKVExpertInstallItem:
     layer_id: int
     module: Any
@@ -998,6 +1031,7 @@ class _LayerKVExpertInstallItem:
     prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
     backing_queued: bool = False
     pending_cpu_experts: Set[int] = dataclasses.field(default_factory=set)
+    prebuilt_install: Optional[_LayerKVExpertInstallBuild] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1665,6 +1699,7 @@ class LayerKVRuntime:
         self._copy_stream: Optional[torch.cuda.Stream] = None
         self._expert_d2h_stream: Optional[torch.cuda.Stream] = None
         self._expert_h2d_stream: Optional[torch.cuda.Stream] = None
+        self._expert_install_stream: Optional[torch.cuda.Stream] = None
         self._runner: Any = None
         self._kv_pool: Any = None
         self._allocator: Any = None
@@ -2593,6 +2628,7 @@ class LayerKVRuntime:
         if str(runner_device).startswith("cuda") or runner_device == "cuda":
             self._copy_stream = torch.cuda.Stream()
             self._expert_d2h_stream = torch.cuda.Stream()
+            self._expert_install_stream = torch.cuda.Stream()
             try:
                 _low_priority, high_priority = torch.cuda.Stream.priority_range()
                 self._expert_h2d_stream = torch.cuda.Stream(priority=high_priority)
@@ -6009,14 +6045,30 @@ class LayerKVRuntime:
                     and installed_mb + layer_reclaim_mb > max_mb
                 ):
                     break
+                if item.prebuilt_install is None:
+                    with self._profile("profile_apply_expert_shrink_ms"):
+                        item.prebuilt_install = self._build_expert_layer_slot_install(
+                            item.module,
+                            item.layer_id,
+                            item.slot_capacity,
+                            initial_resident=item.initial_resident,
+                            prepared_cpu_params=item.prepared_cpu_params,
+                            async_copy=True,
+                        )
+                    if (
+                        item.prebuilt_install.ready_event is not None
+                        and not item.prebuilt_install.ready_event.query()
+                    ):
+                        self.stats.expert_install_prebuild_pending_count += 1
+                        break
+                build = item.prebuilt_install
+                if build.ready_event is not None and not build.ready_event.query():
+                    self._record_expert_install_build_elapsed(build)
+                    self.stats.expert_install_prebuild_pending_count += 1
+                    break
+                self.stats.expert_install_prebuild_ready_count += 1
                 self._expert_install_queue.pop(0)
-                state = self._install_expert_layer_slots(
-                    item.module,
-                    item.layer_id,
-                    item.slot_capacity,
-                    initial_resident=item.initial_resident,
-                    prepared_cpu_params=item.prepared_cpu_params,
-                )
+                state = self._commit_expert_layer_slot_install(build)
                 self._expert_layers[item.layer_id] = state
                 installed += 1
                 installed_mb += layer_reclaim_mb
@@ -6164,24 +6216,49 @@ class LayerKVRuntime:
             total += int(tensor[0].nbytes)
         return total
 
-    def _install_expert_layer_slots(
+    def _expert_install_copy_stream(self, device: torch.device) -> Any:
+        return (
+            self._expert_install_stream
+            or self._copy_stream
+            or torch.cuda.current_stream(device=device)
+        )
+
+    def _record_expert_install_build_elapsed(
+        self, build: _LayerKVExpertInstallBuild
+    ) -> bool:
+        if (
+            build.elapsed_recorded
+            or build.start_event is None
+            or build.ready_event is None
+        ):
+            return build.elapsed_recorded
+        try:
+            if not build.ready_event.query():
+                return False
+            elapsed = float(build.start_event.elapsed_time(build.ready_event))
+            self.stats.expert_install_weight_copy_ms += elapsed
+            build.elapsed_recorded = True
+            return True
+        except Exception:
+            return False
+
+    def _build_expert_layer_slot_install(
         self,
         module: Any,
         layer_id: int,
         slot_capacity: int,
         initial_resident: Optional[List[int]] = None,
         prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
-    ) -> _LayerKVExpertLayerState:
-        if getattr(module, "_layerkv_expert_wrapped", False):
-            return self._expert_layers[layer_id]
-
+        *,
+        async_copy: bool = True,
+    ) -> _LayerKVExpertInstallBuild:
         param_names = self._expert_param_names(module)
         full_num_experts = int(module.w13_weight.data.shape[0])
         device = module.w13_weight.data.device
         dtype = module.w13_weight.data.dtype
         cpu_params: Dict[int, Dict[str, torch.Tensor]] = {}
         expert_bytes = 0
-
+        t_meta = time.perf_counter()
         with torch.no_grad():
             for name in param_names:
                 param = getattr(module, name)
@@ -6193,6 +6270,7 @@ class LayerKVRuntime:
                     full_num_experts=full_num_experts,
                     slot_capacity=slot_capacity,
                 )
+            initial_resident = [int(x) for x in initial_resident]
             with self._profile("profile_apply_expert_slot_map_ms"):
                 logical_to_slot = {
                     expert_id: slot_id
@@ -6245,31 +6323,70 @@ class LayerKVRuntime:
                         layer_id=layer_id,
                     )
                 )
+        self.stats.expert_install_metadata_ms += (
+            time.perf_counter() - t_meta
+        ) * 1000.0
 
-            with self._profile("profile_shrink_expert_weight_ms"):
-                with self._profile("profile_apply_expert_shrink_ms"):
+        compact_params: Dict[str, torch.Tensor] = {}
+        source_refs: List[torch.Tensor] = []
+        start_event = None
+        ready_event = None
+        active_stream = None
+        if async_copy and device.type == "cuda":
+            active_stream = self._expert_install_copy_stream(device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            ready_event = torch.cuda.Event(enable_timing=True)
+
+        t_submit = time.perf_counter()
+        with torch.no_grad():
+            if active_stream is not None:
+                with torch.cuda.stream(active_stream):
+                    start_event.record(active_stream)
                     for name in param_names:
                         param = getattr(module, name)
                         old = param.data
+                        t_alloc = time.perf_counter()
                         new_data = torch.empty(
                             (slot_capacity,) + tuple(old.shape[1:]),
                             dtype=old.dtype,
                             device=old.device,
                         )
+                        self.stats.expert_install_weight_alloc_ms += (
+                            time.perf_counter() - t_alloc
+                        ) * 1000.0
                         for slot_id, expert_id in enumerate(initial_resident):
-                            new_data[slot_id].copy_(old[expert_id])
-                        param.data = new_data
-
-        state = _LayerKVExpertLayerState(
-            layer_id=layer_id,
+                            src = old[int(expert_id)].detach()
+                            new_data[int(slot_id)].copy_(src, non_blocking=True)
+                            source_refs.append(src)
+                        compact_params[name] = new_data
+                    ready_event.record(active_stream)
+            else:
+                for name in param_names:
+                    param = getattr(module, name)
+                    old = param.data
+                    t_alloc = time.perf_counter()
+                    new_data = torch.empty(
+                        (slot_capacity,) + tuple(old.shape[1:]),
+                        dtype=old.dtype,
+                        device=old.device,
+                    )
+                    self.stats.expert_install_weight_alloc_ms += (
+                        time.perf_counter() - t_alloc
+                    ) * 1000.0
+                    for slot_id, expert_id in enumerate(initial_resident):
+                        new_data[int(slot_id)].copy_(old[int(expert_id)])
+                    compact_params[name] = new_data
+        self.stats.expert_install_prebuild_submit_ms += (
+            time.perf_counter() - t_submit
+        ) * 1000.0
+        self.stats.expert_install_shrink_layer_count += 1
+        self.stats.expert_install_shrink_expert_count += len(initial_resident)
+        return _LayerKVExpertInstallBuild(
+            layer_id=int(layer_id),
             module=module,
-            orig_forward=module.forward,
-            orig_run_moe_core=getattr(
-                module, "_layerkv_hotness_orig_run_moe_core", module.run_moe_core
-            ),
-            full_num_experts=full_num_experts,
-            slot_capacity=slot_capacity,
-            expert_bytes=expert_bytes,
+            slot_capacity=int(slot_capacity),
+            initial_resident=initial_resident,
+            full_num_experts=int(full_num_experts),
             device=device,
             dtype=dtype,
             cpu_params=cpu_params,
@@ -6277,20 +6394,68 @@ class LayerKVRuntime:
             logical_to_slot=logical_to_slot,
             slot_to_logical=slot_to_logical,
             lru=lru,
-            hotness_prefill=self._expert_hotness_prefill.setdefault(layer_id, {}),
-            hotness_decode=self._expert_hotness_decode.setdefault(layer_id, {}),
+            expert_bytes=int(expert_bytes),
+            compact_params=compact_params,
+            source_refs=tuple(source_refs),
+            start_event=start_event,
+            ready_event=ready_event,
         )
-        for expert_id, slot_id in logical_to_slot.items():
+
+    def _commit_expert_layer_slot_install(
+        self, build: _LayerKVExpertInstallBuild
+    ) -> _LayerKVExpertLayerState:
+        module = build.module
+        if getattr(module, "_layerkv_expert_wrapped", False):
+            return self._expert_layers[int(build.layer_id)]
+        if build.ready_event is not None and not build.ready_event.query():
+            self.stats.expert_install_prebuild_wait_count += 1
+            build.ready_event.synchronize()
+        self._record_expert_install_build_elapsed(build)
+        t_swap = time.perf_counter()
+        for name, new_data in build.compact_params.items():
+            getattr(module, name).data = new_data
+        self.stats.expert_install_param_swap_ms += (
+            time.perf_counter() - t_swap
+        ) * 1000.0
+
+        t_hook = time.perf_counter()
+        state = _LayerKVExpertLayerState(
+            layer_id=build.layer_id,
+            module=module,
+            orig_forward=module.forward,
+            orig_run_moe_core=getattr(
+                module, "_layerkv_hotness_orig_run_moe_core", module.run_moe_core
+            ),
+            full_num_experts=build.full_num_experts,
+            slot_capacity=build.slot_capacity,
+            expert_bytes=build.expert_bytes,
+            device=build.device,
+            dtype=build.dtype,
+            cpu_params=build.cpu_params,
+            param_names=build.param_names,
+            logical_to_slot=build.logical_to_slot,
+            slot_to_logical=build.slot_to_logical,
+            lru=build.lru,
+            hotness_prefill=self._expert_hotness_prefill.setdefault(
+                int(build.layer_id), {}
+            ),
+            hotness_decode=self._expert_hotness_decode.setdefault(
+                int(build.layer_id), {}
+            ),
+        )
+        for expert_id, slot_id in state.logical_to_slot.items():
             heapq.heappush(state.lru_heap, (state.lru[expert_id], slot_id, expert_id))
         remap_tensor = torch.full(
-            (full_num_experts,),
+            (build.full_num_experts,),
             -1,
             dtype=torch.long,
-            device=device,
+            device=build.device,
         )
-        if initial_resident:
-            ids = torch.tensor(initial_resident, dtype=torch.long, device=device)
-            slots = torch.arange(len(initial_resident), dtype=torch.long, device=device)
+        if build.initial_resident:
+            ids = torch.tensor(build.initial_resident, dtype=torch.long, device=build.device)
+            slots = torch.arange(
+                len(build.initial_resident), dtype=torch.long, device=build.device
+            )
             remap_tensor[ids] = slots
         state.remap_tensor = remap_tensor
 
@@ -6309,19 +6474,39 @@ class LayerKVRuntime:
         module.run_moe_core = wrapped_run_moe_core
         module._layerkv_expert_wrapped = True
         module._layerkv_expert_state = state
-
         try:
-            module.num_experts = slot_capacity
-            module.num_local_experts = slot_capacity
-            module.moe_runner_config.num_experts = slot_capacity
-            module.moe_runner_config.num_local_experts = slot_capacity
-            module.dispatcher.num_experts = slot_capacity
-            module.dispatcher.num_local_experts = slot_capacity
-            module.dispatcher.num_local_routed_experts = slot_capacity
+            module.num_experts = build.slot_capacity
+            module.num_local_experts = build.slot_capacity
+            module.moe_runner_config.num_experts = build.slot_capacity
+            module.moe_runner_config.num_local_experts = build.slot_capacity
+            module.dispatcher.num_experts = build.slot_capacity
+            module.dispatcher.num_local_experts = build.slot_capacity
+            module.dispatcher.num_local_routed_experts = build.slot_capacity
         except Exception:
             pass
+        self.stats.expert_install_hook_ms += (time.perf_counter() - t_hook) * 1000.0
         self._sync_expert_groups_for_state(state)
         return state
+
+    def _install_expert_layer_slots(
+        self,
+        module: Any,
+        layer_id: int,
+        slot_capacity: int,
+        initial_resident: Optional[List[int]] = None,
+        prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+    ) -> _LayerKVExpertLayerState:
+        if getattr(module, "_layerkv_expert_wrapped", False):
+            return self._expert_layers[layer_id]
+        build = self._build_expert_layer_slot_install(
+            module,
+            layer_id,
+            slot_capacity,
+            initial_resident=initial_resident,
+            prepared_cpu_params=prepared_cpu_params,
+            async_copy=False,
+        )
+        return self._commit_expert_layer_slot_install(build)
 
     def _select_initial_resident_experts(
         self, *, layer_id: int, full_num_experts: int, slot_capacity: int
