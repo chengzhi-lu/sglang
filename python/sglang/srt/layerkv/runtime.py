@@ -398,6 +398,19 @@ class LayerKVStats:
     expert_hotness_snapshot_deferred_count: int = 0
     expert_hotness_snapshot_forced_count: int = 0
     expert_hotness_ones_reuse_count: int = 0
+    expert_candidate_snapshot_issue_count: int = 0
+    expert_candidate_snapshot_ready_count: int = 0
+    expert_candidate_snapshot_drop_count: int = 0
+    expert_candidate_order_hit_count: int = 0
+    expert_candidate_order_miss_count: int = 0
+    expert_copy_descriptor_count: int = 0
+    expert_copy_descriptor_d2h_count: int = 0
+    expert_copy_descriptor_h2d_count: int = 0
+    expert_copy_descriptor_param_count: int = 0
+    expert_copy_descriptor_bytes: int = 0
+    expert_copy_descriptor_install_count: int = 0
+    expert_copy_descriptor_evict_count: int = 0
+    expert_copy_descriptor_materialize_count: int = 0
     expert_materialize_mb_total: float = 0.0
     expert_materialize_ms: float = 0.0
     expert_materialize_async_count: int = 0
@@ -884,6 +897,20 @@ class _LayerKVExpertInstallItem:
     slot_capacity: int
     initial_resident: Optional[List[int]]
     prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _LayerKVExpertCopyDescriptor:
+    seq: int
+    direction: str
+    reason: str
+    layer_id: int
+    logical_id: int
+    src_slot: int
+    dst_slot: int
+    bytes: int
+    param_count: int
+    step: int
 
 
 @dataclasses.dataclass
@@ -1583,10 +1610,18 @@ class LayerKVRuntime:
         self._expert_hotness_pending_snapshots: List[
             Tuple[str, int, torch.Tensor, Any, Optional[torch.Tensor]]
         ] = []
+        self._expert_candidate_order_by_layer: Dict[int, List[int]] = {}
+        self._expert_candidate_pending_snapshots: List[
+            Tuple[int, torch.Tensor, Any, Optional[torch.Tensor]]
+        ] = []
+        self._expert_candidate_pending_layers: Set[int] = set()
+        self._expert_candidate_last_snapshot_step: Dict[int, int] = {}
         self._expert_hotness_snapshot_streams: Dict[str, Any] = {}
         self._expert_hotness_pending_snapshot_keys: Set[Tuple[str, int]] = set()
         self._expert_hotness_last_snapshot_step: Dict[Tuple[str, int], int] = {}
         self._expert_hotness_ones_cache: Dict[Tuple[str, int], torch.Tensor] = {}
+        self._expert_copy_descriptor_seq: int = 0
+        self._expert_copy_descriptors_recent: List[_LayerKVExpertCopyDescriptor] = []
         self._expert_hotness_sampled_layers_step: int = -1
         self._expert_hotness_sampled_layers: Optional[Set[int]] = None
         self._expert_hotness_sample_skip_pending: int = 0
@@ -5351,13 +5386,27 @@ class LayerKVRuntime:
         if new_capacity >= int(state.slot_capacity):
             return
         current_resident = list(state.logical_to_slot.keys())
-        current_resident.sort(
-            key=lambda expert_id: (
-                -int(state.hotness_decode.get(int(expert_id), 0)),
-                -int(state.hotness_prefill.get(int(expert_id), 0)),
-                int(expert_id),
-            )
+        candidate_order = self._expert_candidate_order_by_layer.get(
+            int(state.layer_id)
         )
+        if candidate_order:
+            self.stats.expert_candidate_order_hit_count += 1
+            rank = {int(expert_id): i for i, expert_id in enumerate(candidate_order)}
+            current_resident.sort(
+                key=lambda expert_id: (
+                    int(rank.get(int(expert_id), len(rank) + int(expert_id))),
+                    int(expert_id),
+                )
+            )
+        else:
+            self.stats.expert_candidate_order_miss_count += 1
+            current_resident.sort(
+                key=lambda expert_id: (
+                    -int(state.hotness_decode.get(int(expert_id), 0)),
+                    -int(state.hotness_prefill.get(int(expert_id), 0)),
+                    int(expert_id),
+                )
+            )
         keep = [int(x) for x in current_resident[:new_capacity]]
         keep_set = set(keep)
         evict_pairs = [
@@ -5728,6 +5777,7 @@ class LayerKVRuntime:
                         module,
                         param_names,
                         missing_cpu_experts,
+                        layer_id=layer_id,
                     )
                 )
 
@@ -5813,6 +5863,23 @@ class LayerKVRuntime:
     ) -> List[int]:
         if slot_capacity <= 0:
             return []
+        candidate_order = self._expert_candidate_order_by_layer.get(int(layer_id))
+        if candidate_order:
+            self.stats.expert_candidate_order_hit_count += 1
+            selected = [
+                int(expert_id)
+                for expert_id in candidate_order
+                if 0 <= int(expert_id) < int(full_num_experts)
+            ]
+            if len(selected) < int(full_num_experts):
+                selected_set = set(selected)
+                selected.extend(
+                    int(expert_id)
+                    for expert_id in range(int(full_num_experts))
+                    if int(expert_id) not in selected_set
+                )
+            return selected[: min(slot_capacity, full_num_experts)]
+        self.stats.expert_candidate_order_miss_count += 1
         decode_hotness = self._expert_hotness_decode.get(layer_id, {})
         prefill_hotness = self._expert_hotness_prefill.get(layer_id, {})
         experts = list(range(full_num_experts))
@@ -5848,6 +5915,51 @@ class LayerKVRuntime:
         self._expert_host_backing_bytes += sum(int(t.nbytes) for t in backing.values())
         self._refresh_expert_host_backing_stat()
         return backing
+
+    def _record_expert_copy_descriptor(
+        self,
+        *,
+        direction: str,
+        reason: str,
+        layer_id: int,
+        logical_id: int,
+        src_slot: int,
+        dst_slot: int,
+        nbytes: int,
+        param_count: int,
+    ) -> _LayerKVExpertCopyDescriptor:
+        self._expert_copy_descriptor_seq += 1
+        desc = _LayerKVExpertCopyDescriptor(
+            seq=int(self._expert_copy_descriptor_seq),
+            direction=str(direction),
+            reason=str(reason),
+            layer_id=int(layer_id),
+            logical_id=int(logical_id),
+            src_slot=int(src_slot),
+            dst_slot=int(dst_slot),
+            bytes=int(nbytes),
+            param_count=int(param_count),
+            step=int(self._decode_step),
+        )
+        self._expert_copy_descriptors_recent.append(desc)
+        if len(self._expert_copy_descriptors_recent) > 256:
+            self._expert_copy_descriptors_recent = (
+                self._expert_copy_descriptors_recent[-256:]
+            )
+        self.stats.expert_copy_descriptor_count += 1
+        self.stats.expert_copy_descriptor_bytes += int(nbytes)
+        self.stats.expert_copy_descriptor_param_count += int(param_count)
+        if str(direction) == "D2H":
+            self.stats.expert_copy_descriptor_d2h_count += 1
+        elif str(direction) == "H2D":
+            self.stats.expert_copy_descriptor_h2d_count += 1
+        if str(reason).startswith("install"):
+            self.stats.expert_copy_descriptor_install_count += 1
+        elif str(reason).startswith("evict"):
+            self.stats.expert_copy_descriptor_evict_count += 1
+        elif str(reason).startswith("materialize"):
+            self.stats.expert_copy_descriptor_materialize_count += 1
+        return desc
 
     def _copy_expert_to_cpu_backing_no_account(
         self,
@@ -5886,7 +5998,12 @@ class LayerKVRuntime:
         )
 
     def _copy_experts_to_cpu_for_install_batched(
-        self, module: Any, param_names: List[str], expert_ids: List[int]
+        self,
+        module: Any,
+        param_names: List[str],
+        expert_ids: List[int],
+        *,
+        layer_id: int = -1,
     ) -> Dict[int, Dict[str, torch.Tensor]]:
         if not expert_ids:
             return {}
@@ -5939,6 +6056,17 @@ class LayerKVRuntime:
         self._expert_host_backing_bytes += sum(
             self._expert_backing_bytes(params) for params in copied.values()
         )
+        for expert_id, params in copied.items():
+            self._record_expert_copy_descriptor(
+                direction="D2H",
+                reason="install_backing",
+                layer_id=int(layer_id),
+                logical_id=int(expert_id),
+                src_slot=int(expert_id),
+                dst_slot=int(expert_id),
+                nbytes=self._expert_backing_bytes(params),
+                param_count=len(params),
+            )
         self._refresh_expert_host_backing_stat()
         return copied
 
@@ -6051,6 +6179,18 @@ class LayerKVRuntime:
         added = copied_bytes or sum(
             self._expert_backing_bytes(params) for params in copied.values()
         )
+        for logical_id, slot_id in evicted_pairs:
+            params = copied.get(int(logical_id), {})
+            self._record_expert_copy_descriptor(
+                direction="D2H",
+                reason="evict_backing_sync",
+                layer_id=int(state.layer_id),
+                logical_id=int(logical_id),
+                src_slot=int(slot_id),
+                dst_slot=int(logical_id),
+                nbytes=self._expert_backing_bytes(params),
+                param_count=len(params),
+            )
         self._expert_host_backing_bytes += added
         self._refresh_expert_host_backing_stat()
         return copied
@@ -6107,6 +6247,18 @@ class LayerKVRuntime:
         for logical_id in copied:
             self._pending_expert_d2h_by_key[(int(state.layer_id), int(logical_id))] = (
                 pending
+            )
+        for logical_id, slot_id in evicted_pairs:
+            params = copied.get(int(logical_id), {})
+            self._record_expert_copy_descriptor(
+                direction="D2H",
+                reason="evict_backing_async",
+                layer_id=int(state.layer_id),
+                logical_id=int(logical_id),
+                src_slot=int(slot_id),
+                dst_slot=int(logical_id),
+                nbytes=self._expert_backing_bytes(params),
+                param_count=len(params),
             )
         self.stats.expert_eviction_d2h_async_count += len(evicted_pairs)
         self.stats.expert_eviction_d2h_async_mb += copied_bytes / float(1024 * 1024)
@@ -6345,6 +6497,7 @@ class LayerKVRuntime:
                     module,
                     param_names,
                     to_copy,
+                    layer_id=layer_id,
                 )
                 cpu_params_by_layer[layer_id] = layer_cpu_params
 
@@ -6430,6 +6583,7 @@ class LayerKVRuntime:
                         module,
                         param_names,
                         missing,
+                        layer_id=layer_id,
                     )
                     copied_count += len(copied)
                     copied_bytes += sum(
@@ -6856,6 +7010,101 @@ class LayerKVRuntime:
         self._expert_hotness_last_snapshot_step[key] = step
         self.stats.expert_hotness_snapshot_issue_count += 1
 
+    def _hotness_snapshot_stream(self, device: torch.device) -> Any:
+        device_key = str(device)
+        stream = self._expert_hotness_snapshot_streams.get(device_key)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._expert_hotness_snapshot_streams[device_key] = stream
+        return stream
+
+    def _maybe_issue_expert_candidate_snapshot(
+        self, mode: str, layer_id: int, full_num_experts: int, device: torch.device
+    ) -> None:
+        if device.type != "cuda":
+            return
+        if mode != "decode":
+            return
+        layer_id = int(layer_id)
+        if layer_id in self._expert_candidate_pending_layers:
+            return
+        max_pending = max(8, len(self._expert_modules) * 2)
+        if len(self._expert_candidate_pending_snapshots) >= max_pending:
+            self.stats.expert_candidate_snapshot_drop_count += 1
+            return
+        step = max(0, int(self._decode_step))
+        last = int(self._expert_candidate_last_snapshot_step.get(layer_id, -1))
+        interval = max(4, int(self.config.expert_hotness_sample_interval) * 4)
+        if step > 4 and last >= 0 and step - last < interval:
+            return
+        decode_counts = self._expert_hotness_gpu_decode.get(layer_id)
+        prefill_counts = self._expert_hotness_gpu_prefill.get(layer_id)
+        if decode_counts is None and prefill_counts is None:
+            return
+        if decode_counts is None:
+            decode_counts = torch.zeros(
+                (int(full_num_experts),), dtype=torch.int32, device=device
+            )
+        if prefill_counts is None:
+            prefill_counts = torch.zeros(
+                (int(full_num_experts),), dtype=torch.int32, device=device
+            )
+        expert_ids = torch.arange(int(full_num_experts), dtype=torch.long, device=device)
+        # Match CPU ordering: decode hotness desc, then prefill desc, then id asc.
+        scale = 1_000_000_000
+        scores = (
+            (
+                decode_counts.to(torch.long) * scale
+                + prefill_counts.to(torch.long)
+            )
+            * (int(full_num_experts) + 1)
+            + (int(full_num_experts) - expert_ids)
+        )
+        order = torch.argsort(scores, descending=True).to(torch.int32)
+        try:
+            cpu_order = torch.empty_like(order, device="cpu", pin_memory=True)
+        except Exception:
+            cpu_order = torch.empty_like(order, device="cpu")
+        stream = self._hotness_snapshot_stream(device)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(device=device))
+        with torch.cuda.stream(stream):
+            stream.wait_event(ready)
+            cpu_order.copy_(order, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+        order.record_stream(stream)
+        self._expert_candidate_pending_snapshots.append(
+            (layer_id, cpu_order, event, order)
+        )
+        self._expert_candidate_pending_layers.add(layer_id)
+        self._expert_candidate_last_snapshot_step[layer_id] = step
+        self.stats.expert_candidate_snapshot_issue_count += 1
+
+    def _finalize_expert_candidate_snapshots(self, *, block: bool = False) -> None:
+        if not self._expert_candidate_pending_snapshots:
+            return
+        remaining = []
+        for layer_id, cpu_order, event, order in self._expert_candidate_pending_snapshots:
+            keep_pending = False
+            try:
+                if block:
+                    event.synchronize()
+                elif not event.query():
+                    remaining.append((layer_id, cpu_order, event, order))
+                    keep_pending = True
+                    continue
+                self._expert_candidate_order_by_layer[int(layer_id)] = [
+                    int(x) for x in cpu_order.tolist()
+                ]
+                self.stats.expert_candidate_snapshot_ready_count += 1
+            except Exception:
+                self.stats.expert_candidate_snapshot_drop_count += 1
+            finally:
+                if not keep_pending:
+                    self._expert_candidate_pending_layers.discard(int(layer_id))
+        self._expert_candidate_pending_snapshots = remaining
+
     def _finalize_expert_hotness_snapshots(self, *, block: bool = False) -> None:
         if not self._expert_hotness_pending_snapshots:
             return
@@ -6950,6 +7199,7 @@ class LayerKVRuntime:
         self, *, mode: Optional[str] = None, block: bool = False
     ) -> None:
         self._finalize_expert_hotness_snapshots(block=block)
+        self._finalize_expert_candidate_snapshots(block=block)
         if block:
             self._materialize_expert_hotness_gpu_counts(mode=mode)
 
@@ -7004,6 +7254,9 @@ class LayerKVRuntime:
         self.stats.expert_hotness_record_fast_count += 1
         self.stats.expert_hotness_record_count += 1
         self._maybe_issue_expert_hotness_snapshot(mode, int(layer_id), counts)
+        self._maybe_issue_expert_candidate_snapshot(
+            mode, int(layer_id), int(full_num_experts), ids.device
+        )
 
     def _record_expert_hotness_for_layer(
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
@@ -7305,6 +7558,17 @@ class LayerKVRuntime:
     ) -> None:
         if not materialized:
             return
+        for logical_id, slot_id, source_params in materialized:
+            self._record_expert_copy_descriptor(
+                direction="H2D",
+                reason="materialize_async" if async_copy else "materialize_sync",
+                layer_id=int(state.layer_id),
+                logical_id=int(logical_id),
+                src_slot=int(logical_id),
+                dst_slot=int(slot_id),
+                nbytes=self._expert_backing_bytes(source_params),
+                param_count=len(source_params),
+            )
         start = None
         end = None
         active_stream = None
@@ -10064,11 +10328,13 @@ class LayerKVRuntime:
         self._mark_canonical_per_layer_metadata_current()
         if (
             self._expert_hotness_pending_snapshots
+            or self._expert_candidate_pending_snapshots
             or self._pending_expert_d2h_events
             or self._pending_expert_copy_events
         ):
             with self._profile("profile_finalize_expert_ms"):
                 self._finalize_expert_hotness_snapshots(block=False)
+                self._finalize_expert_candidate_snapshots(block=False)
                 self._finalize_expert_d2h_events(block=False)
                 self._finalize_expert_materialize_events(block=False)
         if (
@@ -12914,11 +13180,13 @@ class LayerKVRuntime:
             self._kvc_demand_signature_eval_step = None
             if (
                 self._expert_hotness_pending_snapshots
+                or self._expert_candidate_pending_snapshots
                 or self._pending_expert_d2h_events
                 or self._pending_expert_copy_events
             ):
                 with self._profile("profile_finalize_expert_ms"):
                     self._finalize_expert_hotness_snapshots(block=False)
+                    self._finalize_expert_candidate_snapshots(block=False)
                     self._finalize_expert_d2h_events(block=False)
                     self._finalize_expert_materialize_events(block=False)
             fast_path = self._no_pressure_fast_path_active(forward_batch)

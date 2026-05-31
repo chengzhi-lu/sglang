@@ -263,3 +263,67 @@ snapshot. This directly targets the measured WildChat overhead
 (`profile_expert_hotness_record_ms` around 12682 ms and
 `expert_hotness_sync_fallback_count == expert_hotness_record_count`) while
 keeping expert copy scheduling and metadata semantics mostly unchanged.
+
+## Phase 2/3/4 Progress
+
+Recorded: 2026-05-31T08:05:00Z
+
+Committed baseline before Phase 4:
+
+- Commit: `f0744a2e6 perf(layerkv): async hotness snapshots`.
+- Phase 2/3 moved expert hotness accumulation to GPU and snapshots to async
+  pinned CPU buffers.
+- WildChat CoResid-only result:
+  - `expert_hotness_record_count=1620`.
+  - `expert_hotness_record_fast_count=1620`.
+  - `expert_hotness_sync_fallback_count=0`.
+  - `profile_expert_hotness_record_ms=281.6`.
+  - `profile_expert_hotness_snapshot_ms=62.8`.
+
+Stage A, GPU candidate order snapshot:
+
+- Output: `/data/wenyan/tmp/layerkv_stage_a_wildchat_coresid`.
+- Candidate snapshots are issued only from decode hotness and consumed as small
+  per-layer expert-order tensors.
+- WildChat counters:
+  - `expert_candidate_snapshot_issue_count=192`.
+  - `expert_candidate_snapshot_ready_count=192`.
+  - `expert_candidate_snapshot_drop_count=0`.
+  - `expert_candidate_order_hit_count=48`.
+  - `expert_candidate_order_miss_count=0`.
+- Performance:
+  - `request_wall_ms=26644.6`.
+  - `benchmark_decode0_latency_ms=1665.3`.
+  - `output_throughput_tok_s=4.804`.
+  - `profile_controller_per_decode_step_ms=338.5`.
+  - `profile_copy_expert_to_cpu_ms=1292.9`.
+  - `profile_install_expert_slots_ms=1333.7`.
+
+Stage B, copy descriptor instrumentation:
+
+- Output: `/data/wenyan/tmp/layerkv_stage_b_wildchat_coresid`.
+- Descriptor schema records direction, reason, layer id, logical expert id,
+  source slot, destination slot, byte count, parameter count, sequence, and
+  decode step.
+- Recorded descriptor counters:
+  - `expert_copy_descriptor_count=132`.
+  - `expert_copy_descriptor_d2h_count=127`.
+  - `expert_copy_descriptor_h2d_count=5`.
+  - `expert_copy_descriptor_install_count=122`.
+  - `expert_copy_descriptor_evict_count=5`.
+  - `expert_copy_descriptor_materialize_count=5`.
+  - `expert_copy_descriptor_bytes=1245708288`.
+  - `expert_copy_descriptor_param_count=264`.
+- Stage B overhead is within run noise versus Stage A:
+  - wall `26644.6 -> 26676.7 ms`.
+  - decode0 `1665.3 -> 1667.3 ms`.
+  - controller/decode step `338.5 -> 336.1 ms`.
+  - copy-to-CPU `1292.9 -> 1269.1 ms`.
+- Current bottlenecks remain:
+  - install/copy still occurs on the critical path:
+    `expert_install_blocking_ms=1311.9`,
+    `profile_install_expert_slots_ms=1311.7`.
+  - KVC selection still spends time without actual KVC eviction:
+    `profile_kvc_select_evict_ms=3531.7`,
+    `profile_kvc_evict_to_target_ms=3929.1`,
+    `kvc_evict_count_total=0`.
