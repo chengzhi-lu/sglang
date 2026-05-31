@@ -765,3 +765,88 @@ WildChat default C.2 rerun:
     no-op selection plus general controller overhead;
   - CPU backing pool does not help this particular short run because backing is
     not released/reused during the same request.
+
+## Stage C.3 Expert H2D Reload Path
+
+Recorded: 2026-05-31T11:05:00Z
+
+Implemented:
+
+- Split expert copy streams:
+  - D2H install/evict backing uses `_expert_d2h_stream`;
+  - H2D expert reload/materialize uses `_expert_h2d_stream`;
+  - the existing `_copy_stream` remains the fallback/common stream.
+- On-demand expert reload now issues async H2D copies when optimized profiling
+  is enabled, instead of forcing host-side sync.
+- Ready-before-use guard:
+  - materialized experts are marked `materializing` with CUDA events;
+  - before top-k/slot use, the decode stream waits on the matching ready event;
+  - ready/miss/wait counters are shared with the scheduler-facing metrics.
+- New CSV/stats:
+  - `expert_d2h_stream_launch_count`;
+  - `expert_h2d_stream_launch_count`;
+  - `expert_d2h_stream_busy_ms`;
+  - `expert_h2d_stream_busy_ms`;
+  - `expert_h2d_on_demand_async_count`;
+  - `expert_h2d_prefetch_async_count`;
+  - `expert_h2d_sync_count`.
+
+Validation:
+
+- `python -m py_compile` passed.
+- `git diff --check` passed.
+- `PYTHONNOUSERSITE=1 scripts/layerkv_smoke.py` passed.
+
+WildChat default C.3 rerun:
+
+- Output: `/data/wenyan/tmp/layerkv_stage_c3_default_wildchat_coresid`.
+- Command used default `64 MiB/step`, lookahead `0`.
+- Result:
+  - wall `25348.8 ms`;
+  - decode0 `1584.3 ms`;
+  - throughput `5.050 tok/s`;
+  - install blocking `24.3 ms`;
+  - completed layers `6`;
+  - reclaim `405 MiB`;
+  - D2H stream launches/busy `13 / 597.7 ms`;
+  - H2D stream launches/busy `0 / 0.0 ms`.
+- Interpretation:
+  - default workload did not trigger expert reload, so C.3 only validates the
+    separated D2H stream path in this configuration;
+  - end-to-end latency remains roughly flat versus C.2.3 default.
+
+WildChat lookahead C.3 spot check:
+
+- Output: `/data/wenyan/tmp/layerkv_stage_c3_h2d_lookahead_wildchat_coresid`.
+- Command added `--expert-install-target-steps 16
+  --expert-copy-max-budget-mb 128 --expert-copy-lookahead-layers 4`.
+- Result:
+  - wall `28077.2 ms`;
+  - decode0 `1754.8 ms`;
+  - throughput `4.559 tok/s`;
+  - install blocking `273.5 ms`;
+  - completed layers `14`;
+  - reclaim `981 MiB`;
+  - H2D on-demand async/sync `2 / 0`;
+  - H2D stream launches/busy `2 / 0.387 ms`;
+  - ready-use checks `2`, ready-before-use `0`, stream waits `2`;
+  - deadline misses `2`, exposed wait `0.013 ms`.
+- Comparison against the pre-C.3 lookahead run:
+  - wall `28552.8 -> 28077.2 ms`;
+  - decode0 `1784.5 -> 1754.8 ms`;
+  - throughput `4.483 -> 4.559 tok/s`;
+  - materialize host sync `2 -> 0`;
+  - async materialize `0 -> 2`.
+- Interpretation:
+  - C.3 removes the host-synchronous expert reload path;
+  - the two reloads still reached use before the copy had completed, so decode
+    had to wait on the CUDA event;
+  - the remaining bottleneck is still install/KVC/controller scheduling, not
+    H2D copy time itself.
+
+Known caveat:
+
+- These policy-eval rows still exit non-zero with
+  `INSTALL_IN_PROGRESS_NOT_COMPARABLE`; this is expected for the current
+  long-context CoResid experiment and does not invalidate the collected runtime
+  counters.

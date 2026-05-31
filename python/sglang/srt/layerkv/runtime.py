@@ -554,9 +554,16 @@ class LayerKVStats:
     expert_eviction_d2h_async_finalize_count: int = 0
     expert_copy_stream_launch_count: int = 0
     expert_copy_stream_wait_count: int = 0
+    expert_d2h_stream_launch_count: int = 0
+    expert_h2d_stream_launch_count: int = 0
+    expert_d2h_stream_busy_ms: float = 0.0
+    expert_h2d_stream_busy_ms: float = 0.0
     expert_ready_before_use_count: int = 0
     expert_ready_use_check_count: int = 0
     expert_ready_before_use_ratio: float = 1.0
+    expert_h2d_on_demand_async_count: int = 0
+    expert_h2d_prefetch_async_count: int = 0
+    expert_h2d_sync_count: int = 0
     expert_call_count_total: int = 0
     expert_prefill_call_count_total: int = 0
     expert_decode_call_count_total: int = 0
@@ -1639,6 +1646,8 @@ class LayerKVRuntime:
         self.unsupported_reason = ""
         self._wrapped_methods: Dict[str, Callable] = {}
         self._copy_stream: Optional[torch.cuda.Stream] = None
+        self._expert_d2h_stream: Optional[torch.cuda.Stream] = None
+        self._expert_h2d_stream: Optional[torch.cuda.Stream] = None
         self._runner: Any = None
         self._kv_pool: Any = None
         self._allocator: Any = None
@@ -2566,6 +2575,12 @@ class LayerKVRuntime:
         runner_device = getattr(runner, "device", None)
         if str(runner_device).startswith("cuda") or runner_device == "cuda":
             self._copy_stream = torch.cuda.Stream()
+            self._expert_d2h_stream = torch.cuda.Stream()
+            try:
+                _low_priority, high_priority = torch.cuda.Stream.priority_range()
+                self._expert_h2d_stream = torch.cuda.Stream(priority=high_priority)
+            except Exception:
+                self._expert_h2d_stream = torch.cuda.Stream()
         self._allocator = getattr(runner, "token_to_kv_pool_allocator", None)
         self._req_to_token_pool = getattr(runner, "req_to_token_pool", None)
         self._install_kv_pool_hooks(getattr(runner, "token_to_kv_pool", None))
@@ -6438,6 +6453,27 @@ class LayerKVRuntime:
         except Exception:
             return tensor.to("cpu", copy=True)
 
+    def _expert_d2h_copy_stream(self, device: torch.device) -> Any:
+        return (
+            self._expert_d2h_stream
+            or self._copy_stream
+            or torch.cuda.current_stream(device=device)
+        )
+
+    def _expert_h2d_copy_stream(self, device: torch.device) -> Any:
+        return (
+            self._expert_h2d_stream
+            or self._copy_stream
+            or torch.cuda.current_stream(device=device)
+        )
+
+    def _expert_h2d_async_enabled(self, state: _LayerKVExpertLayerState) -> bool:
+        return (
+            self._optimized_profile_enabled()
+            and state.device.type == "cuda"
+            and self._expert_h2d_stream is not None
+        )
+
     def _copy_expert_to_cpu_backing_no_account(
         self,
         module: Any,
@@ -6591,7 +6627,7 @@ class LayerKVRuntime:
         device = getattr(module, param_names[0]).data.device
         if device.type != "cuda":
             return -1
-        active_stream = self._copy_stream or torch.cuda.current_stream(device=device)
+        active_stream = self._expert_d2h_copy_stream(device)
         expert_ids = [int(expert_id) for expert_id in expert_ids]
         copied: Dict[int, Dict[str, torch.Tensor]] = {
             int(expert_id): {} for expert_id in expert_ids
@@ -6685,6 +6721,7 @@ class LayerKVRuntime:
         self.stats.expert_install_d2h_async_count += len(expert_ids)
         self.stats.expert_install_d2h_async_mb += copied_bytes / float(1024 * 1024)
         self.stats.expert_copy_stream_launch_count += 1
+        self.stats.expert_d2h_stream_launch_count += 1
         self.stats.layerkv_copy_event_record_count += 1
         return int(copied_bytes)
 
@@ -6819,9 +6856,7 @@ class LayerKVRuntime:
     ) -> bool:
         if not evicted or state.device.type != "cuda":
             return False
-        active_stream = self._copy_stream or torch.cuda.current_stream(
-            device=state.device
-        )
+        active_stream = self._expert_d2h_copy_stream(state.device)
         evicted_pairs = [
             (int(logical_id), int(slot_id)) for logical_id, slot_id in evicted
         ]
@@ -6881,6 +6916,7 @@ class LayerKVRuntime:
         self.stats.expert_eviction_d2h_batch_count += 1
         self.stats.expert_eviction_d2h_batched_count += len(evicted_pairs)
         self.stats.expert_eviction_d2h_batched_mb += copied_bytes / float(1024 * 1024)
+        self.stats.expert_d2h_stream_launch_count += 1
         return True
 
     def _finalize_expert_d2h_events(self, *, block: bool = False) -> None:
@@ -6900,6 +6936,7 @@ class LayerKVRuntime:
                         pending.start_event.elapsed_time(pending.ready_event)
                     )
                     self.stats.layerkv_copy_stream_busy_ms += elapsed
+                    self.stats.expert_d2h_stream_busy_ms += elapsed
                 except Exception:
                     pass
                 state = self._expert_layers.get(int(pending.layer_id))
@@ -7984,6 +8021,7 @@ class LayerKVRuntime:
                 elapsed = float(start.elapsed_time(end))
                 self.stats.expert_materialize_ms += elapsed
                 self.stats.layerkv_copy_stream_busy_ms += elapsed
+                self.stats.expert_h2d_stream_busy_ms += elapsed
                 state = self._expert_layers.get(int(pending.layer_id))
                 if state is not None:
                     for logical_id in pending.logical_ids:
@@ -8175,7 +8213,8 @@ class LayerKVRuntime:
                 self._copy_materialized_experts_batched(
                     state,
                     materialized,
-                    async_copy=(reason == "prefetch"),
+                    async_copy=self._expert_h2d_async_enabled(state),
+                    reason=reason,
                 )
                 self._trim_expert_backing_cache(state)
         finally:
@@ -8191,13 +8230,17 @@ class LayerKVRuntime:
         materialized: List[Tuple[int, int, Dict[str, torch.Tensor]]],
         *,
         async_copy: bool,
+        reason: str,
     ) -> None:
         if not materialized:
             return
+        descriptor_reason = (
+            f"materialize_{reason}_async" if async_copy else f"materialize_{reason}_sync"
+        )
         for logical_id, slot_id, source_params in materialized:
             self._record_expert_copy_descriptor(
                 direction="H2D",
-                reason="materialize_async" if async_copy else "materialize_sync",
+                reason=descriptor_reason,
                 layer_id=int(state.layer_id),
                 logical_id=int(logical_id),
                 src_slot=int(logical_id),
@@ -8212,7 +8255,7 @@ class LayerKVRuntime:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             active_stream = (
-                (self._copy_stream or torch.cuda.current_stream(device=state.device))
+                self._expert_h2d_copy_stream(state.device)
                 if async_copy
                 else torch.cuda.current_stream(device=state.device)
             )
@@ -8249,7 +8292,16 @@ class LayerKVRuntime:
                     elapsed = float(start.elapsed_time(end))
                     self.stats.expert_materialize_ms += elapsed
                     self.stats.layerkv_copy_stream_busy_ms += elapsed
+                    self.stats.expert_h2d_stream_busy_ms += elapsed
                     if async_copy:
+                        self.stats.expert_materialize_async_count += batch_size
+                        self.stats.expert_copy_stream_launch_count += 1
+                        self.stats.expert_h2d_stream_launch_count += 1
+                        self.stats.layerkv_copy_event_record_count += 1
+                        if reason == "prefetch":
+                            self.stats.expert_h2d_prefetch_async_count += batch_size
+                        else:
+                            self.stats.expert_h2d_on_demand_async_count += batch_size
                         for logical_id, slot_id, source_params in materialized:
                             group = self._get_or_create_resident_group(
                                 kind="expert",
@@ -8270,6 +8322,11 @@ class LayerKVRuntime:
                 elif async_copy:
                     self.stats.expert_materialize_async_count += batch_size
                     self.stats.expert_copy_stream_launch_count += 1
+                    self.stats.expert_h2d_stream_launch_count += 1
+                    if reason == "prefetch":
+                        self.stats.expert_h2d_prefetch_async_count += batch_size
+                    else:
+                        self.stats.expert_h2d_on_demand_async_count += batch_size
                     self.stats.layerkv_copy_event_record_count += 1
                     for logical_id, slot_id, source_params in materialized:
                         self._mark_expert_group_state(
@@ -8291,11 +8348,13 @@ class LayerKVRuntime:
                     )
                 else:
                     self.stats.expert_materialize_host_sync_count += batch_size
+                    self.stats.expert_h2d_sync_count += batch_size
                     self.stats.resident_group_recover_count += batch_size
             except Exception:
                 pass
         else:
             self.stats.expert_materialize_host_sync_count += batch_size
+            self.stats.expert_h2d_sync_count += batch_size
             self.stats.resident_group_recover_count += batch_size
 
     def _grow_expert_layer_slots(
