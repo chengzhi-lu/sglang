@@ -24,6 +24,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+try:
+    from sglang.jit_kernel.layerkv_expert_remap import layerkv_expert_remap
+except Exception:  # pragma: no cover - optional JIT helper.
+    layerkv_expert_remap = None
+
 
 @dataclasses.dataclass
 class LayerKVConfig:
@@ -418,6 +423,10 @@ class LayerKVStats:
     expert_topk_range_calibrated_count: int = 0
     expert_topk_range_fastpath_count: int = 0
     expert_topk_range_invalid_count: int = 0
+    expert_topk_gpu_remap_count: int = 0
+    expert_topk_gpu_remap_fallback_count: int = 0
+    expert_topk_gpu_remap_missing_count: int = 0
+    expert_topk_gpu_remap_error_count: int = 0
     expert_core_hook_count: int = 0
     expert_hotness_record_count: int = 0
     expert_hotness_sample_skip_count: int = 0
@@ -515,6 +524,17 @@ class LayerKVStats:
     expert_install_param_swap_ms: float = 0.0
     expert_install_hook_ms: float = 0.0
     expert_install_prebuild_submit_ms: float = 0.0
+    expert_install_prealloc_submit_ms: float = 0.0
+    expert_install_prealloc_ready_count: int = 0
+    expert_install_prealloc_reuse_count: int = 0
+    expert_install_prealloc_pending_count: int = 0
+    expert_install_prealloc_fallback_count: int = 0
+    expert_install_prealloc_wait_count: int = 0
+    expert_install_compact_pool_alloc_count: int = 0
+    expert_install_compact_pool_reuse_count: int = 0
+    expert_install_compact_pool_release_count: int = 0
+    expert_install_compact_pool_drop_count: int = 0
+    expert_install_compact_pool_bytes: int = 0
     expert_install_prebuild_ready_count: int = 0
     expert_install_prebuild_pending_count: int = 0
     expert_install_prebuild_wait_count: int = 0
@@ -1032,6 +1052,8 @@ class _LayerKVExpertInstallItem:
     backing_queued: bool = False
     pending_cpu_experts: Set[int] = dataclasses.field(default_factory=set)
     prebuilt_install: Optional[_LayerKVExpertInstallBuild] = None
+    preallocated_compact_params: Optional[Dict[str, torch.Tensor]] = None
+    prealloc_ready_event: Optional[Any] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1787,6 +1809,11 @@ class LayerKVRuntime:
         self.stats.expert_cpu_backing_pool_limit_bytes = int(
             self._expert_cpu_backing_pool_limit_bytes
         )
+        self._expert_compact_tensor_pool: Dict[
+            Tuple[str, torch.dtype, Tuple[int, ...]], List[torch.Tensor]
+        ] = {}
+        self._expert_compact_tensor_pool_bytes: int = 0
+        self._expert_topk_gpu_remap_disabled: bool = False
         self._expert_global_cpu_backing: Dict[
             Tuple[int, int], Dict[str, torch.Tensor]
         ] = {}
@@ -3252,6 +3279,14 @@ class LayerKVRuntime:
         else:
             expert_prefix_candidates = expert_candidates
         expert_prefix_table = self._build_expert_prefix_table(expert_prefix_candidates)
+        expert_layerwise_table = (
+            self._build_coresid_expert_layerwise_plan_table(
+                coresid_expert_plan_inputs
+            )
+            if self.config.policy == "coresid"
+            and coresid_expert_plan_inputs is not None
+            else None
+        )
         (
             kvc_layer_ids,
             kvc_max_tokens_per_layer,
@@ -3335,21 +3370,8 @@ class LayerKVRuntime:
                         materialize_cost,
                         capacities,
                         layer_costs,
-                    ) = self._lookup_expert_prefix_cost(
-                        key,
-                        expert_prefix_candidates,
-                        expert_prefix_table,
-                        base_capacities=(
-                            coresid_expert_plan_inputs[0]
-                            if coresid_expert_plan_inputs is not None
-                            else None
-                        ),
-                        expert_bytes_by_layer=(
-                            coresid_expert_plan_inputs[2]
-                            if coresid_expert_plan_inputs is not None
-                            else None
-                        ),
-                        include_churn_cost=True,
+                    ) = self._lookup_coresid_expert_layerwise_cost(
+                        key, expert_layerwise_table
                     )
                     self.stats.planner_estimated_expert_churn_count = churn_count
                     self.stats.planner_estimated_expert_churn_mb = churn_mb
@@ -4244,12 +4266,50 @@ class LayerKVRuntime:
             age = max(0, int(self._decode_step) - int(state.lru[int(expert_id)]))
             if age < 64:
                 cost += 0.05 * (64.0 - float(age)) / 64.0
+        cost += self._expert_candidate_transition_offload_cost(
+            layer_id, expert_id, expert_bytes, state
+        )
         return (
             float(cost),
             float(expected_calls),
             float(backing_miss_cost),
             float(materialize_cost),
         )
+
+    def _expert_candidate_transition_offload_cost(
+        self,
+        layer_id: int,
+        expert_id: int,
+        expert_bytes: int,
+        state: Optional[_LayerKVExpertLayerState],
+    ) -> float:
+        if state is None or int(expert_id) not in state.logical_to_slot:
+            return 0.0
+        key = (int(layer_id), int(expert_id))
+        if int(expert_id) in state.cpu_params or key in self._pending_expert_d2h_by_key:
+            return 0.0
+        mb = float(expert_bytes) / float(1024 * 1024)
+        copied_mb = (
+            float(self.stats.expert_install_d2h_async_mb)
+            + float(self.stats.expert_eviction_d2h_batched_mb)
+            + float(self.stats.expert_eviction_d2h_async_mb)
+        )
+        if copied_mb > 0.0 and self.stats.profile_copy_expert_to_cpu_ms > 0.0:
+            d2h_ms = (
+                float(self.stats.profile_copy_expert_to_cpu_ms)
+                / max(1e-6, copied_mb)
+                * mb
+            )
+        else:
+            d2h_ms = 0.03 + 0.10 * mb
+        batched_mb = float(self.stats.expert_eviction_d2h_batched_mb)
+        if copied_mb > 0.0:
+            exposed_ratio = batched_mb / max(1e-6, copied_mb)
+            exposed_ratio = max(0.05, min(0.75, exposed_ratio))
+        else:
+            exposed_ratio = 0.25
+        control_ms = 0.003
+        return float(control_ms + exposed_ratio * d2h_ms)
 
     def _coresid_expert_candidate_cost(
         self,
@@ -4352,6 +4412,226 @@ class LayerKVRuntime:
         candidates.sort(key=lambda item: (item[0], item[2], item[3]))
         self.stats.planner_dp_expert_candidate_count = len(candidates)
         return capacities, min_capacities, expert_bytes_by_layer, candidates
+
+    def _build_coresid_expert_layerwise_plan_table(
+        self,
+        precomputed: Optional[
+            Tuple[
+                Dict[int, int],
+                Dict[int, int],
+                Dict[int, int],
+                List[Tuple[float, int, int, int, float, float, float]],
+            ]
+        ],
+    ) -> Optional[Dict[str, Any]]:
+        if precomputed is None:
+            return None
+        base_capacities, min_capacities, _expert_bytes_by_layer, candidates = (
+            precomputed
+        )
+        if not base_capacities:
+            return None
+        candidates_by_layer: Dict[
+            int, List[Tuple[float, int, int, int, float, float, float]]
+        ] = {}
+        for candidate in candidates:
+            layer_id = int(candidate[2])
+            candidates_by_layer.setdefault(layer_id, []).append(candidate)
+        layer_ids = sorted(int(layer_id) for layer_id in base_capacities)
+        states: Dict[
+            int,
+            Tuple[
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                Tuple[int, ...],
+                Tuple[float, ...],
+            ],
+        ] = {0: (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, (), ())}
+        for layer_id in layer_ids:
+            full_capacity = int(base_capacities[layer_id])
+            min_capacity = int(min_capacities.get(layer_id, full_capacity))
+            layer_candidates = sorted(
+                candidates_by_layer.get(layer_id, []),
+                key=lambda item: (float(item[0]), int(item[3])),
+            )
+            max_evict = max(0, full_capacity - min_capacity)
+            points: List[
+                Tuple[int, float, float, float, float, float, int, float]
+            ] = [(0, 0.0, 0.0, 0.0, 0.0, 0.0, full_capacity, 0.0)]
+            reclaimed = 0
+            base_cost = 0.0
+            expected_calls = 0.0
+            churn_mb = 0.0
+            backing_cost = 0.0
+            materialize_cost = 0.0
+            for evicted_count, candidate in enumerate(
+                layer_candidates[:max_evict], start=1
+            ):
+                (
+                    candidate_cost,
+                    expert_bytes,
+                    _layer_id,
+                    _expert_id,
+                    candidate_expected_calls,
+                    candidate_backing_cost,
+                    candidate_materialize_cost,
+                ) = candidate
+                reclaimed += int(expert_bytes)
+                base_cost += float(candidate_cost)
+                expected_calls += float(candidate_expected_calls)
+                churn_mb += (
+                    float(candidate_expected_calls)
+                    * float(expert_bytes)
+                    / float(1024 * 1024)
+                )
+                backing_cost += float(candidate_backing_cost)
+                materialize_cost += float(candidate_materialize_cost)
+                install_mb = float(reclaimed) / float(1024 * 1024)
+                point_cost = base_cost + 0.15 * install_mb + 0.05 * churn_mb
+                points.append(
+                    (
+                        int(reclaimed),
+                        float(point_cost),
+                        float(expected_calls),
+                        float(churn_mb),
+                        float(install_mb),
+                        float(backing_cost),
+                        max(0, full_capacity - evicted_count),
+                        float(materialize_cost),
+                    )
+                )
+            next_states: Dict[
+                int,
+                Tuple[
+                    float,
+                    float,
+                    float,
+                    float,
+                    float,
+                    float,
+                    Tuple[int, ...],
+                    Tuple[float, ...],
+                ],
+            ] = {}
+            for prev_bytes, state in states.items():
+                (
+                    prev_cost,
+                    prev_calls,
+                    prev_churn_mb,
+                    prev_install_mb,
+                    prev_backing,
+                    prev_materialize,
+                    prev_caps,
+                    prev_layer_costs,
+                ) = state
+                for (
+                    point_bytes,
+                    point_cost,
+                    point_calls,
+                    point_churn_mb,
+                    point_install_mb,
+                    point_backing,
+                    point_capacity,
+                    point_materialize,
+                ) in points:
+                    total_bytes = int(prev_bytes) + int(point_bytes)
+                    candidate_state = (
+                        float(prev_cost + point_cost),
+                        float(prev_calls + point_calls),
+                        float(prev_churn_mb + point_churn_mb),
+                        float(prev_install_mb + point_install_mb),
+                        float(prev_backing + point_backing),
+                        float(prev_materialize + point_materialize),
+                        prev_caps + (int(point_capacity),),
+                        prev_layer_costs + (float(point_cost),),
+                    )
+                    existing = next_states.get(total_bytes)
+                    if existing is None or candidate_state[0] < existing[0]:
+                        next_states[total_bytes] = candidate_state
+            pruned: Dict[
+                int,
+                Tuple[
+                    float,
+                    float,
+                    float,
+                    float,
+                    float,
+                    float,
+                    Tuple[int, ...],
+                    Tuple[float, ...],
+                ],
+            ] = {}
+            best_cost = float("inf")
+            for total_bytes in sorted(next_states, reverse=True):
+                state = next_states[total_bytes]
+                if state[0] < best_cost - 1e-12:
+                    pruned[total_bytes] = state
+                    best_cost = state[0]
+            states = pruned
+        sorted_bytes = sorted(states)
+        sorted_states = [states[total_bytes] for total_bytes in sorted_bytes]
+        suffix_best: List[int] = [0 for _ in sorted_bytes]
+        best_idx = len(sorted_bytes) - 1
+        best_cost = float("inf")
+        for idx in range(len(sorted_bytes) - 1, -1, -1):
+            cost = float(sorted_states[idx][0])
+            if cost <= best_cost:
+                best_cost = cost
+                best_idx = idx
+            suffix_best[idx] = best_idx
+        return {
+            "layer_ids": layer_ids,
+            "bytes": sorted_bytes,
+            "states": sorted_states,
+            "suffix_best": suffix_best,
+        }
+
+    def _lookup_coresid_expert_layerwise_cost(
+        self, reclaim_mb: float, table: Optional[Dict[str, Any]]
+    ) -> Tuple[
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        Dict[int, int],
+        Dict[int, float],
+    ]:
+        if reclaim_mb <= 0.0:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {}, {}
+        if not table:
+            return 1.0e30, 0.0, 0.0, 0.0, 0.0, 0.0, {}, {}
+        target_bytes = int(max(0.0, float(reclaim_mb)) * 1024 * 1024)
+        sorted_bytes = table.get("bytes", [])
+        pos = bisect.bisect_left(sorted_bytes, target_bytes)
+        if pos >= len(sorted_bytes):
+            return 1.0e30, 0.0, 0.0, 0.0, 0.0, 0.0, {}, {}
+        best_idx = int(table["suffix_best"][pos])
+        state = table["states"][best_idx]
+        layer_ids = [int(layer_id) for layer_id in table["layer_ids"]]
+        capacities = {
+            int(layer_id): int(capacity)
+            for layer_id, capacity in zip(layer_ids, state[6])
+        }
+        layer_costs = {
+            int(layer_id): float(cost)
+            for layer_id, cost in zip(layer_ids, state[7])
+        }
+        return (
+            float(state[0]),
+            float(state[1]),
+            float(state[2]),
+            float(state[3]),
+            float(state[4]),
+            float(state[5]),
+            capacities,
+            layer_costs,
+        )
 
     def _build_expert_prefix_table(
         self,
@@ -5046,7 +5326,9 @@ class LayerKVRuntime:
                 float(target_mb), float(self._planned_expert_target_mb)
             )
             precomputed = self._build_coresid_expert_plan_inputs(forward_batch)
-            prefix_table = self._build_expert_prefix_table(precomputed[3])
+            layerwise_table = self._build_coresid_expert_layerwise_plan_table(
+                precomputed
+            )
             (
                 _cost,
                 churn_count,
@@ -5056,13 +5338,8 @@ class LayerKVRuntime:
                 materialize_cost,
                 capacities,
                 layer_costs,
-            ) = self._lookup_expert_prefix_cost(
-                plan_target_mb,
-                precomputed[3],
-                prefix_table,
-                base_capacities=precomputed[0],
-                expert_bytes_by_layer=precomputed[2],
-                include_churn_cost=True,
+            ) = self._lookup_coresid_expert_layerwise_cost(
+                plan_target_mb, layerwise_table
             )
             planned_capacities = {
                 int(layer_id): int(capacity)
@@ -5806,7 +6083,7 @@ class LayerKVRuntime:
         self.stats.expert_install_d2h_effective_budget_mb = float(budget_mb)
         return float(budget_mb)
 
-    def _prepare_expert_install_d2h_lookahead(self) -> None:
+    def _prepare_expert_install_d2h_lookahead(self, *, prealloc: bool = True) -> None:
         lookahead = max(0, int(self.config.expert_copy_lookahead_layers))
         if lookahead <= 0 or not self._expert_install_queue:
             return
@@ -5814,6 +6091,8 @@ class LayerKVRuntime:
         for item in self._expert_install_queue[:lookahead]:
             before = bool(item.backing_queued)
             self._prepare_expert_install_item_backing(item)
+            if prealloc:
+                self._prealloc_expert_install_item_compact(item)
             if not before and item.backing_queued:
                 prepared += 1
         if prepared:
@@ -6018,7 +6297,7 @@ class LayerKVRuntime:
         self.stats.expert_install_remaining_steps = int(remaining_steps)
         self.stats.expert_install_effective_layers_this_step = int(max_layers)
         self.stats.expert_install_effective_budget_mb_this_step = float(max_mb)
-        self._prepare_expert_install_d2h_lookahead()
+        self._prepare_expert_install_d2h_lookahead(prealloc=False)
         self._expert_install_state = "installing_slots"
         install_profile = (
             "profile_apply_prepared_expert_plan_ms"
@@ -6054,7 +6333,13 @@ class LayerKVRuntime:
                             initial_resident=item.initial_resident,
                             prepared_cpu_params=item.prepared_cpu_params,
                             async_copy=True,
+                            preallocated_compact_params=(
+                                item.preallocated_compact_params
+                            ),
+                            prealloc_ready_event=item.prealloc_ready_event,
                         )
+                        item.preallocated_compact_params = None
+                        item.prealloc_ready_event = None
                     if (
                         item.prebuilt_install.ready_event is not None
                         and not item.prebuilt_install.ready_event.query()
@@ -6242,6 +6527,103 @@ class LayerKVRuntime:
         except Exception:
             return False
 
+    def _expert_compact_pool_key(
+        self, tensor: torch.Tensor
+    ) -> Tuple[str, torch.dtype, Tuple[int, ...]]:
+        return (str(tensor.device), tensor.dtype, tuple(int(x) for x in tensor.shape))
+
+    def _alloc_expert_compact_tensor(
+        self, old: torch.Tensor, slot_capacity: int
+    ) -> torch.Tensor:
+        shape = (int(slot_capacity),) + tuple(old.shape[1:])
+        key = (str(old.device), old.dtype, tuple(int(x) for x in shape))
+        pool = self._expert_compact_tensor_pool.get(key)
+        if pool:
+            tensor = pool.pop()
+            self._expert_compact_tensor_pool_bytes = max(
+                0, self._expert_compact_tensor_pool_bytes - int(tensor.nbytes)
+            )
+            self.stats.expert_install_compact_pool_reuse_count += 1
+            self.stats.expert_install_compact_pool_bytes = int(
+                self._expert_compact_tensor_pool_bytes
+            )
+            return tensor
+        tensor = torch.empty(shape, dtype=old.dtype, device=old.device)
+        self.stats.expert_install_compact_pool_alloc_count += 1
+        return tensor
+
+    def _release_expert_compact_tensor(self, tensor: torch.Tensor) -> None:
+        if tensor is None:
+            return
+        try:
+            key = self._expert_compact_pool_key(tensor)
+            self._expert_compact_tensor_pool.setdefault(key, []).append(tensor)
+            self._expert_compact_tensor_pool_bytes += int(tensor.nbytes)
+            self.stats.expert_install_compact_pool_release_count += 1
+            self.stats.expert_install_compact_pool_bytes = int(
+                self._expert_compact_tensor_pool_bytes
+            )
+        except Exception:
+            self.stats.expert_install_compact_pool_drop_count += 1
+
+    def _prealloc_expert_install_item_compact(
+        self, item: _LayerKVExpertInstallItem
+    ) -> bool:
+        if item.preallocated_compact_params is not None:
+            event = item.prealloc_ready_event
+            if event is not None and not event.query():
+                self.stats.expert_install_prealloc_pending_count += 1
+                return False
+            self.stats.expert_install_prealloc_ready_count += 1
+            return True
+        if item.prebuilt_install is not None:
+            return True
+        t0 = time.perf_counter()
+        compact_params: Dict[str, torch.Tensor] = {}
+        active_stream = None
+        ready_event = None
+        try:
+            param_names = self._expert_param_names(item.module)
+            if not param_names:
+                return False
+            device = getattr(item.module, param_names[0]).data.device
+            if device.type == "cuda":
+                active_stream = self._expert_install_copy_stream(device)
+                ready_event = torch.cuda.Event(enable_timing=False)
+            with torch.no_grad():
+                if active_stream is not None:
+                    with torch.cuda.stream(active_stream):
+                        for name in param_names:
+                            old = getattr(item.module, name).data
+                            compact_params[name] = self._alloc_expert_compact_tensor(
+                                old, item.slot_capacity
+                            )
+                        ready_event.record(active_stream)
+                else:
+                    for name in param_names:
+                        old = getattr(item.module, name).data
+                        compact_params[name] = self._alloc_expert_compact_tensor(
+                            old, item.slot_capacity
+                        )
+            item.preallocated_compact_params = compact_params
+            item.prealloc_ready_event = ready_event
+            if ready_event is not None and not ready_event.query():
+                self.stats.expert_install_prealloc_pending_count += 1
+                return False
+            self.stats.expert_install_prealloc_ready_count += 1
+            return True
+        except Exception:
+            for tensor in compact_params.values():
+                self._release_expert_compact_tensor(tensor)
+            item.preallocated_compact_params = None
+            item.prealloc_ready_event = None
+            self.stats.expert_install_prealloc_fallback_count += 1
+            return False
+        finally:
+            self.stats.expert_install_prealloc_submit_ms += (
+                time.perf_counter() - t0
+            ) * 1000.0
+
     def _build_expert_layer_slot_install(
         self,
         module: Any,
@@ -6251,6 +6633,8 @@ class LayerKVRuntime:
         prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
         *,
         async_copy: bool = True,
+        preallocated_compact_params: Optional[Dict[str, torch.Tensor]] = None,
+        prealloc_ready_event: Optional[Any] = None,
     ) -> _LayerKVExpertInstallBuild:
         param_names = self._expert_param_names(module)
         full_num_experts = int(module.w13_weight.data.shape[0])
@@ -6336,6 +6720,9 @@ class LayerKVRuntime:
             active_stream = self._expert_install_copy_stream(device)
             start_event = torch.cuda.Event(enable_timing=True)
             ready_event = torch.cuda.Event(enable_timing=True)
+        if prealloc_ready_event is not None and not prealloc_ready_event.query():
+            self.stats.expert_install_prealloc_wait_count += 1
+            prealloc_ready_event.synchronize()
 
         t_submit = time.perf_counter()
         with torch.no_grad():
@@ -6345,15 +6732,19 @@ class LayerKVRuntime:
                     for name in param_names:
                         param = getattr(module, name)
                         old = param.data
-                        t_alloc = time.perf_counter()
-                        new_data = torch.empty(
-                            (slot_capacity,) + tuple(old.shape[1:]),
-                            dtype=old.dtype,
-                            device=old.device,
-                        )
-                        self.stats.expert_install_weight_alloc_ms += (
-                            time.perf_counter() - t_alloc
-                        ) * 1000.0
+                        new_data = None
+                        if preallocated_compact_params is not None:
+                            new_data = preallocated_compact_params.pop(name, None)
+                            if new_data is not None:
+                                self.stats.expert_install_prealloc_reuse_count += 1
+                        if new_data is None:
+                            t_alloc = time.perf_counter()
+                            new_data = self._alloc_expert_compact_tensor(
+                                old, slot_capacity
+                            )
+                            self.stats.expert_install_weight_alloc_ms += (
+                                time.perf_counter() - t_alloc
+                            ) * 1000.0
                         for slot_id, expert_id in enumerate(initial_resident):
                             src = old[int(expert_id)].detach()
                             new_data[int(slot_id)].copy_(src, non_blocking=True)
@@ -6364,18 +6755,26 @@ class LayerKVRuntime:
                 for name in param_names:
                     param = getattr(module, name)
                     old = param.data
-                    t_alloc = time.perf_counter()
-                    new_data = torch.empty(
-                        (slot_capacity,) + tuple(old.shape[1:]),
-                        dtype=old.dtype,
-                        device=old.device,
-                    )
-                    self.stats.expert_install_weight_alloc_ms += (
-                        time.perf_counter() - t_alloc
-                    ) * 1000.0
+                    new_data = None
+                    if preallocated_compact_params is not None:
+                        new_data = preallocated_compact_params.pop(name, None)
+                        if new_data is not None:
+                            self.stats.expert_install_prealloc_reuse_count += 1
+                    if new_data is None:
+                        t_alloc = time.perf_counter()
+                        new_data = self._alloc_expert_compact_tensor(
+                            old, slot_capacity
+                        )
+                        self.stats.expert_install_weight_alloc_ms += (
+                            time.perf_counter() - t_alloc
+                        ) * 1000.0
                     for slot_id, expert_id in enumerate(initial_resident):
                         new_data[int(slot_id)].copy_(old[int(expert_id)])
                     compact_params[name] = new_data
+        if preallocated_compact_params:
+            for tensor in preallocated_compact_params.values():
+                self._release_expert_compact_tensor(tensor)
+            preallocated_compact_params.clear()
         self.stats.expert_install_prebuild_submit_ms += (
             time.perf_counter() - t_submit
         ) * 1000.0
@@ -7652,11 +8051,11 @@ class LayerKVRuntime:
             top_k = int(getattr(state.module.moe_runner_config, "top_k", 1) or 1)
         if int(state.slot_capacity) >= max(1, min(int(state.full_num_experts), top_k)):
             return False
-        if (
-            self._optimized_profile_enabled()
-            and self._expert_plan_applied
-            and state.remap_tensor is not None
-        ):
+        topk_fastpath_enabled = self._optimized_profile_enabled() and (
+            self._expert_plan_applied
+            or self._expert_install_state in {"installing_slots", "queued"}
+        )
+        if topk_fastpath_enabled and state.remap_tensor is not None:
             valid = (topk_ids >= 0) & (topk_ids < state.full_num_experts)
             if not bool(valid.any().item()):
                 return False
@@ -7804,6 +8203,49 @@ class LayerKVRuntime:
             self.stats.expert_guard_pass = False
             self.stats.expert_guard_reason = reason
             raise RuntimeError(reason)
+        topk_fastpath_enabled = self._optimized_profile_enabled() and (
+            self._expert_plan_applied
+            or self._expert_install_state in {"installing_slots", "queued"}
+        )
+        if (
+            topk_fastpath_enabled
+            and fast_in_range
+        ):
+            gpu_result = self._try_gpu_expert_topk_remap(state, topk_output, remap)
+            if gpu_result is not None:
+                rewritten_topk, missing_logical_ids = gpu_result
+                if not missing_logical_ids:
+                    self.stats.expert_topk_rewrite_count += 1
+                    return rewritten_topk
+                logical_ids = self._unique_expert_ids_and_record_hotness(
+                    state,
+                    topk_ids,
+                    record_hotness=not self._expert_plan_applied,
+                )
+                if len(logical_ids) > state.slot_capacity:
+                    self._grow_expert_layer_slots(state, len(logical_ids))
+                self._materialize_experts(state, logical_ids, reason="on_demand")
+                self._wait_for_expert_logical_ids_ready(state, logical_ids)
+                mapped_ids = remap[safe_ids]
+                missing = mapped_ids < 0
+                if bool(missing.any().item()):
+                    missing_ids = self._unique_expert_ids(
+                        topk_ids, state.full_num_experts
+                    )
+                    reason = (
+                        f"layer {state.layer_id} expert remap still missing after "
+                        f"gpu materialize: logical_ids={missing_ids[:8]}"
+                    )
+                    self.stats.expert_guard_pass = False
+                    self.stats.expert_guard_reason = reason
+                    self.stats.comparable = False
+                    self.stats.comparability_reason = reason
+                    raise RuntimeError(reason)
+                if self._current_forward_mode == "decode":
+                    state.last_decode_logical_ids = logical_ids
+                    self._expert_prefetch_dirty_layers.add(int(state.layer_id))
+                self.stats.expert_topk_rewrite_count += 1
+                return topk_output._replace(topk_ids=mapped_ids.to(topk_ids.dtype))
         mapped_ids = remap[safe_ids]
         if (
             not fast_in_range
@@ -7818,7 +8260,7 @@ class LayerKVRuntime:
             else:
                 state.topk_ids_in_range_calibrated = True
                 self.stats.expert_topk_range_calibrated_count += 1
-        if self._optimized_profile_enabled() and self._expert_plan_applied:
+        if topk_fastpath_enabled:
             # Common pressure steady state: one or a few cold experts are
             # offloaded, but this token routes only to resident experts. Avoid
             # CPU unique/materialize work and only rewrite logical ids to slots.
@@ -7870,6 +8312,46 @@ class LayerKVRuntime:
             rewritten_ids = torch.where(valid, mapped_ids.to(topk_ids.dtype), topk_ids)
         self.stats.expert_topk_rewrite_count += 1
         return topk_output._replace(topk_ids=rewritten_ids)
+
+    def _try_gpu_expert_topk_remap(
+        self,
+        state: _LayerKVExpertLayerState,
+        topk_output: Any,
+        remap: torch.Tensor,
+    ) -> Optional[Tuple[Any, List[int]]]:
+        if (
+            self._expert_topk_gpu_remap_disabled
+            or layerkv_expert_remap is None
+            or remap.device.type != "cuda"
+        ):
+            self.stats.expert_topk_gpu_remap_fallback_count += 1
+            return None
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        if (
+            topk_ids is None
+            or topk_ids.device.type != "cuda"
+            or topk_ids.dtype not in (torch.int32, torch.int64)
+            or topk_ids.numel() == 0
+        ):
+            self.stats.expert_topk_gpu_remap_fallback_count += 1
+            return None
+        try:
+            rewritten_ids, missing_ids, missing_count = layerkv_expert_remap(
+                topk_ids, remap, state.full_num_experts
+            )
+            missing_n = int(missing_count.item())
+            self.stats.expert_topk_gpu_remap_count += 1
+            if missing_n <= 0:
+                return topk_output._replace(topk_ids=rewritten_ids), []
+            self.stats.expert_topk_gpu_remap_missing_count += int(missing_n)
+            ids = missing_ids[:missing_n].detach().cpu().tolist()
+            missing_logical_ids = list(dict.fromkeys(int(x) for x in ids))
+            return topk_output._replace(topk_ids=rewritten_ids), missing_logical_ids
+        except Exception:
+            self._expert_topk_gpu_remap_disabled = True
+            self.stats.expert_topk_gpu_remap_error_count += 1
+            self.stats.expert_topk_gpu_remap_fallback_count += 1
+            return None
 
     def _record_expert_hotness(
         self, state: _LayerKVExpertLayerState, topk_ids: torch.Tensor
@@ -14325,6 +14807,7 @@ class LayerKVRuntime:
             else:
                 self._maybe_prepare_expert_plan_after_decode(forward_batch)
                 self._submit_expert_install_d2h_budgeted()
+                self._prepare_expert_install_d2h_lookahead(prealloc=True)
             if (
                 self._pending_kvc_evict_events
                 or self._pending_kvc_reload_events
