@@ -631,3 +631,74 @@ Interpretation:
   `1098 MiB` in Stage B to `405-513 MiB` in C.2. This means the next expert-side
   work should either add an idle/prefill drain mode or tune budget by remaining
   decode horizon, rather than blindly raising the per-step budget.
+
+## Stage C.2.1/C.2.2 Progress
+
+Recorded: 2026-05-31T09:45:00Z
+
+Implemented after C.2 commit `05ad7980e`:
+
+- Optional force-drain experiment:
+  - flag: `--layerkv-expert-copy-force-drain`;
+  - blocks after expert plan creation to drain install backing D2H and slot
+    install work;
+  - intended only for reclaim/blocking upper-bound experiments, not default.
+- Horizon-aware expert D2H copy budget:
+  - reuses `--layerkv-expert-install-target-steps`;
+  - computes queued D2H bytes over remaining target steps;
+  - raises the effective per-step copy budget above
+    `--layerkv-expert-copy-budget-mb` when needed;
+  - optional cap: `--layerkv-expert-copy-max-budget-mb`, where `0` means no cap.
+- Optional install D2H lookahead:
+  - flag: `--layerkv-expert-copy-lookahead-layers`;
+  - default `0` to preserve the low-latency C.2 behavior;
+  - when positive, later install items can enqueue backing D2H descriptors while
+    earlier layers are still waiting;
+  - physical slot shrink/install remains in original queue order.
+- New CSV/stats:
+  - `expert_install_d2h_effective_budget_mb`;
+  - `expert_install_d2h_max_budget_mb`;
+  - `expert_install_d2h_lookahead_layers`;
+  - `expert_install_d2h_lookahead_queue_count`;
+  - `expert_install_d2h_dynamic_budget_count`;
+  - `expert_install_d2h_force_drain_count`;
+  - `expert_install_d2h_force_drain_ms`.
+
+Validation:
+
+- `python -m py_compile` passed.
+- `git diff --check` passed.
+- `PYTHONNOUSERSITE=1 scripts/layerkv_smoke.py` passed.
+
+WildChat spot checks:
+
+- Dynamic budget without lookahead:
+  - command added `--expert-install-target-steps 16
+    --expert-copy-max-budget-mb 128`;
+  - output `/data/wenyan/tmp/layerkv_stage_c2_dynamic_wildchat_coresid`;
+  - completed layers `10`, reclaim `747 MiB`;
+  - wall `26381.2 ms`, decode0 `1648.8 ms`, throughput `4.852 tok/s`;
+  - install blocking `395.2 ms`;
+  - conclusion: better reclaim than fixed 64 MiB but still descriptor-starved,
+    because only the queue head was generating D2H work.
+- Dynamic budget with lookahead `4`:
+  - command added `--expert-copy-lookahead-layers 4`;
+  - output
+    `/data/wenyan/tmp/layerkv_stage_c2_dynamic_lookahead_wildchat_coresid`;
+  - completed layers `14`, reclaim `981 MiB`;
+  - wall `28552.8 ms`, decode0 `1784.5 ms`, throughput `4.483 tok/s`;
+  - install blocking `261.3 ms`;
+  - D2H queued/submitted/finalized `145/134/119`;
+  - lookahead queued `17` layer backings;
+  - conclusion: lookahead fixes descriptor starvation and nearly restores Stage
+    B reclaim, but the extra copy traffic hurts latency. Keep it opt-in until a
+    pressure-aware trigger is added.
+
+Current recommendation:
+
+- Keep default C.2 behavior focused on latency: lookahead `0`, copy budget
+  `64 MiB`.
+- Use `--expert-install-target-steps 16 --expert-copy-max-budget-mb 128
+  --expert-copy-lookahead-layers 4` only as a reclaim-pressure experiment.
+- Next optimization should be pressure-aware lookahead/drain, not unconditional
+  lookahead.

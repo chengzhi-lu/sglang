@@ -622,6 +622,9 @@ def layerkv_flags(
     expert_install_target_steps: int = 0,
     expert_copy_budget_mb: float = 64.0,
     expert_copy_chunk_mb: float = 128.0,
+    expert_copy_max_budget_mb: float = 0.0,
+    expert_copy_lookahead_layers: int = 0,
+    expert_copy_force_drain: bool = False,
 ) -> List[str]:
     flags = [
         "--enable-layerkv",
@@ -660,8 +663,14 @@ def layerkv_flags(
             str(expert_copy_budget_mb),
             "--layerkv-expert-copy-chunk-mb",
             str(expert_copy_chunk_mb),
+            "--layerkv-expert-copy-max-budget-mb",
+            str(expert_copy_max_budget_mb),
+            "--layerkv-expert-copy-lookahead-layers",
+            str(expert_copy_lookahead_layers),
         ]
     )
+    if expert_copy_force_drain:
+        flags.append("--layerkv-expert-copy-force-drain")
     if reclaim_limit_mb is not None:
         flags.extend(["--layerkv-reclaim-limit-mb", str(reclaim_limit_mb)])
     if dynamic_pressure_from_kvc:

@@ -247,7 +247,14 @@ CSV_FIELDS = [
     "expert_install_d2h_queue_length",
     "expert_install_d2h_submit_step_count",
     "expert_install_d2h_budget_mb",
+    "expert_install_d2h_effective_budget_mb",
+    "expert_install_d2h_max_budget_mb",
     "expert_install_d2h_chunk_mb",
+    "expert_install_d2h_lookahead_layers",
+    "expert_install_d2h_lookahead_queue_count",
+    "expert_install_d2h_dynamic_budget_count",
+    "expert_install_d2h_force_drain_count",
+    "expert_install_d2h_force_drain_ms",
     "expert_lazy_backing_enabled",
     "expert_lazy_backing_skipped_count",
     "expert_lazy_backing_skipped_mb",
@@ -470,6 +477,9 @@ def policy_command(
         expert_install_target_steps=args.expert_install_target_steps,
         expert_copy_budget_mb=args.expert_copy_budget_mb,
         expert_copy_chunk_mb=args.expert_copy_chunk_mb,
+        expert_copy_max_budget_mb=args.expert_copy_max_budget_mb,
+        expert_copy_lookahead_layers=args.expert_copy_lookahead_layers,
+        expert_copy_force_drain=args.expert_copy_force_drain,
     )
 
 
@@ -678,6 +688,9 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int) -> List
             expert_install_target_steps=args.expert_install_target_steps,
             expert_copy_budget_mb=args.expert_copy_budget_mb,
             expert_copy_chunk_mb=args.expert_copy_chunk_mb,
+            expert_copy_max_budget_mb=args.expert_copy_max_budget_mb,
+            expert_copy_lookahead_layers=args.expert_copy_lookahead_layers,
+            expert_copy_force_drain=args.expert_copy_force_drain,
         )
     )
     return cmd
@@ -1143,6 +1156,9 @@ def main() -> int:
     parser.add_argument("--expert-install-target-steps", type=int, default=0)
     parser.add_argument("--expert-copy-budget-mb", type=float, default=64.0)
     parser.add_argument("--expert-copy-chunk-mb", type=float, default=128.0)
+    parser.add_argument("--expert-copy-max-budget-mb", type=float, default=0.0)
+    parser.add_argument("--expert-copy-lookahead-layers", type=int, default=0)
+    parser.add_argument("--expert-copy-force-drain", action="store_true")
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--timeout-s", type=int, default=1200)

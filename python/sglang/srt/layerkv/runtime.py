@@ -50,6 +50,9 @@ class LayerKVConfig:
     expert_install_target_steps: int = 0
     expert_copy_budget_mb: float = 64.0
     expert_copy_chunk_mb: float = 128.0
+    expert_copy_max_budget_mb: float = 0.0
+    expert_copy_lookahead_layers: int = 0
+    expert_copy_force_drain: bool = False
     worker_role: str = "standalone"
 
     @classmethod
@@ -144,6 +147,20 @@ class LayerKVConfig:
                     getattr(server_args, "layerkv_expert_copy_chunk_mb", 128.0)
                     or 128.0
                 ),
+            ),
+            expert_copy_max_budget_mb=max(
+                0.0,
+                float(
+                    getattr(server_args, "layerkv_expert_copy_max_budget_mb", 0.0)
+                    or 0.0
+                ),
+            ),
+            expert_copy_lookahead_layers=max(
+                0,
+                int(getattr(server_args, "layerkv_expert_copy_lookahead_layers", 0)),
+            ),
+            expert_copy_force_drain=bool(
+                getattr(server_args, "layerkv_expert_copy_force_drain", False)
             ),
             worker_role=worker_role,
         )
@@ -493,7 +510,14 @@ class LayerKVStats:
     expert_install_d2h_queue_length: int = 0
     expert_install_d2h_submit_step_count: int = 0
     expert_install_d2h_budget_mb: float = 0.0
+    expert_install_d2h_effective_budget_mb: float = 0.0
+    expert_install_d2h_max_budget_mb: float = 0.0
     expert_install_d2h_chunk_mb: float = 0.0
+    expert_install_d2h_lookahead_layers: int = 0
+    expert_install_d2h_lookahead_queue_count: int = 0
+    expert_install_d2h_dynamic_budget_count: int = 0
+    expert_install_d2h_force_drain_count: int = 0
+    expert_install_d2h_force_drain_ms: float = 0.0
     expert_lazy_backing_enabled: bool = True
     expert_lazy_backing_skipped_count: int = 0
     expert_lazy_backing_skipped_mb: float = 0.0
@@ -5544,8 +5568,18 @@ class LayerKVRuntime:
         self.stats.expert_install_d2h_budget_mb = float(
             self.config.expert_copy_budget_mb
         )
+        if queued_install_d2h <= 0:
+            self.stats.expert_install_d2h_effective_budget_mb = float(
+                self.config.expert_copy_budget_mb
+            )
+        self.stats.expert_install_d2h_max_budget_mb = float(
+            self.config.expert_copy_max_budget_mb
+        )
         self.stats.expert_install_d2h_chunk_mb = float(
             self.config.expert_copy_chunk_mb
+        )
+        self.stats.expert_install_d2h_lookahead_layers = int(
+            self.config.expert_copy_lookahead_layers
         )
         self.stats.expert_install_reclaim_mb_progress = float(
             self.stats.physical_expert_reclaim_mb
@@ -5590,6 +5624,50 @@ class LayerKVRuntime:
         )
         self.stats.expert_install_d2h_queued_count += len(expert_ids)
         self._refresh_expert_install_progress()
+
+    def _queued_expert_install_d2h_bytes(self) -> int:
+        total = 0
+        for job in self._expert_install_d2h_queue:
+            total += len(job.expert_ids) * max(1, int(self._expert_bytes(job.module)))
+        return int(total)
+
+    def _pending_expert_install_d2h_count(self) -> int:
+        return sum(
+            len(pending_copy.copied)
+            for pending_copy in self._pending_expert_d2h_events
+            if str(pending_copy.reason).startswith("install")
+        )
+
+    def _effective_expert_install_d2h_budget_mb(self) -> float:
+        budget_mb = max(0.0, float(self.config.expert_copy_budget_mb))
+        target_steps = max(0, int(self._expert_install_target_steps))
+        if target_steps > 0 and self._expert_install_d2h_queue:
+            remaining_steps = max(
+                1, target_steps - int(self.stats.forward_decode_count)
+            )
+            queued_mb = self._queued_expert_install_d2h_bytes() / float(1024 * 1024)
+            horizon_budget_mb = queued_mb / float(remaining_steps)
+            if horizon_budget_mb > budget_mb + 1e-3:
+                budget_mb = horizon_budget_mb
+                self.stats.expert_install_d2h_dynamic_budget_count += 1
+        max_budget_mb = max(0.0, float(self.config.expert_copy_max_budget_mb))
+        if max_budget_mb > 0.0:
+            budget_mb = min(budget_mb, max_budget_mb)
+        self.stats.expert_install_d2h_effective_budget_mb = float(budget_mb)
+        return float(budget_mb)
+
+    def _prepare_expert_install_d2h_lookahead(self) -> None:
+        lookahead = max(0, int(self.config.expert_copy_lookahead_layers))
+        if lookahead <= 0 or not self._expert_install_queue:
+            return
+        prepared = 0
+        for item in self._expert_install_queue[:lookahead]:
+            before = bool(item.backing_queued)
+            self._prepare_expert_install_item_backing(item)
+            if not before and item.backing_queued:
+                prepared += 1
+        if prepared:
+            self.stats.expert_install_d2h_lookahead_queue_count += prepared
 
     def _prepare_expert_install_item_backing(
         self, item: _LayerKVExpertInstallItem
@@ -5651,10 +5729,16 @@ class LayerKVRuntime:
         item.backing_queued = True
         return True
 
-    def _submit_expert_install_d2h_budgeted(self) -> None:
+    def _submit_expert_install_d2h_budgeted(
+        self, *, budget_mb: Optional[float] = None
+    ) -> None:
         if not self._expert_install_d2h_queue:
             return
-        budget_bytes = int(max(0.0, float(self.config.expert_copy_budget_mb)) * 1024 * 1024)
+        if budget_mb is None:
+            budget_mb = self._effective_expert_install_d2h_budget_mb()
+        else:
+            self.stats.expert_install_d2h_effective_budget_mb = float(budget_mb)
+        budget_bytes = int(max(0.0, float(budget_mb)) * 1024 * 1024)
         if budget_bytes <= 0:
             return
         chunk_cap_bytes = int(
@@ -5708,6 +5792,45 @@ class LayerKVRuntime:
             self.stats.expert_install_d2h_submit_step_count += 1
             self._refresh_expert_install_progress()
 
+    def _force_drain_expert_install_d2h_and_slots(self) -> None:
+        if not self.config.expert_copy_force_drain:
+            return
+        if (
+            not self._expert_install_queue
+            and not self._expert_install_d2h_queue
+            and self._pending_expert_install_d2h_count() <= 0
+        ):
+            return
+        start = time.perf_counter()
+        self.stats.expert_install_d2h_force_drain_count += 1
+        max_iters = max(8, len(self._expert_modules) * 4 + 8)
+        for _ in range(max_iters):
+            before = (
+                len(self._expert_install_queue),
+                self._queued_expert_install_d2h_bytes(),
+                self._pending_expert_install_d2h_count(),
+                len(self._expert_layers),
+            )
+            queued_mb = self._queued_expert_install_d2h_bytes() / float(1024 * 1024)
+            if queued_mb > 0.0:
+                self._submit_expert_install_d2h_budgeted(budget_mb=queued_mb)
+            if self._pending_expert_install_d2h_count() > 0:
+                self._finalize_expert_d2h_events(block=True)
+            self._advance_expert_install_budgeted()
+            after = (
+                len(self._expert_install_queue),
+                self._queued_expert_install_d2h_bytes(),
+                self._pending_expert_install_d2h_count(),
+                len(self._expert_layers),
+            )
+            if after[0] == 0 and after[1] == 0 and after[2] == 0:
+                break
+            if after == before:
+                break
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self.stats.expert_install_d2h_force_drain_ms += elapsed_ms
+        self._refresh_expert_install_progress()
+
     def _advance_expert_install_budgeted(self) -> None:
         if self.config.mode != "kvc-expert" or not self._expert_install_queue:
             self._refresh_expert_install_progress()
@@ -5743,6 +5866,7 @@ class LayerKVRuntime:
         self.stats.expert_install_remaining_steps = int(remaining_steps)
         self.stats.expert_install_effective_layers_this_step = int(max_layers)
         self.stats.expert_install_effective_budget_mb_this_step = float(max_mb)
+        self._prepare_expert_install_d2h_lookahead()
         self._expert_install_state = "installing_slots"
         install_profile = (
             "profile_apply_prepared_expert_plan_ms"
@@ -10685,6 +10809,7 @@ class LayerKVRuntime:
                 with self._profile("profile_apply_expert_plan_ms"):
                     self._apply_expert_plan_once(forward_batch)
                 self._advance_expert_install_budgeted()
+                self._force_drain_expert_install_d2h_and_slots()
                 if self._expert_plan_applied and not self._expert_install_queue:
                     self._check_current_coresid_plan_match(context="post_install")
             self.stats.forward_decode_count += 1

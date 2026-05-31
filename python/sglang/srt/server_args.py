@@ -705,6 +705,9 @@ class ServerArgs:
     layerkv_expert_install_target_steps: int = 0
     layerkv_expert_copy_budget_mb: float = 64.0
     layerkv_expert_copy_chunk_mb: float = 128.0
+    layerkv_expert_copy_max_budget_mb: float = 0.0
+    layerkv_expert_copy_lookahead_layers: int = 0
+    layerkv_expert_copy_force_drain: bool = False
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3588,6 +3591,14 @@ class ServerArgs:
             raise ValueError("--layerkv-expert-copy-budget-mb must be non-negative")
         if self.layerkv_expert_copy_chunk_mb <= 0:
             raise ValueError("--layerkv-expert-copy-chunk-mb must be positive")
+        if self.layerkv_expert_copy_max_budget_mb < 0:
+            raise ValueError(
+                "--layerkv-expert-copy-max-budget-mb must be non-negative"
+            )
+        if self.layerkv_expert_copy_lookahead_layers < 0:
+            raise ValueError(
+                "--layerkv-expert-copy-lookahead-layers must be non-negative"
+            )
         if self.layerkv_expert_cpu_backing_mode not in ("none", "all"):
             raise ValueError(
                 "--layerkv-expert-cpu-backing-mode must be one of: none, all"
@@ -6614,6 +6625,23 @@ class ServerArgs:
             type=float,
             default=ServerArgs.layerkv_expert_copy_chunk_mb,
             help="Maximum expert D2H backing copy chunk MB submitted as one async copy batch.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-copy-max-budget-mb",
+            type=float,
+            default=ServerArgs.layerkv_expert_copy_max_budget_mb,
+            help="Cap for horizon-raised expert D2H copy budget. Use 0 for no cap.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-copy-lookahead-layers",
+            type=int,
+            default=ServerArgs.layerkv_expert_copy_lookahead_layers,
+            help="Install queue lookahead layers whose expert D2H backing descriptors may be queued before earlier layers finish.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-copy-force-drain",
+            action="store_true",
+            help="Experiment mode: block to drain expert install D2H and slots after plan creation.",
         )
 
         # Hierarchical sparse attention
