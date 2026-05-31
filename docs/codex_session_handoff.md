@@ -899,3 +899,53 @@ Important limitation:
   The priority mechanism only changes ordering for descriptors that have not
   been submitted yet; bounded chunk size is still required to keep urgent waits
   short.
+
+## Phase 5 Ready-Miss Stall Accounting
+
+Recorded: 2026-05-31T12:20:00Z
+
+Implemented:
+
+- Added CUDA-event accounting for use-point ready misses.
+- Expert H2D ready misses now record events around the main/decode stream
+  `wait_event()` and finalize the elapsed time later without synchronizing at
+  the use point.
+- KVC ready-miss fields were added to the shared stats/CSV path as well.
+- New CSV/stats:
+  - `expert_ready_miss_stall_ms`;
+  - `expert_ready_miss_stall_count`;
+  - `kvc_ready_miss_stall_ms`;
+  - `kvc_ready_miss_stall_count`;
+  - `layerkv_main_stream_wait_ms`.
+
+Validation:
+
+- `python -m py_compile` passed.
+- `git diff --check` passed.
+- `PYTHONNOUSERSITE=1 scripts/layerkv_smoke.py` passed.
+
+WildChat spot check:
+
+- Output:
+  `/data/wenyan/tmp/layerkv_stage_c4_wait_stall_chunk128_wildchat_coresid`.
+- Command used lookahead `4`, target steps `16`, max copy budget `128 MiB`,
+  default chunk `128 MiB`.
+- Result:
+  - wall `27626.9 ms`;
+  - decode0 `1726.7 ms`;
+  - throughput `4.633 tok/s`;
+  - expert ready checks `2`;
+  - expert ready-before-use `0`;
+  - expert ready-miss stall count `2`;
+  - expert ready-miss GPU stall `0.0705 ms`;
+  - scheduler CPU exposed wait submission time `0.0334 ms`;
+  - H2D on-demand async count `2`;
+  - H2D stream busy `0.386 ms`.
+
+Interpretation:
+
+- The observed expert ready misses are real, but their measured GPU stall in
+  this run is small: about `0.035 ms` per miss.
+- The larger decode latency gap is not primarily from the two H2D use-point
+  waits; controller/KVC no-op selection and install/shrink bookkeeping still
+  dominate.

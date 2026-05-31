@@ -568,6 +568,8 @@ class LayerKVStats:
     expert_ready_before_use_count: int = 0
     expert_ready_use_check_count: int = 0
     expert_ready_before_use_ratio: float = 1.0
+    expert_ready_miss_stall_ms: float = 0.0
+    expert_ready_miss_stall_count: int = 0
     expert_h2d_on_demand_async_count: int = 0
     expert_h2d_prefetch_async_count: int = 0
     expert_h2d_sync_count: int = 0
@@ -645,6 +647,8 @@ class LayerKVStats:
     kvc_ready_before_use_count: int = 0
     kvc_ready_use_check_count: int = 0
     kvc_ready_before_use_ratio: float = 1.0
+    kvc_ready_miss_stall_ms: float = 0.0
+    kvc_ready_miss_stall_count: int = 0
     layerkv_main_stream_wait_ms: float = 0.0
     layerkv_copy_stream_busy_ms: float = 0.0
     layerkv_python_overhead_ms: float = 0.0
@@ -901,6 +905,9 @@ class _LayerKVPendingExpertCopy:
     layer_id: int
     logical_ids: Set[int]
     waited_on_main_stream: bool = False
+    wait_start_event: Optional[Any] = None
+    wait_end_event: Optional[Any] = None
+    wait_elapsed_recorded: bool = False
 
 
 @dataclasses.dataclass
@@ -8122,6 +8129,29 @@ class LayerKVRuntime:
                 self.stats.expert_ready_before_use_count / float(total)
             )
 
+    def _record_expert_wait_stall_if_ready(
+        self, pending: _LayerKVPendingExpertCopy
+    ) -> bool:
+        if (
+            pending.wait_elapsed_recorded
+            or pending.wait_start_event is None
+            or pending.wait_end_event is None
+        ):
+            return pending.wait_elapsed_recorded
+        try:
+            if not pending.wait_end_event.query():
+                return False
+            elapsed = float(
+                pending.wait_start_event.elapsed_time(pending.wait_end_event)
+            )
+            self.stats.expert_ready_miss_stall_ms += elapsed
+            self.stats.layerkv_main_stream_wait_ms += elapsed
+            self.stats.expert_ready_miss_stall_count += 1
+            pending.wait_elapsed_recorded = True
+            return True
+        except Exception:
+            return False
+
     def _wait_for_expert_logical_ids_ready(
         self, state: _LayerKVExpertLayerState, logical_ids: List[int]
     ) -> None:
@@ -8146,7 +8176,20 @@ class LayerKVRuntime:
                 self.stats.layerkv_deadline_miss_count += 1
                 self.stats.scheduler_deadline_miss_count += 1
             t_wait = time.perf_counter()
+            if not ready:
+                try:
+                    pending.wait_start_event = torch.cuda.Event(enable_timing=True)
+                    pending.wait_end_event = torch.cuda.Event(enable_timing=True)
+                    pending.wait_start_event.record(stream)
+                except Exception:
+                    pending.wait_start_event = None
+                    pending.wait_end_event = None
             stream.wait_event(pending.ready_event)
+            if not ready and pending.wait_end_event is not None:
+                try:
+                    pending.wait_end_event.record(stream)
+                except Exception:
+                    pending.wait_end_event = None
             self.stats.scheduler_exposed_wait_ms += (
                 time.perf_counter() - t_wait
             ) * 1000.0
@@ -8161,6 +8204,7 @@ class LayerKVRuntime:
                     group.ready_waited = True
             self.stats.resident_group_wait_count += len(pending.logical_ids)
             pending.waited_on_main_stream = True
+            self._record_expert_wait_stall_if_ready(pending)
         self._refresh_expert_ready_before_use_ratio()
 
     def _finalize_expert_materialize_events(self, *, block: bool = False) -> None:
@@ -8171,6 +8215,7 @@ class LayerKVRuntime:
             start = pending.start_event
             end = pending.ready_event
             try:
+                self._record_expert_wait_stall_if_ready(pending)
                 if block:
                     end.synchronize()
                 elif not end.query():
@@ -10294,9 +10339,33 @@ class LayerKVRuntime:
             self.stats.scheduler_deadline_miss_count += 1
         stream = torch.cuda.current_stream(device=self._kv_pool.device)
         t_wait = time.perf_counter()
+        wait_start = None
+        wait_end = None
+        if not ready:
+            try:
+                wait_start = torch.cuda.Event(enable_timing=True)
+                wait_end = torch.cuda.Event(enable_timing=True)
+                wait_start.record(stream)
+            except Exception:
+                wait_start = None
+                wait_end = None
         stream.wait_event(pending.ready_event)
+        if wait_end is not None:
+            try:
+                wait_end.record(stream)
+            except Exception:
+                wait_end = None
         self.stats.scheduler_exposed_wait_ms += (time.perf_counter() - t_wait) * 1000.0
         self.stats.layerkv_copy_event_wait_count += 1
+        if wait_start is not None and wait_end is not None:
+            try:
+                wait_end.synchronize()
+                stall_ms = float(wait_start.elapsed_time(wait_end))
+                self.stats.kvc_ready_miss_stall_ms += stall_ms
+                self.stats.layerkv_main_stream_wait_ms += stall_ms
+                self.stats.kvc_ready_miss_stall_count += 1
+            except Exception:
+                pass
         try:
             elapsed_ms = float(pending.start_event.elapsed_time(pending.ready_event))
             self.stats.virtual_kvc_materialize_ms += elapsed_ms
@@ -10763,11 +10832,35 @@ class LayerKVRuntime:
                 self.stats.layerkv_deadline_miss_count += 1
                 self.stats.scheduler_deadline_miss_count += 1
             t_wait = time.perf_counter()
+            wait_start = None
+            wait_end = None
+            if not ready:
+                try:
+                    wait_start = torch.cuda.Event(enable_timing=True)
+                    wait_end = torch.cuda.Event(enable_timing=True)
+                    wait_start.record(stream)
+                except Exception:
+                    wait_start = None
+                    wait_end = None
             stream.wait_event(event)
+            if wait_end is not None:
+                try:
+                    wait_end.record(stream)
+                except Exception:
+                    wait_end = None
             self.stats.scheduler_exposed_wait_ms += (
                 time.perf_counter() - t_wait
             ) * 1000.0
             self.stats.layerkv_copy_event_wait_count += 1
+            if wait_start is not None and wait_end is not None:
+                try:
+                    wait_end.synchronize()
+                    stall_ms = float(wait_start.elapsed_time(wait_end))
+                    self.stats.kvc_ready_miss_stall_ms += stall_ms
+                    self.stats.layerkv_main_stream_wait_ms += stall_ms
+                    self.stats.kvc_ready_miss_stall_count += 1
+                except Exception:
+                    pass
             for entry in pending.entries:
                 group = self._resident_groups.get(
                     self._residency_key("kvc", -1, (int(entry.req_idx), int(entry.pos)))
