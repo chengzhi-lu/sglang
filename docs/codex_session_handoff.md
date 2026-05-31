@@ -850,3 +850,52 @@ Known caveat:
   `INSTALL_IN_PROGRESS_NOT_COMPARABLE`; this is expected for the current
   long-context CoResid experiment and does not invalidate the collected runtime
   counters.
+
+## Phase 5 Expert On-Demand D2H Priority
+
+Recorded: 2026-05-31T11:45:00Z
+
+Implemented:
+
+- Intermediate on-demand expert backing now feeds back into the D2H descriptor
+  queue.
+- If on-demand materialize needs an expert whose D2H backing descriptor is
+  still queued:
+  - the requested expert id is split out of the original install job;
+  - it is requeued as a single-expert `demand_backing_async` job;
+  - priority is raised above normal install/lookahead work;
+  - deadline is moved to the current decode step;
+  - the job can mirror finalized backing into both the original install target
+    and the live layer `state.cpu_params`.
+- If no queued descriptor exists but the module is still full-sized, the runtime
+  can enqueue a new urgent demand descriptor.
+- If D2H is already pending, it cannot be preempted; the use point waits and the
+  demand wait is counted.
+- D2H submit ordering is now priority-first, then deadline, then sequence. With
+  equal priority this preserves the previous deadline/queue order.
+
+New CSV/stats:
+
+- `expert_d2h_demand_ready_hit_count`;
+- `expert_d2h_demand_boost_count`;
+- `expert_d2h_demand_urgent_enqueue_count`;
+- `expert_d2h_demand_async_count`;
+- `expert_d2h_demand_finalize_count`;
+- `expert_d2h_demand_pending_wait_count`;
+- `expert_d2h_demand_unavailable_count`.
+
+Validation:
+
+- `python -m py_compile` passed.
+- `git diff --check` passed.
+- `PYTHONNOUSERSITE=1 scripts/layerkv_smoke.py` passed.
+- A local queue-promotion construction test confirmed that the demanded expert
+  is split into a high-priority single-expert job at the front of the queue,
+  while the original install job keeps the remaining expert ids.
+
+Important limitation:
+
+- CUDA copies already submitted to the D2H stream still cannot be preempted.
+  The priority mechanism only changes ordering for descriptors that have not
+  been submitted yet; bounded chunk size is still required to keep urgent waits
+  short.

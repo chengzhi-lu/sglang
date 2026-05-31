@@ -528,6 +528,13 @@ class LayerKVStats:
     expert_install_d2h_dynamic_budget_count: int = 0
     expert_install_d2h_force_drain_count: int = 0
     expert_install_d2h_force_drain_ms: float = 0.0
+    expert_d2h_demand_ready_hit_count: int = 0
+    expert_d2h_demand_boost_count: int = 0
+    expert_d2h_demand_urgent_enqueue_count: int = 0
+    expert_d2h_demand_async_count: int = 0
+    expert_d2h_demand_finalize_count: int = 0
+    expert_d2h_demand_pending_wait_count: int = 0
+    expert_d2h_demand_unavailable_count: int = 0
     expert_lazy_backing_enabled: bool = True
     expert_lazy_backing_skipped_count: int = 0
     expert_lazy_backing_skipped_mb: float = 0.0
@@ -906,6 +913,7 @@ class _LayerKVPendingExpertD2H:
     reason: str = "evict_backing_async"
     source_refs: Tuple[torch.Tensor, ...] = ()
     target_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+    mirror_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
 
 
 @dataclasses.dataclass
@@ -918,6 +926,8 @@ class _LayerKVExpertInstallD2HJob:
     target_cpu_params: Dict[int, Dict[str, torch.Tensor]]
     priority: int = 0
     deadline_step: int = 0
+    reason: str = "install_backing_async"
+    mirror_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5634,6 +5644,7 @@ class LayerKVRuntime:
         target_cpu_params: Dict[int, Dict[str, torch.Tensor]],
         priority: int = 0,
         deadline_step: Optional[int] = None,
+        reason: str = "install_backing_async",
     ) -> None:
         expert_ids = [int(expert_id) for expert_id in expert_ids]
         if not expert_ids:
@@ -5653,10 +5664,73 @@ class LayerKVRuntime:
                     if deadline_step is not None
                     else int(self._decode_step + 1)
                 ),
+                reason=str(reason),
             )
         )
         self.stats.expert_install_d2h_queued_count += len(expert_ids)
         self._refresh_expert_install_progress()
+
+    def _promote_queued_expert_d2h_for_demand(
+        self, state: _LayerKVExpertLayerState, logical_id: int
+    ) -> bool:
+        logical_id = int(logical_id)
+        for job in list(self._expert_install_d2h_queue):
+            if int(job.layer_id) != int(state.layer_id):
+                continue
+            if logical_id not in set(int(x) for x in job.expert_ids):
+                continue
+            job.expert_ids = [int(x) for x in job.expert_ids if int(x) != logical_id]
+            self._expert_install_d2h_job_seq += 1
+            self._expert_install_d2h_queue.append(
+                _LayerKVExpertInstallD2HJob(
+                    seq=int(self._expert_install_d2h_job_seq),
+                    layer_id=int(job.layer_id),
+                    module=job.module,
+                    param_names=list(job.param_names),
+                    expert_ids=[logical_id],
+                    target_cpu_params=job.target_cpu_params,
+                    priority=max(int(job.priority), 10_000),
+                    deadline_step=int(self._decode_step),
+                    reason="demand_backing_async",
+                    mirror_cpu_params=state.cpu_params,
+                )
+            )
+            self.stats.expert_d2h_demand_boost_count += 1
+            self._refresh_expert_install_progress()
+            return True
+        return False
+
+    def _enqueue_urgent_expert_d2h_for_demand(
+        self, state: _LayerKVExpertLayerState, logical_id: int
+    ) -> bool:
+        logical_id = int(logical_id)
+        if not state.param_names:
+            return False
+        try:
+            param0 = getattr(state.module, state.param_names[0]).data
+        except Exception:
+            return False
+        if getattr(param0, "device", None) is None or param0.device.type != "cuda":
+            return False
+        if int(param0.shape[0]) <= logical_id:
+            return False
+        # After slot shrinking, module rows are physical slots rather than
+        # logical expert ids. Only direct D2H from the module while it is still
+        # full-sized.
+        if int(param0.shape[0]) != int(state.full_num_experts):
+            return False
+        self._enqueue_expert_install_d2h_job(
+            layer_id=int(state.layer_id),
+            module=state.module,
+            param_names=state.param_names,
+            expert_ids=[logical_id],
+            target_cpu_params=state.cpu_params,
+            priority=10_000,
+            deadline_step=int(self._decode_step),
+            reason="demand_backing_async",
+        )
+        self.stats.expert_d2h_demand_urgent_enqueue_count += 1
+        return True
 
     def _queued_expert_install_d2h_bytes(self) -> int:
         total = 0
@@ -5782,8 +5856,8 @@ class LayerKVRuntime:
         made_progress = False
         self._expert_install_d2h_queue.sort(
             key=lambda job: (
-                int(job.deadline_step),
                 -int(job.priority),
+                int(job.deadline_step),
                 int(job.seq),
             )
         )
@@ -5803,6 +5877,8 @@ class LayerKVRuntime:
                 expert_ids,
                 layer_id=int(job.layer_id),
                 target_cpu_params=job.target_cpu_params,
+                reason=job.reason,
+                mirror_cpu_params=job.mirror_cpu_params,
             )
             if copied_bytes < 0:
                 copied = self._copy_experts_to_cpu_for_install_batched(
@@ -6621,6 +6697,8 @@ class LayerKVRuntime:
         *,
         layer_id: int = -1,
         target_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+        reason: str = "install_backing_async",
+        mirror_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
     ) -> int:
         if not expert_ids or not param_names:
             return 0
@@ -6700,9 +6778,10 @@ class LayerKVRuntime:
             layer_id=int(layer_id),
             copied=copied,
             bytes=int(copied_bytes),
-            reason="install_backing_async",
+            reason=str(reason),
             source_refs=tuple(source_refs),
             target_cpu_params=target_cpu_params,
+            mirror_cpu_params=mirror_cpu_params,
         )
         self._pending_expert_d2h_events.append(pending)
         for expert_id in copied:
@@ -6710,7 +6789,7 @@ class LayerKVRuntime:
         for expert_id, params in copied.items():
             self._record_expert_copy_descriptor(
                 direction="D2H",
-                reason="install_backing_async",
+                reason=str(reason),
                 layer_id=int(layer_id),
                 logical_id=int(expert_id),
                 src_slot=int(expert_id),
@@ -6718,8 +6797,11 @@ class LayerKVRuntime:
                 nbytes=self._expert_backing_bytes(params),
                 param_count=len(params),
             )
-        self.stats.expert_install_d2h_async_count += len(expert_ids)
-        self.stats.expert_install_d2h_async_mb += copied_bytes / float(1024 * 1024)
+        if str(reason).startswith("demand"):
+            self.stats.expert_d2h_demand_async_count += len(expert_ids)
+        else:
+            self.stats.expert_install_d2h_async_count += len(expert_ids)
+            self.stats.expert_install_d2h_async_mb += copied_bytes / float(1024 * 1024)
         self.stats.expert_copy_stream_launch_count += 1
         self.stats.expert_d2h_stream_launch_count += 1
         self.stats.layerkv_copy_event_record_count += 1
@@ -6941,15 +7023,36 @@ class LayerKVRuntime:
                     pass
                 state = self._expert_layers.get(int(pending.layer_id))
                 target_cpu_params = pending.target_cpu_params
-                if state is None and target_cpu_params is None:
+                mirror_cpu_params = pending.mirror_cpu_params
+                if (
+                    state is None
+                    and target_cpu_params is None
+                    and mirror_cpu_params is None
+                ):
                     remaining.append(pending)
                     continue
                 for logical_id, params in pending.copied.items():
                     logical_id = int(logical_id)
                     if target_cpu_params is not None:
                         target_cpu_params[logical_id] = params
+                    if (
+                        mirror_cpu_params is not None
+                        and mirror_cpu_params is not target_cpu_params
+                    ):
+                        mirror_cpu_params[logical_id] = params
                     elif state is not None:
                         state.cpu_params[logical_id] = params
+                    if (
+                        state is not None
+                        and (
+                            target_cpu_params is state.cpu_params
+                            or mirror_cpu_params is state.cpu_params
+                            or (
+                                target_cpu_params is None
+                                and mirror_cpu_params is None
+                            )
+                        )
+                    ):
                         state.backing_lru[logical_id] = self._decode_step
                     key = (int(pending.layer_id), logical_id)
                     if self._pending_expert_d2h_by_key.get(key) is pending:
@@ -6960,6 +7063,12 @@ class LayerKVRuntime:
                         pending.copied
                     )
                     finalized_install += len(pending.copied)
+                elif str(pending.reason).startswith("demand"):
+                    self.stats.expert_d2h_demand_finalize_count += len(
+                        pending.copied
+                    )
+                    if target_cpu_params is not None:
+                        finalized_install += len(pending.copied)
                 else:
                     self.stats.expert_eviction_d2h_async_finalize_count += len(
                         pending.copied
@@ -6972,19 +7081,68 @@ class LayerKVRuntime:
             self._refresh_expert_install_progress()
 
     def _wait_for_pending_expert_backing(
-        self, state: _LayerKVExpertLayerState, logical_id: int
+        self,
+        state: _LayerKVExpertLayerState,
+        logical_id: int,
+        *,
+        demand: bool = False,
     ) -> Optional[Dict[str, torch.Tensor]]:
         key = (int(state.layer_id), int(logical_id))
         pending = self._pending_expert_d2h_by_key.get(key)
         if pending is None:
             return None
+        if demand:
+            self.stats.expert_d2h_demand_pending_wait_count += 1
         if str(pending.reason).startswith("install"):
             self.stats.expert_install_d2h_async_wait_count += 1
+        elif str(pending.reason).startswith("demand"):
+            pass
         else:
             self.stats.expert_eviction_d2h_async_wait_count += 1
         pending.ready_event.synchronize()
         self._finalize_expert_d2h_events(block=False)
         return state.cpu_params.get(int(logical_id))
+
+    def _expert_backing_for_materialize(
+        self,
+        state: _LayerKVExpertLayerState,
+        logical_id: int,
+        *,
+        reason: str,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        logical_id = int(logical_id)
+        source_params = state.cpu_params.get(logical_id)
+        is_demand = reason == "on_demand"
+        if source_params is not None:
+            if is_demand:
+                self.stats.expert_d2h_demand_ready_hit_count += 1
+            return source_params
+        global_params = (
+            self._global_expert_backing(state.layer_id, logical_id)
+            if self._expert_global_cpu_backing
+            else None
+        )
+        if global_params is not None:
+            state.cpu_params[logical_id] = global_params
+            if is_demand:
+                self.stats.expert_d2h_demand_ready_hit_count += 1
+            return global_params
+        if is_demand:
+            if self._promote_queued_expert_d2h_for_demand(state, logical_id):
+                budget_mb = max(
+                    1e-6, float(state.expert_bytes) / float(1024 * 1024)
+                )
+                self._submit_expert_install_d2h_budgeted(budget_mb=budget_mb)
+            elif self._enqueue_urgent_expert_d2h_for_demand(state, logical_id):
+                budget_mb = max(
+                    1e-6, float(state.expert_bytes) / float(1024 * 1024)
+                )
+                self._submit_expert_install_d2h_budgeted(budget_mb=budget_mb)
+            else:
+                self.stats.expert_d2h_demand_unavailable_count += 1
+        return self._wait_for_pending_expert_backing(
+            state, logical_id, demand=is_demand
+        )
 
     @staticmethod
     def _expert_backing_bytes(params: Dict[str, torch.Tensor]) -> int:
@@ -8150,11 +8308,9 @@ class LayerKVRuntime:
                             group_state="offloaded",
                             cpu_params=state.cpu_params.get(evicted),
                         )
-                source_params = state.cpu_params.get(int(logical_id))
-                if source_params is None:
-                    source_params = self._wait_for_pending_expert_backing(
-                        state, int(logical_id)
-                    )
+                source_params = self._expert_backing_for_materialize(
+                    state, int(logical_id), reason=reason
+                )
                 if source_params is None:
                     source_params = (
                         self._global_expert_backing(state.layer_id, int(logical_id))
