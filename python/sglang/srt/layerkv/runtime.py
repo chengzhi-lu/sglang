@@ -444,6 +444,16 @@ class LayerKVStats:
     expert_copy_descriptor_install_count: int = 0
     expert_copy_descriptor_evict_count: int = 0
     expert_copy_descriptor_materialize_count: int = 0
+    expert_d2h_slice_run_count: int = 0
+    expert_d2h_slice_expert_count: int = 0
+    expert_d2h_gather_batch_count: int = 0
+    expert_d2h_gather_expert_count: int = 0
+    expert_cpu_backing_pool_alloc_count: int = 0
+    expert_cpu_backing_pool_reuse_count: int = 0
+    expert_cpu_backing_pool_release_count: int = 0
+    expert_cpu_backing_pool_drop_count: int = 0
+    expert_cpu_backing_pool_bytes: int = 0
+    expert_cpu_backing_pool_limit_bytes: int = 0
     expert_materialize_mb_total: float = 0.0
     expert_materialize_ms: float = 0.0
     expert_materialize_async_count: int = 0
@@ -1708,6 +1718,14 @@ class LayerKVRuntime:
             self.config.expert_install_target_steps
         )
         self._expert_host_backing_bytes: int = 0
+        self._expert_cpu_backing_pool: Dict[
+            Tuple[torch.dtype, Tuple[int, ...]], List[torch.Tensor]
+        ] = {}
+        self._expert_cpu_backing_pool_bytes: int = 0
+        self._expert_cpu_backing_pool_limit_bytes: int = 256 * 1024 * 1024
+        self.stats.expert_cpu_backing_pool_limit_bytes = int(
+            self._expert_cpu_backing_pool_limit_bytes
+        )
         self._expert_global_cpu_backing: Dict[
             Tuple[int, int], Dict[str, torch.Tensor]
         ] = {}
@@ -6095,6 +6113,7 @@ class LayerKVRuntime:
                     if expert_id in resident_set:
                         removed = cpu_params.pop(expert_id)
                         removed_bytes += sum(int(t.nbytes) for t in removed.values())
+                        self._release_expert_backing_params(removed)
                 if removed_bytes:
                     self._expert_host_backing_bytes -= removed_bytes
                     self._refresh_expert_host_backing_stat()
@@ -6309,6 +6328,116 @@ class LayerKVRuntime:
             self.stats.expert_copy_descriptor_materialize_count += 1
         return desc
 
+    @staticmethod
+    def _contiguous_int_runs(values: List[int]) -> List[List[int]]:
+        if not values:
+            return []
+        ordered = sorted(dict.fromkeys(int(x) for x in values))
+        runs: List[List[int]] = []
+        current: List[int] = [ordered[0]]
+        for value in ordered[1:]:
+            if int(value) == int(current[-1]) + 1:
+                current.append(int(value))
+            else:
+                runs.append(current)
+                current = [int(value)]
+        runs.append(current)
+        return runs
+
+    def _expert_cpu_backing_pool_key(
+        self, shape: Tuple[int, ...], dtype: torch.dtype
+    ) -> Tuple[torch.dtype, Tuple[int, ...]]:
+        return (dtype, tuple(int(x) for x in shape))
+
+    def _alloc_cpu_backing_tensor(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        pin_memory: bool = True,
+    ) -> torch.Tensor:
+        shape = tuple(int(x) for x in shape)
+        if pin_memory:
+            key = self._expert_cpu_backing_pool_key(shape, dtype)
+            pool = self._expert_cpu_backing_pool.get(key)
+            if pool:
+                tensor = pool.pop()
+                self._expert_cpu_backing_pool_bytes -= int(tensor.nbytes)
+                self.stats.expert_cpu_backing_pool_reuse_count += 1
+                self.stats.expert_cpu_backing_pool_bytes = int(
+                    self._expert_cpu_backing_pool_bytes
+                )
+                return tensor
+        self.stats.expert_cpu_backing_pool_alloc_count += 1
+        return torch.empty(
+            shape,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+
+    @staticmethod
+    def _tensor_owns_storage(tensor: torch.Tensor) -> bool:
+        try:
+            if getattr(tensor, "_base", None) is not None:
+                return False
+            if int(tensor.storage_offset()) != 0:
+                return False
+            return int(tensor.untyped_storage().nbytes()) == int(tensor.nbytes)
+        except Exception:
+            return False
+
+    def _release_cpu_backing_tensor(self, tensor: torch.Tensor) -> None:
+        try:
+            if tensor.device.type != "cpu" or not self._tensor_owns_storage(tensor):
+                self.stats.expert_cpu_backing_pool_drop_count += 1
+                return
+            if hasattr(tensor, "is_pinned") and not bool(tensor.is_pinned()):
+                self.stats.expert_cpu_backing_pool_drop_count += 1
+                return
+            nbytes = int(tensor.nbytes)
+            if self._expert_cpu_backing_pool_bytes + nbytes > int(
+                self._expert_cpu_backing_pool_limit_bytes
+            ):
+                self.stats.expert_cpu_backing_pool_drop_count += 1
+                return
+            key = self._expert_cpu_backing_pool_key(tuple(tensor.shape), tensor.dtype)
+            self._expert_cpu_backing_pool.setdefault(key, []).append(tensor.detach())
+            self._expert_cpu_backing_pool_bytes += nbytes
+            self.stats.expert_cpu_backing_pool_release_count += 1
+            self.stats.expert_cpu_backing_pool_bytes = int(
+                self._expert_cpu_backing_pool_bytes
+            )
+            self.stats.expert_cpu_backing_pool_limit_bytes = int(
+                self._expert_cpu_backing_pool_limit_bytes
+            )
+        except Exception:
+            self.stats.expert_cpu_backing_pool_drop_count += 1
+
+    def _release_expert_backing_params(
+        self, params: Optional[Dict[str, torch.Tensor]]
+    ) -> None:
+        if not params:
+            return
+        for tensor in params.values():
+            self._release_cpu_backing_tensor(tensor)
+
+    def _copy_tensor_to_cpu_backing_pooled(
+        self, tensor: torch.Tensor, *, non_blocking: bool, pin_memory: bool = True
+    ) -> torch.Tensor:
+        if not pin_memory:
+            return tensor.to("cpu", copy=True)
+        try:
+            dst = self._alloc_cpu_backing_tensor(
+                tuple(tensor.shape),
+                tensor.dtype,
+                pin_memory=True,
+            )
+            dst.copy_(tensor, non_blocking=non_blocking)
+            return dst
+        except Exception:
+            return tensor.to("cpu", copy=True)
+
     def _copy_expert_to_cpu_backing_no_account(
         self,
         module: Any,
@@ -6319,7 +6448,7 @@ class LayerKVRuntime:
         pin_memory: bool = True,
     ) -> Dict[str, torch.Tensor]:
         return {
-            name: self._copy_tensor_to_cpu_backing(
+            name: self._copy_tensor_to_cpu_backing_pooled(
                 getattr(module, name).data[expert_id].detach(),
                 non_blocking=non_blocking,
                 pin_memory=pin_memory,
@@ -6358,6 +6487,7 @@ class LayerKVRuntime:
         copied: Dict[int, Dict[str, torch.Tensor]] = {
             int(expert_id): {} for expert_id in expert_ids
         }
+        copied_bytes = 0
         device = getattr(module, param_names[0]).data.device if param_names else None
         with self._profile("profile_copy_expert_to_cpu_ms"):
             with torch.no_grad():
@@ -6368,8 +6498,35 @@ class LayerKVRuntime:
                         max_chunk_bytes = 256 * 1024 * 1024
                         per_expert_bytes = max(1, int(param[0].nbytes))
                         chunk_size = max(1, max_chunk_bytes // per_expert_bytes)
-                        for begin in range(0, len(expert_ids), chunk_size):
-                            chunk = expert_ids[begin : begin + chunk_size]
+                        runs = self._contiguous_int_runs(expert_ids)
+                        singleton_ids: List[int] = []
+                        for run in runs:
+                            if len(run) <= 1:
+                                singleton_ids.extend(run)
+                                continue
+                            for begin in range(0, len(run), chunk_size):
+                                chunk = run[begin : begin + chunk_size]
+                                selected = param[
+                                    int(chunk[0]) : int(chunk[0]) + len(chunk)
+                                ].detach()
+                                try:
+                                    dst = self._alloc_cpu_backing_tensor(
+                                        tuple(selected.shape),
+                                        selected.dtype,
+                                        pin_memory=True,
+                                    )
+                                    dst.copy_(selected, non_blocking=True)
+                                except Exception:
+                                    dst = selected.to("cpu", copy=True)
+                                copied_bytes += int(dst.nbytes)
+                                self.stats.expert_d2h_slice_run_count += 1
+                                self.stats.expert_d2h_slice_expert_count += len(chunk)
+                                for offset, expert_id in enumerate(chunk):
+                                    copied[int(expert_id)][name] = dst[offset]
+                        for begin in range(0, len(singleton_ids), chunk_size):
+                            chunk = singleton_ids[begin : begin + chunk_size]
+                            if not chunk:
+                                continue
                             idx = torch.tensor(
                                 chunk,
                                 dtype=torch.long,
@@ -6377,15 +6534,17 @@ class LayerKVRuntime:
                             )
                             selected = param.index_select(0, idx).detach()
                             try:
-                                dst = torch.empty(
+                                dst = self._alloc_cpu_backing_tensor(
                                     tuple(selected.shape),
-                                    dtype=selected.dtype,
-                                    device="cpu",
+                                    selected.dtype,
                                     pin_memory=True,
                                 )
                                 dst.copy_(selected, non_blocking=True)
                             except Exception:
                                 dst = selected.to("cpu", copy=True)
+                            copied_bytes += int(dst.nbytes)
+                            self.stats.expert_d2h_gather_batch_count += 1
+                            self.stats.expert_d2h_gather_expert_count += len(chunk)
                             for offset, expert_id in enumerate(chunk):
                                 copied[int(expert_id)][name] = dst[offset]
                 else:
@@ -6394,7 +6553,7 @@ class LayerKVRuntime:
                         for expert_id in expert_ids:
                             tensor = param[int(expert_id)].detach()
                             copied[int(expert_id)][name] = (
-                                self._copy_tensor_to_cpu_backing(
+                                self._copy_tensor_to_cpu_backing_pooled(
                                     tensor,
                                     non_blocking=True,
                                 )
@@ -6450,22 +6609,44 @@ class LayerKVRuntime:
                         max_chunk_bytes = 256 * 1024 * 1024
                         per_expert_bytes = max(1, int(param[0].nbytes))
                         chunk_size = max(1, max_chunk_bytes // per_expert_bytes)
-                        for begin in range(0, len(expert_ids), chunk_size):
-                            chunk = expert_ids[begin : begin + chunk_size]
-                            idx = torch.tensor(
-                                chunk,
-                                dtype=torch.long,
-                                device=param.device,
-                            )
+                        runs = self._contiguous_int_runs(expert_ids)
+                        singleton_ids: List[int] = []
+                        for run in runs:
+                            if len(run) <= 1:
+                                singleton_ids.extend(run)
+                                continue
+                            for begin in range(0, len(run), chunk_size):
+                                chunk = run[begin : begin + chunk_size]
+                                selected = param[
+                                    int(chunk[0]) : int(chunk[0]) + len(chunk)
+                                ].detach()
+                                dst = self._alloc_cpu_backing_tensor(
+                                    tuple(selected.shape),
+                                    selected.dtype,
+                                    pin_memory=True,
+                                )
+                                dst.copy_(selected, non_blocking=True)
+                                copied_bytes += int(dst.nbytes)
+                                source_refs.append(selected)
+                                self.stats.expert_d2h_slice_run_count += 1
+                                self.stats.expert_d2h_slice_expert_count += len(chunk)
+                                for offset, expert_id in enumerate(chunk):
+                                    copied[int(expert_id)][name] = dst[offset]
+                        for begin in range(0, len(singleton_ids), chunk_size):
+                            chunk = singleton_ids[begin : begin + chunk_size]
+                            if not chunk:
+                                continue
+                            idx = torch.tensor(chunk, dtype=torch.long, device=param.device)
                             selected = param.index_select(0, idx).detach()
-                            dst = torch.empty(
+                            dst = self._alloc_cpu_backing_tensor(
                                 tuple(selected.shape),
-                                dtype=selected.dtype,
-                                device="cpu",
+                                selected.dtype,
                                 pin_memory=True,
                             )
                             dst.copy_(selected, non_blocking=True)
                             copied_bytes += int(dst.nbytes)
+                            self.stats.expert_d2h_gather_batch_count += 1
+                            self.stats.expert_d2h_gather_expert_count += len(chunk)
                             source_refs.extend([idx, selected])
                             for offset, expert_id in enumerate(chunk):
                                 copied[int(expert_id)][name] = dst[offset]
@@ -6557,10 +6738,9 @@ class LayerKVRuntime:
                                 )
                                 selected = param.index_select(0, idx).detach()
                                 try:
-                                    dst = torch.empty(
+                                    dst = self._alloc_cpu_backing_tensor(
                                         tuple(selected.shape),
-                                        dtype=selected.dtype,
-                                        device="cpu",
+                                        selected.dtype,
                                         pin_memory=True,
                                     )
                                     dst.copy_(selected, non_blocking=True)
@@ -6590,7 +6770,7 @@ class LayerKVRuntime:
                             param = getattr(state.module, name).data
                             for logical_id, slot_id in evicted_pairs:
                                 tensor = param[int(slot_id)].detach()
-                                backing = self._copy_tensor_to_cpu_backing(
+                                backing = self._copy_tensor_to_cpu_backing_pooled(
                                     tensor,
                                     non_blocking=True,
                                 )
@@ -6605,7 +6785,7 @@ class LayerKVRuntime:
                         param = getattr(state.module, name).data
                         for logical_id, slot_id in evicted_pairs:
                             tensor = param[int(slot_id)].detach()
-                            backing = self._copy_tensor_to_cpu_backing(
+                            backing = self._copy_tensor_to_cpu_backing_pooled(
                                 tensor,
                                 non_blocking=True,
                             )
@@ -6657,10 +6837,9 @@ class LayerKVRuntime:
                     start.record(active_stream)
                     for name in state.param_names:
                         param = getattr(state.module, name).data
-                        dst = torch.empty(
+                        dst = self._alloc_cpu_backing_tensor(
                             (len(evicted_pairs),) + tuple(param.shape[1:]),
-                            dtype=param.dtype,
-                            device="cpu",
+                            param.dtype,
                             pin_memory=True,
                         )
                         copied_bytes += int(dst.nbytes)
@@ -6782,6 +6961,7 @@ class LayerKVRuntime:
         if removed is not None:
             if not self._is_global_expert_backing(state.layer_id, logical_id, removed):
                 self._expert_host_backing_bytes -= self._expert_backing_bytes(removed)
+                self._release_expert_backing_params(removed)
             self.stats.expert_backing_cache_evict_count += 1
             self._refresh_expert_host_backing_stat()
 
@@ -6810,6 +6990,7 @@ class LayerKVRuntime:
                         state.layer_id, logical_id, removed
                     ):
                         removed_bytes += self._expert_backing_bytes(removed)
+                        self._release_expert_backing_params(removed)
                     removed_count += 1
             if removed_count:
                 self._expert_host_backing_bytes -= removed_bytes

@@ -702,3 +702,66 @@ Current recommendation:
   --expert-copy-lookahead-layers 4` only as a reclaim-pressure experiment.
 - Next optimization should be pressure-aware lookahead/drain, not unconditional
   lookahead.
+
+## Stage C.2.3 Copy Path Experiment
+
+Recorded: 2026-05-31T10:15:00Z
+
+Implemented:
+
+- Run-based install D2H coalescing:
+  - expert ids are split into contiguous runs;
+  - runs with length greater than one use `param[start:end]` slice copies
+    instead of `index_select`;
+  - singleton/non-contiguous ids are still batched through `index_select` to
+    avoid many tiny D2H submits.
+- Conservative CPU backing pool:
+  - released CPU backing tensors are reused only when they own their storage;
+  - batched backing views are not pooled, because reusing one view could
+    corrupt other experts sharing the same underlying storage;
+  - default internal pool cap is `256 MiB`.
+- New counters:
+  - `expert_d2h_slice_run_count`;
+  - `expert_d2h_slice_expert_count`;
+  - `expert_d2h_gather_batch_count`;
+  - `expert_d2h_gather_expert_count`;
+  - `expert_cpu_backing_pool_*`.
+
+Validation:
+
+- `python -m py_compile` passed.
+- `git diff --check` passed.
+- `PYTHONNOUSERSITE=1 scripts/layerkv_smoke.py` passed.
+
+WildChat default C.2 rerun:
+
+- Output: `/data/wenyan/tmp/layerkv_stage_c23_coalesce_wildchat_coresid`.
+- Command used default `64 MiB/step`, lookahead `0`.
+- Result:
+  - wall `25155.9 ms`;
+  - decode0 `1572.2 ms`;
+  - throughput `5.088 tok/s`;
+  - install blocking `146.9 ms`;
+  - completed layers `6`;
+  - reclaim `405 MiB`;
+  - `profile_copy_expert_to_cpu_ms=567.5`;
+  - `layerkv_copy_stream_busy_ms=496.5`.
+- Copy breakdown:
+  - slice runs `10`;
+  - slice experts `22`;
+  - gather batches `26`;
+  - gather experts `84`;
+  - pool alloc `36`;
+  - pool reuse/release `0/0` in this short run.
+- Comparison against C.2 default before coalescing:
+  - wall `25059.2 -> 25155.9 ms` (roughly flat);
+  - decode0 `1566.2 -> 1572.2 ms` (roughly flat);
+  - copy profile `657.4 -> 567.5 ms`;
+  - copy stream busy `588.0 -> 496.5 ms`;
+  - install blocking `129.0 -> 146.9 ms`.
+- Interpretation:
+  - slice coalescing reduced copy-path measured time without changing reclaim;
+  - the end-to-end latency change is within noise and still dominated by KVC
+    no-op selection plus general controller overhead;
+  - CPU backing pool does not help this particular short run because backing is
+    not released/reused during the same request.
