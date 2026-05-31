@@ -49,7 +49,7 @@ FIG4_WORKLOADS = {
         "max_ctx": 32768,
         "output_len": 16,
         "dataset_name": "WildChat-1M",
-        "dataset_path": "/data/wenyan/.cache/huggingface/allenai___wild_chat-1_m",
+        "dataset_path": "/data/hf-cache/hub/datasets--allenai--WildChat-1M/blobs",
     },
     "context_heavy": {
         "batch_size": 8,
@@ -58,7 +58,7 @@ FIG4_WORKLOADS = {
         "max_ctx": 32768,
         "output_len": 16,
         "dataset_name": "WildChat-1M",
-        "dataset_path": "/data/wenyan/.cache/huggingface/allenai___wild_chat-1_m",
+        "dataset_path": "/data/hf-cache/hub/datasets--allenai--WildChat-1M/blobs",
     },
 }
 

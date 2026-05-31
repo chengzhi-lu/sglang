@@ -389,6 +389,9 @@ class LayerKVStats:
     expert_hotness_record_count: int = 0
     expert_hotness_sample_skip_count: int = 0
     expert_hotness_snapshot_count: int = 0
+    expert_hotness_snapshot_issue_count: int = 0
+    expert_hotness_snapshot_ready_count: int = 0
+    expert_hotness_snapshot_drop_count: int = 0
     expert_hotness_sync_fallback_count: int = 0
     expert_hotness_record_fast_count: int = 0
     expert_hotness_record_safe_count: int = 0
@@ -1578,8 +1581,9 @@ class LayerKVRuntime:
         self._expert_hotness_gpu_prefill: Dict[int, torch.Tensor] = {}
         self._expert_hotness_gpu_decode: Dict[int, torch.Tensor] = {}
         self._expert_hotness_pending_snapshots: List[
-            Tuple[str, int, torch.Tensor, Any]
+            Tuple[str, int, torch.Tensor, Any, Optional[torch.Tensor]]
         ] = []
+        self._expert_hotness_snapshot_streams: Dict[str, Any] = {}
         self._expert_hotness_pending_snapshot_keys: Set[Tuple[str, int]] = set()
         self._expert_hotness_last_snapshot_step: Dict[Tuple[str, int], int] = {}
         self._expert_hotness_ones_cache: Dict[Tuple[str, int], torch.Tensor] = {}
@@ -6818,36 +6822,62 @@ class LayerKVRuntime:
         key = (str(mode), int(layer_id))
         if key in self._expert_hotness_pending_snapshot_keys:
             return
+        max_pending = max(8, len(self._expert_modules) * 2)
+        if len(self._expert_hotness_pending_snapshots) >= max_pending:
+            self.stats.expert_hotness_snapshot_drop_count += 1
+            return
         step = max(0, int(self._decode_step))
         last = int(self._expert_hotness_last_snapshot_step.get(key, -1))
         interval = max(4, int(self.config.expert_hotness_sample_interval) * 4)
         if step > 4 and last >= 0 and step - last < interval:
             return
+        snapshot_counts = counts.detach().clone()
         try:
             cpu_counts = torch.empty_like(counts, device="cpu", pin_memory=True)
         except Exception:
             cpu_counts = torch.empty_like(counts, device="cpu")
-        cpu_counts.copy_(counts, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(device=counts.device))
+        device_key = str(counts.device)
+        stream = self._expert_hotness_snapshot_streams.get(device_key)
+        if stream is None:
+            stream = torch.cuda.Stream(device=counts.device)
+            self._expert_hotness_snapshot_streams[device_key] = stream
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(device=counts.device))
+        with torch.cuda.stream(stream):
+            stream.wait_event(ready)
+            cpu_counts.copy_(snapshot_counts, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+        snapshot_counts.record_stream(stream)
         self._expert_hotness_pending_snapshots.append(
-            (str(mode), int(layer_id), cpu_counts, event)
+            (str(mode), int(layer_id), cpu_counts, event, snapshot_counts)
         )
         self._expert_hotness_pending_snapshot_keys.add(key)
         self._expert_hotness_last_snapshot_step[key] = step
+        self.stats.expert_hotness_snapshot_issue_count += 1
 
     def _finalize_expert_hotness_snapshots(self, *, block: bool = False) -> None:
         if not self._expert_hotness_pending_snapshots:
             return
         t0 = time.perf_counter() if self.config.profile_detail else 0.0
         remaining = []
-        for mode, layer_id, cpu_counts, event in self._expert_hotness_pending_snapshots:
+        for (
+            mode,
+            layer_id,
+            cpu_counts,
+            event,
+            snapshot_counts,
+        ) in self._expert_hotness_pending_snapshots:
             key = (str(mode), int(layer_id))
+            keep_pending = False
             try:
                 if block:
                     event.synchronize()
                 elif not event.query():
-                    remaining.append((mode, layer_id, cpu_counts, event))
+                    remaining.append(
+                        (mode, layer_id, cpu_counts, event, snapshot_counts)
+                    )
+                    keep_pending = True
                     continue
                 target = (
                     self._expert_hotness_decode.setdefault(int(layer_id), {})
@@ -6864,10 +6894,12 @@ class LayerKVRuntime:
                     self.stats.expert_hotness_observed = True
                     self._expert_hotness_version += 1
                 self.stats.expert_hotness_snapshot_count += 1
+                self.stats.expert_hotness_snapshot_ready_count += 1
             except Exception:
                 self.stats.expert_hotness_sync_fallback_count += 1
             finally:
-                self._expert_hotness_pending_snapshot_keys.discard(key)
+                if not keep_pending:
+                    self._expert_hotness_pending_snapshot_keys.discard(key)
         self._expert_hotness_pending_snapshots = remaining
         if self.config.profile_detail:
             self._add_profile(
@@ -6914,9 +6946,12 @@ class LayerKVRuntime:
                 (time.perf_counter() - t0) * 1000.0,
             )
 
-    def _ensure_expert_hotness_cpu_view(self, *, mode: Optional[str] = None) -> None:
-        self._finalize_expert_hotness_snapshots(block=True)
-        self._materialize_expert_hotness_gpu_counts(mode=mode)
+    def _ensure_expert_hotness_cpu_view(
+        self, *, mode: Optional[str] = None, block: bool = False
+    ) -> None:
+        self._finalize_expert_hotness_snapshots(block=block)
+        if block:
+            self._materialize_expert_hotness_gpu_counts(mode=mode)
 
     def _record_expert_hotness_cpu(
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
@@ -6946,6 +6981,30 @@ class LayerKVRuntime:
             self.stats.expert_prefill_call_count_total += total
         self.stats.expert_hotness_observed = True
 
+    def _record_expert_hotness_gpu(
+        self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
+    ) -> None:
+        ids = topk_ids.detach().reshape(-1)
+        if ids.numel() == 0:
+            return
+        mode = "decode" if self._current_forward_mode == "decode" else "prefill"
+        counts = self._expert_hotness_gpu_counts(
+            mode, int(layer_id), int(full_num_experts), ids.device
+        )
+        index = ids.to(dtype=torch.long, non_blocking=True)
+        ones = self._expert_hotness_ones(ids.device, int(index.numel()))
+        counts.index_add_(0, index, ones)
+        total = int(index.numel())
+        self.stats.expert_call_count_total += total
+        if mode == "decode":
+            self.stats.expert_decode_call_count_total += total
+        else:
+            self.stats.expert_prefill_call_count_total += total
+        self.stats.expert_hotness_observed = True
+        self.stats.expert_hotness_record_fast_count += 1
+        self.stats.expert_hotness_record_count += 1
+        self._maybe_issue_expert_hotness_snapshot(mode, int(layer_id), counts)
+
     def _record_expert_hotness_for_layer(
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
     ) -> None:
@@ -6959,9 +7018,7 @@ class LayerKVRuntime:
             if ids.numel() == 0:
                 return
             if ids.device.type == "cuda":
-                self.stats.expert_hotness_sync_fallback_count += 1
-                self.stats.expert_hotness_record_count += 1
-                self._record_expert_hotness_cpu(
+                self._record_expert_hotness_gpu(
                     int(layer_id), int(full_num_experts), ids
                 )
             else:

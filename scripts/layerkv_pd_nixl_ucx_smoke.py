@@ -33,8 +33,11 @@ ROOT_MODEL_CANDIDATES = [
 
 def _default_model_path() -> str:
     for path in ROOT_MODEL_CANDIDATES:
-        if Path(path).exists():
-            return path
+        try:
+            if Path(path).exists():
+                return path
+        except OSError:
+            continue
     return DEFAULT_MODEL_PATH
 
 
