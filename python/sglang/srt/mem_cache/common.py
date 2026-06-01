@@ -528,6 +528,22 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    if batch.tree_cache.page_size == 1:
+        runtime_owner = getattr(
+            batch.token_to_kv_pool_allocator.get_kvcache(),
+            "layerkv_runtime",
+            None,
+        )
+        register_native = getattr(
+            runtime_owner, "register_native_kvc_runs_for_extend", None
+        )
+        if register_native is not None:
+            register_native(
+                reqs=reqs,
+                prefix_lens=[int(x) for x in batch.prefix_lens],
+                seq_lens=[int(x) for x in batch.seq_lens_cpu.tolist()],
+                locs=out_cache_loc,
+            )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 

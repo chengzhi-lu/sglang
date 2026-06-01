@@ -718,8 +718,23 @@ class LayerKVStats:
     profile_virtual_metadata_rewrite_ms: float = 0.0
     profile_virtual_direct_metadata_patch_ms: float = 0.0
     profile_virtual_prefetch_issue_ms: float = 0.0
+    profile_virtual_reload_prepare_ms: float = 0.0
+    profile_virtual_reload_contiguous_check_ms: float = 0.0
+    profile_virtual_reload_issue_wall_ms: float = 0.0
+    profile_virtual_reload_sync_wall_ms: float = 0.0
+    virtual_kvc_reload_slice_count: int = 0
+    virtual_kvc_reload_index_count: int = 0
+    virtual_kvc_reload_async_count: int = 0
+    virtual_kvc_reload_sync_count: int = 0
+    virtual_kvc_reload_slice_token_count: int = 0
+    virtual_kvc_reload_index_token_count: int = 0
     profile_kvc_evict_staging_alloc_ms: float = 0.0
+    profile_kvc_host_alloc_ms: float = 0.0
+    profile_kvc_backup_wall_ms: float = 0.0
     profile_kvc_evict_commit_ms: float = 0.0
+    profile_kvc_free_locs_ms: float = 0.0
+    profile_kvc_cost_observe_ms: float = 0.0
+    profile_kvc_refresh_stats_ms: float = 0.0
     profile_expert_unique_ms: float = 0.0
     profile_expert_hotness_record_ms: float = 0.0
     profile_expert_hotness_snapshot_ms: float = 0.0
@@ -810,6 +825,25 @@ class _LayerKVResidencyEntry:
 
 
 @dataclasses.dataclass
+class _LayerKVNativeKvcRun:
+    req_idx: int
+    start: int
+    end: int
+    locs: Tuple[int, ...]
+
+    def contains(self, pos: int, count: int) -> bool:
+        pos = int(pos)
+        count = int(count)
+        return count >= 0 and pos >= int(self.start) and pos + count <= int(self.end)
+
+    def loc_slice(self, pos: int, count: int) -> Tuple[int, ...]:
+        if not self.contains(pos, count):
+            return ()
+        offset = int(pos) - int(self.start)
+        return tuple(int(x) for x in self.locs[offset : offset + int(count)])
+
+
+@dataclasses.dataclass
 class _LayerKVPendingReload:
     start_event: Any
     ready_event: Any
@@ -884,6 +918,11 @@ class _LayerKVMetadataPatchCacheEntry:
     pos_tensor: Optional[torch.Tensor] = None
     flat_tensor: Optional[torch.Tensor] = None
     scratch_tensor: Optional[torch.Tensor] = None
+    flat_span_tensor: Optional[torch.Tensor] = None
+    flat_span_scratch_tensor: Optional[torch.Tensor] = None
+    row_span_row_tensor: Optional[torch.Tensor] = None
+    row_span_pos_tensor: Optional[torch.Tensor] = None
+    row_span_scratch_tensor: Optional[torch.Tensor] = None
     flat_slice: Optional[Tuple[int, int]] = None
     flat_slice_checked: bool = False
     page_slice: Optional[Tuple[int, int, int]] = None
@@ -1121,11 +1160,17 @@ class _LayerKVHostKVStore:
     """Compact pinned host backing for LayerKV-owned evicted MHA KV tokens."""
 
     def __init__(
-        self, kv_pool: Any, capacity_tokens: int, *, per_layer_mode: bool = False
+        self,
+        kv_pool: Any,
+        capacity_tokens: int,
+        *,
+        per_layer_mode: bool = False,
+        stats: Optional[LayerKVStats] = None,
     ):
         self.kv_pool = kv_pool
         self.capacity_tokens = max(1, int(capacity_tokens))
         self.per_layer_mode = bool(per_layer_mode)
+        self.stats = stats
         self.free_slots: List[int] = list(range(self.capacity_tokens))
         self.used_slots = set()
         self.layer_num = int(kv_pool.layer_num)
@@ -1139,6 +1184,8 @@ class _LayerKVHostKVStore:
         self.layer_capacities: List[int] = [0 for _ in range(self.layer_num)]
         self.layer_free_slots: List[List[int]] = [[] for _ in range(self.layer_num)]
         self.layer_used_slots: List[Set[int]] = [set() for _ in range(self.layer_num)]
+        self.layer_used_counts: List[int] = [0 for _ in range(self.layer_num)]
+        self.track_layer_used_sets = not self.per_layer_mode
         self.bytes_per_token_per_layer = int(k0[0].nbytes + v0[0].nbytes)
         self.bytes_per_token_all_layers = int(
             (k0[0].nbytes + v0[0].nbytes) * self.layer_num
@@ -1162,6 +1209,22 @@ class _LayerKVHostKVStore:
                 )
             )
 
+    def _add_profile(self, field: str, elapsed_ms: float) -> None:
+        if self.stats is None:
+            return
+        try:
+            setattr(self.stats, field, float(getattr(self.stats, field)) + elapsed_ms)
+        except Exception:
+            pass
+
+    def _add_stat(self, field: str, value: int = 1) -> None:
+        if self.stats is None:
+            return
+        try:
+            setattr(self.stats, field, int(getattr(self.stats, field)) + int(value))
+        except Exception:
+            pass
+
     @staticmethod
     def _empty_cpu(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         try:
@@ -1172,7 +1235,7 @@ class _LayerKVHostKVStore:
     @property
     def used_count(self) -> int:
         if self.per_layer_mode:
-            return sum(len(slots) for slots in self.layer_used_slots)
+            return sum(int(count) for count in self.layer_used_counts)
         return len(self.used_slots)
 
     @property
@@ -1202,9 +1265,15 @@ class _LayerKVHostKVStore:
         k_ref = self.kv_pool._get_key_buffer(layer_id)
         v_ref = self.kv_pool._get_value_buffer(layer_id)
         old_capacity = self.layer_capacities[layer_offset]
-        used = len(self.layer_used_slots[layer_offset])
+        used = int(self.layer_used_counts[layer_offset])
         required = used + int(need_free)
-        new_capacity = max(required, old_capacity * 2 if old_capacity > 0 else 0, 64)
+        initial_chunk = min(max(1, int(self.capacity_tokens)), 4096)
+        new_capacity = max(
+            required,
+            old_capacity * 2 if old_capacity > 0 else 0,
+            initial_chunk,
+            64,
+        )
         k_new = self._empty_cpu((new_capacity,) + tuple(k_ref.shape[1:]), k_ref.dtype)
         v_new = self._empty_cpu((new_capacity,) + tuple(v_ref.shape[1:]), v_ref.dtype)
         k_old = self.k_buffers[layer_offset]
@@ -1223,25 +1292,52 @@ class _LayerKVHostKVStore:
         if not self.per_layer_mode:
             return self.alloc(sum(entry.token_count for entry in entries))
         need_by_layer: Dict[int, int] = {}
+        entry_layers: List[int] = []
         for entry in entries:
             layer_offset = int(entry.layer_id) - self.start_layer
             if layer_offset < 0 or layer_offset >= self.layer_num:
                 return None
+            entry_layers.append(layer_offset)
             need_by_layer[layer_offset] = need_by_layer.get(layer_offset, 0) + int(
                 entry.token_count
             )
         for layer_offset, need in need_by_layer.items():
             self._ensure_layer_capacity(layer_offset, need)
-        out: List[int] = []
-        for entry in entries:
-            layer_offset = int(entry.layer_id) - self.start_layer
-            need = int(entry.token_count)
+        for layer_offset, need in need_by_layer.items():
+            if int(need) > len(self.layer_free_slots[layer_offset]):
+                return None
+        allocated_by_layer: Dict[int, List[int]] = {}
+        for layer_offset, need in need_by_layer.items():
             free = self.layer_free_slots[layer_offset]
-            slots = free[-need:]
-            del free[-need:]
-            self.layer_used_slots[layer_offset].update(slots)
+            slots = free[-int(need) :]
+            del free[-int(need) :]
+            self.layer_used_counts[layer_offset] += len(slots)
+            if self.track_layer_used_sets:
+                self.layer_used_slots[layer_offset].update(slots)
+            allocated_by_layer[layer_offset] = slots
+        offsets_by_layer = {int(layer_offset): 0 for layer_offset in need_by_layer}
+        out: List[int] = []
+        for entry, layer_offset in zip(entries, entry_layers):
+            need = int(entry.token_count)
+            offset = offsets_by_layer[layer_offset]
+            slots = allocated_by_layer[layer_offset][offset : offset + need]
+            offsets_by_layer[layer_offset] = offset + need
             out.extend(slots)
         return out
+
+    def preallocate_per_layer_capacity(self, tokens_per_layer: int) -> None:
+        if not self.per_layer_mode:
+            return
+        tokens_per_layer = max(0, int(tokens_per_layer))
+        if tokens_per_layer <= 0:
+            return
+        for layer_offset in range(self.layer_num):
+            need = max(
+                0,
+                int(tokens_per_layer) - len(self.layer_free_slots[layer_offset]),
+            )
+            if need > 0:
+                self._ensure_layer_capacity(layer_offset, need)
 
     def alloc(self, need: int) -> Optional[List[int]]:
         if self.per_layer_mode:
@@ -1272,13 +1368,34 @@ class _LayerKVHostKVStore:
         layer_offset = int(layer_id) - self.start_layer
         if layer_offset < 0 or layer_offset >= self.layer_num:
             return
-        used = self.layer_used_slots[layer_offset]
         free = self.layer_free_slots[layer_offset]
+        if not self.track_layer_used_sets:
+            free.extend(int(slot) for slot in slots)
+            self.layer_used_counts[layer_offset] = max(
+                0, int(self.layer_used_counts[layer_offset]) - len(slots)
+            )
+            return
+        used = self.layer_used_slots[layer_offset]
+        released = 0
         for slot in slots:
             slot = int(slot)
             if slot in used:
                 used.remove(slot)
                 free.append(slot)
+                released += 1
+        self.layer_used_counts[layer_offset] = max(
+            0, int(self.layer_used_counts[layer_offset]) - released
+        )
+
+    @staticmethod
+    def _unit_stride_start(values: List[int]) -> Optional[int]:
+        if not values:
+            return None
+        start = int(values[0])
+        for idx, value in enumerate(values):
+            if int(value) != start + idx:
+                return None
+        return start
 
     def backup(self, device_locs: torch.Tensor, host_slots: List[int]) -> float:
         if device_locs.numel() == 0:
@@ -1381,22 +1498,30 @@ class _LayerKVHostKVStore:
             if not device_loc_list or not host_slot_list:
                 continue
             layer_id = self.start_layer + layer_offset
-            host_index = torch.tensor(host_slot_list, dtype=torch.int64, device="cpu")
             device_locs = torch.tensor(
                 device_loc_list, dtype=torch.int64, device=self.device
             )
-            k_src = (
-                self.kv_pool._get_key_buffer(layer_id)[device_locs]
-                .detach()
-                .to("cpu", non_blocking=True)
-            )
-            v_src = (
-                self.kv_pool._get_value_buffer(layer_id)[device_locs]
-                .detach()
-                .to("cpu", non_blocking=True)
-            )
-            self.k_buffers[layer_offset].index_copy_(0, host_index, k_src)
-            self.v_buffers[layer_offset].index_copy_(0, host_index, v_src)
+            k_src = self.kv_pool._get_key_buffer(layer_id)[device_locs].detach()
+            v_src = self.kv_pool._get_value_buffer(layer_id)[device_locs].detach()
+            host_start = self._unit_stride_start(host_slot_list)
+            if host_start is not None:
+                host_end = int(host_start) + len(host_slot_list)
+                self.k_buffers[layer_offset][host_start:host_end].copy_(
+                    k_src, non_blocking=True
+                )
+                self.v_buffers[layer_offset][host_start:host_end].copy_(
+                    v_src, non_blocking=True
+                )
+            else:
+                host_index = torch.tensor(
+                    host_slot_list, dtype=torch.int64, device="cpu"
+                )
+                self.k_buffers[layer_offset].index_copy_(
+                    0, host_index, k_src.to("cpu", non_blocking=True)
+                )
+                self.v_buffers[layer_offset].index_copy_(
+                    0, host_index, v_src.to("cpu", non_blocking=True)
+                )
         end.record()
         end.synchronize()
         return float(start.elapsed_time(end))
@@ -1539,6 +1664,7 @@ class _LayerKVHostKVStore:
     ) -> Tuple[float, Optional[Any], Optional[Any]]:
         if not entries or int(device_locs.numel()) == 0:
             return 0.0, None, None
+        prepare_t0 = time.perf_counter()
         layer_offset = int(layer_id) - self.start_layer
         if layer_offset < 0 or layer_offset >= self.layer_num:
             raise RuntimeError(f"invalid virtual KVC layer_id={layer_id}")
@@ -1564,10 +1690,11 @@ class _LayerKVHostKVStore:
             raise RuntimeError(
                 f"virtual KVC scratch reload mismatch: host={int(host_index.numel())} device={int(device_locs.numel())}"
             )
-        device_module = torch.get_device_module(self.device)
-        start = device_module.Event(enable_timing=True)
-        end = device_module.Event(enable_timing=True)
-        active_stream = stream if async_copy and stream is not None else None
+        self._add_profile(
+            "profile_virtual_reload_prepare_ms",
+            (time.perf_counter() - prepare_t0) * 1000.0,
+        )
+        contiguous_check_t0 = time.perf_counter()
         if (
             host_slice_obj is None
             and host_index is not None
@@ -1586,6 +1713,25 @@ class _LayerKVHostKVStore:
                 )
                 if bool(torch.equal(host_index, expected)):
                     host_slice_obj = slice(first_slot, first_slot + token_count)
+        self._add_profile(
+            "profile_virtual_reload_contiguous_check_ms",
+            (time.perf_counter() - contiguous_check_t0) * 1000.0,
+        )
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        active_stream = stream if async_copy and stream is not None else None
+        token_count = int(device_locs.numel())
+        if host_slice_obj is not None:
+            self._add_stat("virtual_kvc_reload_slice_count")
+            self._add_stat("virtual_kvc_reload_slice_token_count", token_count)
+        else:
+            self._add_stat("virtual_kvc_reload_index_count")
+            self._add_stat("virtual_kvc_reload_index_token_count", token_count)
+        if active_stream is not None:
+            self._add_stat("virtual_kvc_reload_async_count")
+        else:
+            self._add_stat("virtual_kvc_reload_sync_count")
 
         def issue_copy() -> None:
             if active_stream is not None:
@@ -1619,11 +1765,26 @@ class _LayerKVHostKVStore:
 
         if active_stream is not None:
             with torch.cuda.stream(active_stream):
+                issue_t0 = time.perf_counter()
                 issue_copy()
+                self._add_profile(
+                    "profile_virtual_reload_issue_wall_ms",
+                    (time.perf_counter() - issue_t0) * 1000.0,
+                )
             return 0.0, start, end
 
+        issue_t0 = time.perf_counter()
         issue_copy()
+        self._add_profile(
+            "profile_virtual_reload_issue_wall_ms",
+            (time.perf_counter() - issue_t0) * 1000.0,
+        )
+        sync_t0 = time.perf_counter()
         end.synchronize()
+        self._add_profile(
+            "profile_virtual_reload_sync_wall_ms",
+            (time.perf_counter() - sync_t0) * 1000.0,
+        )
         return float(start.elapsed_time(end)), start, end
 
 
@@ -1756,6 +1917,9 @@ class LayerKVRuntime:
         self._per_layer_offloaded_positions_by_req_layer: Dict[
             Tuple[int, int], Tuple[int, Tuple[int, ...]]
         ] = {}
+        self._per_layer_offloaded_runs_by_req_layer: Dict[
+            Tuple[int, int], List[_LayerKVResidencyEntry]
+        ] = {}
         self._per_layer_offloaded_dirty_reqs: Set[int] = set()
         self._per_layer_offloaded_dirty_req_layers: Set[Tuple[int, int]] = set()
         self._resident_groups: Dict[
@@ -1871,6 +2035,15 @@ class LayerKVRuntime:
         self._virtual_materialize_plans_by_layer: Dict[
             int, _LayerKVVirtualMaterializePlan
         ] = {}
+        self._virtual_batch_index_step: int = -1
+        self._virtual_batch_index_cache: Optional[
+            Tuple[
+                List[Tuple[int, int]],
+                Dict[int, int],
+                Dict[int, int],
+                Dict[int, int],
+            ]
+        ] = None
         self._virtual_kvc_demands: Dict[Tuple[int, int], _LayerKVKvcDemand] = {}
         self._virtual_scratch_cache_by_layer: Dict[
             int, _LayerKVVirtualScratchCacheEntry
@@ -1888,12 +2061,14 @@ class LayerKVRuntime:
         self._per_layer_arena_reserved_locs: Set[int] = set()
         self._per_layer_arena_common_free_locs: Set[int] = set()
         self._per_layer_arena_common_free_order: List[int] = []
+        self._per_layer_arena_common_free_dirty = False
         self._per_layer_arena_free_locs: Dict[int, List[int]] = {}
         self._per_layer_arena_allocated_locs: Dict[int, Set[int]] = {}
         self._per_layer_arena_protected_locs: Dict[int, Set[int]] = {}
         self._per_layer_canonical_to_physical: Dict[int, Dict[int, int]] = {}
         self._per_layer_owned_req_indices: Set[int] = set()
         self._per_layer_owned_keys_by_req: Dict[int, Set[Tuple[int, int, int]]] = {}
+        self._native_kvc_runs_by_req: Dict[int, List[_LayerKVNativeKvcRun]] = {}
         self._virtual_scratch_locs: Optional[torch.Tensor] = None
         self._virtual_scratch_buffers: List[torch.Tensor] = []
         self._virtual_scratch_capacity: int = 0
@@ -2199,6 +2374,10 @@ class LayerKVRuntime:
                 return 0, raw_offloaded, "no_kvc_layers"
             self._refresh_per_layer_allocator_stats()
             if reason == "decode_prealloc_admission":
+                self._ensure_per_layer_common_free_current()
+                self.stats.kvc_per_layer_physical_arena_common_free_tokens = len(
+                    self._per_layer_arena_common_free_locs
+                )
                 credit = int(
                     self.stats.kvc_per_layer_physical_arena_common_free_tokens
                 )
@@ -2260,6 +2439,10 @@ class LayerKVRuntime:
         if self.config.kvc_backend == "per-layer-arena":
             self._refresh_per_layer_allocator_stats()
             if reason == "decode_prealloc_admission":
+                self._ensure_per_layer_common_free_current()
+                self.stats.kvc_per_layer_physical_arena_common_free_tokens = len(
+                    self._per_layer_arena_common_free_locs
+                )
                 visible_available = int(available_tokens) + int(
                     self.stats.kvc_per_layer_physical_arena_common_free_tokens
                 )
@@ -2671,6 +2854,12 @@ class LayerKVRuntime:
         self._allocator = getattr(runner, "token_to_kv_pool_allocator", None)
         self._req_to_token_pool = getattr(runner, "req_to_token_pool", None)
         self._install_kv_pool_hooks(getattr(runner, "token_to_kv_pool", None))
+        if (
+            self.config.mode in ("kvc-only", "kvc-expert")
+            and self.physical_kvc_supported
+            and self.config.reclaim_limit_mb > 0
+        ):
+            self._ensure_host_store()
         if self.config.kvc_backend in ("virtual-arena", "per-layer-arena"):
             self._ensure_virtual_scratch()
         self._discover_expert_support(runner)
@@ -2775,7 +2964,12 @@ class LayerKVRuntime:
             self._kv_pool,
             capacity_tokens,
             per_layer_mode=(self.config.kvc_backend == "per-layer-arena"),
+            stats=self.stats,
         )
+        if self.config.kvc_backend == "per-layer-arena":
+            self._host_store.preallocate_per_layer_capacity(
+                min(max(1, int(capacity_tokens)), 4096)
+            )
         self.stats.kvc_host_capacity_tokens = self._host_store.capacity_tokens
         self.stats.kvc_host_backing_mb = self._host_store.capacity_mb
 
@@ -3685,6 +3879,15 @@ class LayerKVRuntime:
             if state.hotness_prefill:
                 return True
         return False
+
+    def _has_initial_expert_hotness(self) -> bool:
+        return self._has_decode_expert_hotness() or self._has_prefill_expert_hotness()
+
+    def _has_prefill_expert_hotness_gpu(self) -> bool:
+        return any(
+            counts is not None and int(counts.numel()) > 0
+            for counts in self._expert_hotness_gpu_prefill.values()
+        )
 
     def _extend_progress_ratio(self, forward_batch: Any) -> float:
         orig_seq_lens = getattr(forward_batch, "orig_seq_lens", None)
@@ -5786,7 +5989,7 @@ class LayerKVRuntime:
             self.config.dynamic_pressure_from_kvc
             and not self._expert_install_queue
             and not self._expert_plan_applied
-            and not self._has_decode_expert_hotness()
+            and not self._has_initial_expert_hotness()
         ):
             runtime_pressure_mb = self._dynamic_runtime_pressure_mb(forward_batch)
             if runtime_pressure_mb > 1e-3:
@@ -5811,10 +6014,8 @@ class LayerKVRuntime:
                 self.stats.requested_total_reclaim_mb = (
                     self.stats.effective_reclaim_target_mb
                 )
-                self.stats.policy_semantics_reason = (
-                    "waiting_for_decode_expert_hotness"
-                )
-                self._expert_install_state = "waiting_for_decode_hotness"
+                self.stats.policy_semantics_reason = "waiting_for_expert_hotness"
+                self._expert_install_state = "waiting_for_hotness"
                 self._refresh_expert_install_progress()
             return
         if self._expert_install_queue or self._expert_install_state in {
@@ -5890,13 +6091,10 @@ class LayerKVRuntime:
             self.stats.comparability_reason = self.stats.expert_guard_reason
             return
 
-        # Standard FusedMoE executes all unique experts for the current dispatch
-        # in one kernel call. A shrunk slot table must therefore be at least as
-        # large as the per-layer decode unique expert set. Prefill often touches
-        # every expert in batch-heavy workloads, while decode can be sparser; wait
-        # for one decode routing sample before committing the physical slot plan.
-        if not self._has_decode_expert_hotness():
-            self.stats.policy_semantics_reason = "waiting_for_decode_expert_hotness"
+        # Prefill routing is sufficient to seed the first expert residency plan.
+        # Decode hotness is an online refinement signal, not a hard dependency.
+        if not self._has_initial_expert_hotness():
+            self.stats.policy_semantics_reason = "waiting_for_expert_hotness"
             return
 
         full_bytes = sum(
@@ -6020,7 +6218,7 @@ class LayerKVRuntime:
 
         if target_mb <= float(self._expert_install_target_mb) + 1e-3:
             return
-        if not self._has_decode_expert_hotness():
+        if not self._has_initial_expert_hotness():
             return
         with self._profile("profile_plan_expert_capacity_ms"):
             slot_capacities = self._coresid_planned_expert_capacities(
@@ -6072,8 +6270,8 @@ class LayerKVRuntime:
 
         if not self._expert_layers:
             return
-        if not self._has_decode_expert_hotness():
-            self.stats.policy_semantics_reason = "waiting_for_decode_expert_hotness"
+        if not self._has_initial_expert_hotness():
+            self.stats.policy_semantics_reason = "waiting_for_expert_hotness"
             return
         current_mb = max(0.0, float(self.stats.physical_expert_reclaim_mb))
         if target_mb <= current_mb + 1e-3:
@@ -8246,8 +8444,8 @@ class LayerKVRuntime:
         target_mb = self._effective_expert_reclaim_mb(forward_batch)
         if target_mb <= 0:
             return
-        self._ensure_expert_hotness_cpu_view(mode="decode")
-        if not self._has_decode_expert_hotness():
+        self._ensure_expert_hotness_cpu_view(mode=None)
+        if not self._has_initial_expert_hotness():
             return
         self._expert_prepare_started = True
         with self._profile("profile_prepare_expert_backing_ms"):
@@ -8656,7 +8854,7 @@ class LayerKVRuntime:
         if self._current_forward_mode != "decode":
             return True
         step = max(0, int(self._decode_step))
-        if step <= 4:
+        if step <= 4 and not self._has_prefill_expert_hotness_gpu():
             return True
         if self._expert_hotness_sampled_layers_step == step:
             sampled = self._expert_hotness_sampled_layers
@@ -8698,11 +8896,60 @@ class LayerKVRuntime:
         }
 
     def _should_collect_expert_hotness_layer(self, layer_id: int) -> bool:
+        if not self._expert_hotness_counter_needed():
+            return False
         if self._current_forward_mode != "decode":
             return True
         if self._decode_step <= 0:
             return True
         return self._should_sample_expert_hotness(layer_id)
+
+    def _expert_hotness_counter_needed(self) -> bool:
+        if self.config.expert_collector_only:
+            return True
+        if self._current_forward_mode != "decode":
+            return True
+        if self._expert_install_queue or self._expert_plan_applied or self._expert_layers:
+            return True
+        if not self.config.dynamic_pressure_from_kvc:
+            return True
+        if float(self.stats.planned_expert_reclaim_mb) > 1e-3:
+            return True
+        if float(self.stats.policy_expert_fraction) > 1e-6:
+            return True
+        return True
+
+    def _expert_hotness_cpu_snapshot_needed(self, mode: str) -> bool:
+        if self.config.expert_collector_only:
+            return True
+        if self._expert_install_queue or self._expert_plan_applied or self._expert_layers:
+            return True
+        if not self.config.dynamic_pressure_from_kvc:
+            return True
+        if float(self.stats.planned_expert_reclaim_mb) > 1e-3:
+            return True
+        if float(self.stats.policy_expert_fraction) > 1e-6:
+            return True
+        return False
+
+    def _decode_expert_hotness_collection_needed(self) -> bool:
+        if self._current_forward_mode != "decode":
+            return True
+        if not self._expert_hotness_counter_needed():
+            return False
+        if self._expert_install_queue or self._expert_plan_applied or self._expert_layers:
+            return True
+        if not self.config.dynamic_pressure_from_kvc:
+            return True
+        if float(self.stats.planned_expert_reclaim_mb) > 1e-3:
+            return True
+        if float(self.stats.policy_expert_fraction) > 1e-6:
+            return True
+        if str(self.stats.planner_fallback_reason) == "dynamic_kvc_pressure_requires_kvc_reclaim":
+            return False
+        if self._has_prefill_expert_hotness():
+            return False
+        return True
 
     def _flush_expert_hotness_sample_skip_count(self) -> None:
         pending = int(self._expert_hotness_sample_skip_pending)
@@ -8765,6 +9012,9 @@ class LayerKVRuntime:
     ) -> None:
         if counts.device.type != "cuda":
             return
+        if not self._expert_hotness_cpu_snapshot_needed(mode):
+            self.stats.expert_hotness_snapshot_deferred_count += 1
+            return
         if self._defer_expert_hotness_snapshot():
             self.stats.expert_hotness_snapshot_deferred_count += 1
             return
@@ -8819,6 +9069,8 @@ class LayerKVRuntime:
         if device.type != "cuda":
             return
         if mode != "decode":
+            return
+        if not self._expert_hotness_cpu_snapshot_needed(mode):
             return
         layer_id = int(layer_id)
         if layer_id in self._expert_candidate_pending_layers:
@@ -9048,10 +9300,13 @@ class LayerKVRuntime:
         self.stats.expert_hotness_observed = True
         self.stats.expert_hotness_record_fast_count += 1
         self.stats.expert_hotness_record_count += 1
-        self._maybe_issue_expert_hotness_snapshot(mode, int(layer_id), counts)
-        self._maybe_issue_expert_candidate_snapshot(
-            mode, int(layer_id), int(full_num_experts), ids.device
-        )
+        if self._expert_hotness_cpu_snapshot_needed(mode):
+            self._maybe_issue_expert_hotness_snapshot(mode, int(layer_id), counts)
+            self._maybe_issue_expert_candidate_snapshot(
+                mode, int(layer_id), int(full_num_experts), ids.device
+            )
+        else:
+            self.stats.expert_hotness_snapshot_deferred_count += 1
 
     def _record_expert_hotness_for_layer(
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
@@ -9716,8 +9971,6 @@ class LayerKVRuntime:
 
     def _per_layer_kvc_block_page_size(self) -> int:
         base_page = max(1, int(self._page_size))
-        if self._per_layer_allocator_enabled():
-            return base_page
         block_tokens = int(getattr(self.config, "kvc_block_tokens", 0) or 0)
         if block_tokens <= base_page:
             return base_page
@@ -9748,6 +10001,41 @@ class LayerKVRuntime:
             or self._per_layer_offloaded_keys
             or self._pending_virtual_kvc_materialize
         )
+
+    def _mark_per_layer_common_free_dirty(self) -> None:
+        self._per_layer_arena_common_free_dirty = True
+
+    def _ensure_per_layer_common_free_current(self) -> None:
+        if not self._per_layer_arena_common_free_dirty:
+            return
+        layer_ids = [int(layer_id) for layer_id in self._kvc_layer_ids()]
+        common: Optional[Set[int]] = None
+        for layer_id in layer_ids:
+            free = {
+                int(loc)
+                for loc in self._per_layer_arena_free_locs.get(layer_id, [])
+                if int(loc) > 0
+            }
+            free.difference_update(
+                self._per_layer_arena_allocated_locs.setdefault(layer_id, set())
+            )
+            free.difference_update(
+                self._per_layer_arena_protected_locs.setdefault(layer_id, set())
+            )
+            common = free if common is None else common.intersection(free)
+            if not common:
+                break
+        common = common or set()
+        self._per_layer_arena_common_free_locs = set(common)
+        ordered = [
+            int(loc)
+            for loc in self._per_layer_arena_common_free_order
+            if int(loc) in common
+        ]
+        seen = set(ordered)
+        ordered.extend(int(loc) for loc in sorted(common) if int(loc) not in seen)
+        self._per_layer_arena_common_free_order = ordered
+        self._per_layer_arena_common_free_dirty = False
 
     def _refresh_per_layer_allocator_stats(self) -> None:
         if not self._per_layer_arena_free_locs:
@@ -9787,10 +10075,11 @@ class LayerKVRuntime:
             return False
         min_free_tokens = max(1, int(min_free_tokens or 1))
         self._refresh_per_layer_allocator_stats()
-        if (
-            self.stats.kvc_per_layer_physical_arena_common_free_tokens
-            >= min_free_tokens
-        ):
+        self._ensure_per_layer_common_free_current()
+        if len(self._per_layer_arena_common_free_locs) >= min_free_tokens:
+            self.stats.kvc_per_layer_physical_arena_common_free_tokens = len(
+                self._per_layer_arena_common_free_locs
+            )
             return True
         available = int(self._allocator.available_size())
         if available < min_free_tokens:
@@ -9845,7 +10134,11 @@ class LayerKVRuntime:
         if len(cleaned) != len(free):
             self._per_layer_arena_free_locs[layer_id] = cleaned
             free = cleaned
-        if len(free) < count and self._per_layer_arena_common_free_locs:
+        if len(free) < count and (
+            self._per_layer_arena_common_free_locs
+            or self._per_layer_arena_common_free_dirty
+        ):
+            self._ensure_per_layer_common_free_current()
             present = {int(loc) for loc in free}
             for loc in sorted(self._per_layer_arena_common_free_locs):
                 loc = int(loc)
@@ -9876,8 +10169,10 @@ class LayerKVRuntime:
         count = max(0, int(count))
         if count <= 0:
             return []
+        self._ensure_per_layer_common_free_current()
         if not self._ensure_per_layer_physical_arena(count):
             return None
+        self._ensure_per_layer_common_free_current()
         layer_ids = [int(x) for x in self._kvc_layer_ids()]
         common = self._per_layer_arena_common_free_locs
         if len(common) < count:
@@ -10020,6 +10315,40 @@ class LayerKVRuntime:
             ]
             self._per_layer_arena_common_free_locs.update(new_common)
             self._per_layer_arena_common_free_order.extend(new_common)
+        if refresh:
+            self._refresh_per_layer_allocator_stats()
+
+    def _free_per_layer_locs_batch(
+        self, per_layer_locs: Dict[int, List[int]], *, refresh: bool = True
+    ) -> None:
+        if not per_layer_locs:
+            return
+        freed_count = 0
+        for layer_id, locs in per_layer_locs.items():
+            if not locs:
+                continue
+            layer_id = int(layer_id)
+            allocated = self._per_layer_arena_allocated_locs.setdefault(
+                layer_id, set()
+            )
+            loc_set = {int(x) for x in locs}
+            reusable = loc_set.intersection(allocated)
+            if not reusable:
+                continue
+            allocated.difference_update(reusable)
+            protected = self._per_layer_arena_protected_locs.setdefault(
+                layer_id, set()
+            )
+            ordinary_reusable = reusable.difference(protected)
+
+            free = self._per_layer_arena_free_locs.setdefault(layer_id, [])
+            free.extend(int(loc) for loc in ordinary_reusable)
+            freed_count += len(reusable)
+
+        if freed_count:
+            self.stats.kvc_per_layer_physical_arena_free_count += freed_count
+            self._mark_per_layer_common_free_dirty()
+
         if refresh:
             self._refresh_per_layer_allocator_stats()
 
@@ -10581,6 +10910,37 @@ class LayerKVRuntime:
         )
         return self._virtual_materialize_plan
 
+    def _virtual_batch_index_context(
+        self,
+    ) -> Tuple[
+        List[Tuple[int, int]],
+        Dict[int, int],
+        Dict[int, int],
+        Dict[int, int],
+    ]:
+        if (
+            int(self._virtual_batch_index_step) == int(self._decode_step)
+            and self._virtual_batch_index_cache is not None
+        ):
+            return self._virtual_batch_index_cache
+        batch_req_lens = self._batch_req_indices_and_lens(self._last_forward_batch)
+        active_lens = {
+            int(req_idx): self._align_tokens_down(max(0, int(seq_len) - 1))
+            for req_idx, seq_len in batch_req_lens
+        }
+        row_by_req: Dict[int, int] = {}
+        flat_base_by_req: Dict[int, int] = {}
+        flat_base = 0
+        for row, (req_idx, seq_len) in enumerate(batch_req_lens):
+            req_idx = int(req_idx)
+            row_by_req[req_idx] = int(row)
+            flat_base_by_req[req_idx] = int(flat_base)
+            flat_base += max(0, int(seq_len))
+        cache = (batch_req_lens, active_lens, row_by_req, flat_base_by_req)
+        self._virtual_batch_index_cache = cache
+        self._virtual_batch_index_step = int(self._decode_step)
+        return cache
+
     def _build_virtual_materialize_plan(
         self, *, layer_id: Optional[int]
     ) -> Optional[_LayerKVVirtualMaterializePlan]:
@@ -10590,55 +10950,16 @@ class LayerKVRuntime:
         target_layer = None if layer_id is None else int(layer_id)
         direct_kv_indices_only = target_layer is not None
         with self._profile("profile_virtual_select_ms"):
-            batch_req_lens = self._batch_req_indices_and_lens(self._last_forward_batch)
-            active_lens = {
-                int(req_idx): self._align_tokens_down(max(0, int(seq_len) - 1))
-                for req_idx, seq_len in batch_req_lens
-            }
-            row_by_req: Dict[int, int] = {}
-            flat_base_by_req: Dict[int, int] = {}
-            flat_base = 0
-            for row, (req_idx, seq_len) in enumerate(batch_req_lens):
-                req_idx = int(req_idx)
-                row_by_req[req_idx] = int(row)
-                flat_base_by_req[req_idx] = int(flat_base)
-                flat_base += max(0, int(seq_len))
+            (
+                batch_req_lens,
+                active_lens,
+                row_by_req,
+                flat_base_by_req,
+            ) = self._virtual_batch_index_context()
             if self.config.kvc_backend == "per-layer-arena" and target_layer is not None:
-                selected = []
-                stale: List[Tuple[int, int, int]] = []
-                scanned = 0
-                for req_idx, required_prefix_len in active_lens.items():
-                    sorted_keys, positions = (
-                        self._sorted_per_layer_offloaded_keys_for_req_layer(
-                            int(req_idx), int(target_layer)
-                        )
-                    )
-                    if not sorted_keys:
-                        continue
-                    self.stats.kvc_layerwise_required_index_hit_count += 1
-                    limit = bisect.bisect_right(
-                        positions, max(0, int(required_prefix_len) - 1)
-                    )
-                    if limit <= 0:
-                        continue
-                    for idx in range(limit):
-                        key = sorted_keys[idx]
-                        scanned += 1
-                        entry = self._per_layer_residency.get(key)
-                        if entry is None or entry.state != "offloaded":
-                            stale.append(key)
-                            continue
-                        if int(entry.pos) + int(entry.token_count) > int(
-                            required_prefix_len
-                        ):
-                            continue
-                        selected.append(entry)
-                self.stats.kvc_layerwise_required_index_scan_count += scanned
-                self.stats.kvc_required_scanned_keys += scanned
-                if stale:
-                    for key in stale:
-                        self._untrack_per_layer_offloaded_key(key)
-                    self.stats.kvc_layerwise_required_index_stale_count += len(stale)
+                selected = self._select_offloaded_run_entries_for_virtual_layer(
+                    int(target_layer), active_lens
+                )
             else:
                 source_entries = (
                     self._per_layer_residency.values()
@@ -10704,28 +11025,25 @@ class LayerKVRuntime:
                 pos_start = int(entry.pos)
                 base = int(flat_base_by_req[req_idx])
                 row = int(row_by_req[req_idx])
-                if direct_kv_indices_only and token_count_for_entry == 1:
-                    pos = pos_start
-                    flat_index = base + int(pos)
-                    flat_indices.append(flat_index)
-                    row_indices.append(row)
-                    positions.append(pos)
-                    if span_len > 0 and flat_index == span_start + span_len:
-                        span_len += 1
+                if direct_kv_indices_only:
+                    run_len = int(token_count_for_entry)
+                    flat_start = base + pos_start
+                    if span_len > 0 and flat_start == span_start + span_len:
+                        span_len += run_len
                     else:
                         if span_len > 0:
                             flat_spans.append(
                                 (span_start, span_scratch_start, span_len)
                             )
-                        span_start = int(flat_index)
+                        span_start = int(flat_start)
                         span_scratch_start = int(scratch_offset)
-                        span_len = 1
+                        span_len = int(run_len)
                     if (
                         row_span_len > 0
                         and row == row_span_row
-                        and pos == row_span_start + row_span_len
+                        and pos_start == row_span_start + row_span_len
                     ):
-                        row_span_len += 1
+                        row_span_len += run_len
                     else:
                         if row_span_len > 0:
                             row_spans.append(
@@ -10737,50 +11055,14 @@ class LayerKVRuntime:
                                 )
                             )
                         row_span_row = int(row)
-                        row_span_start = int(pos)
+                        row_span_start = int(pos_start)
                         row_span_scratch_start = int(scratch_offset)
-                        row_span_len = 1
-                    scratch_offset += 1
+                        row_span_len = int(run_len)
+                    scratch_offset += run_len
                     continue
                 for pos in range(pos_start, pos_start + token_count_for_entry):
                     flat_index = base + int(pos)
-                    if direct_kv_indices_only:
-                        flat_indices.append(flat_index)
-                        row_indices.append(row)
-                        positions.append(pos)
-                        if span_len > 0 and flat_index == span_start + span_len:
-                            span_len += 1
-                        else:
-                            if span_len > 0:
-                                flat_spans.append(
-                                    (span_start, span_scratch_start, span_len)
-                                )
-                            span_start = int(flat_index)
-                            span_scratch_start = int(scratch_offset)
-                            span_len = 1
-                        if (
-                            row_span_len > 0
-                            and row == row_span_row
-                            and pos == row_span_start + row_span_len
-                        ):
-                            row_span_len += 1
-                        else:
-                            if row_span_len > 0:
-                                row_spans.append(
-                                    (
-                                        row_span_row,
-                                        row_span_start,
-                                        row_span_scratch_start,
-                                        row_span_len,
-                                    )
-                                )
-                            row_span_row = int(row)
-                            row_span_start = int(pos)
-                            row_span_scratch_start = int(scratch_offset)
-                            row_span_len = 1
-                        scratch_offset += 1
-                    else:
-                        flat_indices.append(flat_index)
+                    flat_indices.append(flat_index)
                 if not direct_kv_indices_only:
                     req_indices.extend([req_idx] * token_count_for_entry)
                     positions.extend(range(pos_start, pos_start + token_count_for_entry))
@@ -10798,7 +11080,10 @@ class LayerKVRuntime:
                 )
             host_slots: List[int] = []
             for entry in selected:
-                host_slots.extend(entry.host_slot_list())
+                if entry.host_slots is not None:
+                    host_slots.extend(entry.host_slots)
+                elif entry.host_slot is not None:
+                    host_slots.append(int(entry.host_slot))
             host_signature = self._host_slot_signature(host_slots)
             host_slice = self._contiguous_host_slice(host_slots)
             host_index_cpu = (
@@ -10863,9 +11148,7 @@ class LayerKVRuntime:
     def _host_slot_signature(host_slots: List[int]) -> Tuple[int, int, int, int]:
         if not host_slots:
             return (0, 0, 0, 0)
-        checksum = 0
-        for slot in host_slots:
-            checksum = (checksum + int(slot)) & 0x7FFFFFFF
+        checksum = int(sum(host_slots)) & 0x7FFFFFFF
         return (
             len(host_slots),
             int(host_slots[0]),
@@ -10878,6 +11161,9 @@ class LayerKVRuntime:
         if not host_slots:
             return (-1, 0)
         first = int(host_slots[0])
+        last = int(host_slots[-1])
+        if last - first + 1 != len(host_slots):
+            return (-1, 0)
         for offset, slot in enumerate(host_slots):
             if int(slot) != first + int(offset):
                 return (-1, 0)
@@ -11060,6 +11346,10 @@ class LayerKVRuntime:
                 if cache_entry.scratch_tensor is None or (
                     cache_entry.scratch_tensor.device != kv_indices.device
                     or cache_entry.scratch_tensor.dtype != kv_indices.dtype
+                    or int(cache_entry.scratch_tensor.numel())
+                    != int(scratch_locs.numel())
+                    or int(cache_entry.scratch_tensor.data_ptr())
+                    != int(scratch_locs.data_ptr())
                 ):
                     cache_entry.scratch_tensor = scratch_locs.to(
                         device=kv_indices.device, dtype=kv_indices.dtype
@@ -11079,6 +11369,28 @@ class LayerKVRuntime:
                                 device=kv_indices.device,
                             )
                         kv_indices[cache_entry.flat_tensor] = cache_entry.scratch_tensor
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                    if len(demand.flat_spans) > 16:
+                        if cache_entry.flat_span_tensor is None or (
+                            cache_entry.flat_span_tensor.device != kv_indices.device
+                        ):
+                            (
+                                cache_entry.flat_span_tensor,
+                                cache_entry.flat_span_scratch_tensor,
+                            ) = self._metadata_flat_span_scatter_tensors(
+                                demand.flat_spans,
+                                int(demand.token_count),
+                                kv_indices.device,
+                            )
+                        kv_indices[cache_entry.flat_span_tensor] = (
+                            cache_entry.scratch_tensor[
+                                cache_entry.flat_span_scratch_tensor
+                            ]
+                        )
                         self.stats.metadata_patch_slice_count += 1
                         self.stats.metadata_patch_slice_token_count += int(
                             demand.token_count
@@ -11143,6 +11455,10 @@ class LayerKVRuntime:
                 if cache_entry.scratch_tensor is None or (
                     cache_entry.scratch_tensor.device != page_table.device
                     or cache_entry.scratch_tensor.dtype != page_table.dtype
+                    or int(cache_entry.scratch_tensor.numel())
+                    != int(scratch_locs.numel())
+                    or int(cache_entry.scratch_tensor.data_ptr())
+                    != int(scratch_locs.data_ptr())
                 ):
                     cache_entry.scratch_tensor = scratch_locs.to(
                         device=page_table.device, dtype=page_table.dtype
@@ -11174,6 +11490,31 @@ class LayerKVRuntime:
                         page_table[cache_entry.row_tensor, cache_entry.pos_tensor] = (
                             cache_entry.scratch_tensor
                         )
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                    if len(demand.row_spans) > 16:
+                        if cache_entry.row_span_row_tensor is None or (
+                            cache_entry.row_span_row_tensor.device
+                            != page_table.device
+                        ):
+                            (
+                                cache_entry.row_span_row_tensor,
+                                cache_entry.row_span_pos_tensor,
+                                cache_entry.row_span_scratch_tensor,
+                            ) = self._metadata_row_span_scatter_tensors(
+                                demand.row_spans,
+                                int(demand.token_count),
+                                page_table.device,
+                            )
+                        page_table[
+                            cache_entry.row_span_row_tensor,
+                            cache_entry.row_span_pos_tensor,
+                        ] = cache_entry.scratch_tensor[
+                            cache_entry.row_span_scratch_tensor
+                        ]
                         self.stats.metadata_patch_slice_count += 1
                         self.stats.metadata_patch_slice_token_count += int(
                             demand.token_count
@@ -11268,6 +11609,75 @@ class LayerKVRuntime:
                 return None
         return row, start, start + len(positions)
 
+    @staticmethod
+    def _metadata_flat_span_scatter_tensors(
+        spans: Tuple[Tuple[int, int, int], ...],
+        token_count: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        starts = torch.tensor(
+            [int(start) for start, _offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        scratch_starts = torch.tensor(
+            [int(offset) for _start, offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        lengths = torch.tensor(
+            [int(length) for _start, _offset, length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        span_ids = torch.repeat_interleave(
+            torch.arange(int(lengths.numel()), dtype=torch.int64, device=device),
+            lengths,
+        )
+        span_bases = torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
+        offsets = torch.arange(int(token_count), dtype=torch.int64, device=device)
+        local_offsets = offsets - span_bases
+        return starts[span_ids] + local_offsets, scratch_starts[span_ids] + local_offsets
+
+    @staticmethod
+    def _metadata_row_span_scatter_tensors(
+        spans: Tuple[Tuple[int, int, int, int], ...],
+        token_count: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = torch.tensor(
+            [int(row) for row, _start, _offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        starts = torch.tensor(
+            [int(start) for _row, start, _offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        scratch_starts = torch.tensor(
+            [int(offset) for _row, _start, offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        lengths = torch.tensor(
+            [int(length) for _row, _start, _offset, length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        span_ids = torch.repeat_interleave(
+            torch.arange(int(lengths.numel()), dtype=torch.int64, device=device),
+            lengths,
+        )
+        span_bases = torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
+        offsets = torch.arange(int(token_count), dtype=torch.int64, device=device)
+        local_offsets = offsets - span_bases
+        return (
+            rows[span_ids],
+            starts[span_ids] + local_offsets,
+            scratch_starts[span_ids] + local_offsets,
+        )
+
     def _metadata_patch_cache_entry(
         self,
         layer_id: int,
@@ -11290,7 +11700,6 @@ class LayerKVRuntime:
             metadata_shape = ()
             metadata_device = ""
         metadata_signature = (
-            demand.signature,
             self._metadata_int_tuple_signature(demand.req_indices),
             self._metadata_int_tuple_signature(demand.positions),
             self._metadata_int_tuple_signature(demand.row_indices),
@@ -11303,16 +11712,12 @@ class LayerKVRuntime:
             metadata_kind,
             metadata_shape,
             metadata_device,
-            int(scratch_locs.numel()),
-            int(scratch_locs.data_ptr()),
             metadata_signature,
         )
         shared_key = (
             metadata_kind,
             metadata_shape,
             metadata_device,
-            int(scratch_locs.numel()),
-            int(scratch_locs.data_ptr()),
             metadata_signature,
         )
         lookup_key = (int(layer_id), metadata_kind)
@@ -11324,7 +11729,11 @@ class LayerKVRuntime:
                 entry.row_tensor = shared.row_tensor
                 entry.pos_tensor = shared.pos_tensor
                 entry.flat_tensor = shared.flat_tensor
-                entry.scratch_tensor = shared.scratch_tensor
+                entry.flat_span_tensor = shared.flat_span_tensor
+                entry.flat_span_scratch_tensor = shared.flat_span_scratch_tensor
+                entry.row_span_row_tensor = shared.row_span_row_tensor
+                entry.row_span_pos_tensor = shared.row_span_pos_tensor
+                entry.row_span_scratch_tensor = shared.row_span_scratch_tensor
                 shared.hit_count += 1
                 self.stats.metadata_patch_cache_hit_count += 1
             else:
@@ -11733,6 +12142,306 @@ class LayerKVRuntime:
         self._sync_kvc_group_if_needed(entry)
         return entry
 
+    def register_native_kvc_runs_for_extend(
+        self,
+        *,
+        reqs: List[Any],
+        prefix_lens: List[int],
+        seq_lens: List[int],
+        locs: torch.Tensor,
+    ) -> None:
+        if not self._per_layer_allocator_enabled():
+            return
+        if locs is None or int(locs.numel()) <= 0:
+            return
+        try:
+            loc_list = tuple(int(x) for x in locs.detach().cpu().tolist())
+        except Exception:
+            return
+        offset = 0
+        changed = False
+        for req, prefix_len, seq_len in zip(reqs, prefix_lens, seq_lens):
+            req_idx = getattr(req, "req_pool_idx", None)
+            start = int(prefix_len)
+            end = int(seq_len)
+            count = max(0, end - start)
+            req_locs = loc_list[offset : offset + count]
+            offset += count
+            if req_idx is None or count <= 0 or len(req_locs) != count:
+                continue
+            req_idx = int(req_idx)
+            runs = self._native_kvc_runs_by_req.setdefault(req_idx, [])
+            if runs and int(runs[-1].end) == start:
+                previous = runs[-1]
+                previous.end = end
+                previous.locs = tuple(previous.locs) + tuple(int(x) for x in req_locs)
+            else:
+                runs.append(
+                    _LayerKVNativeKvcRun(
+                        req_idx=req_idx,
+                        start=start,
+                        end=end,
+                        locs=tuple(int(x) for x in req_locs),
+                    )
+                )
+            changed = True
+        if changed:
+            for req_idx in list(self._native_kvc_runs_by_req):
+                self._native_kvc_runs_by_req[req_idx].sort(
+                    key=lambda run: (int(run.start), int(run.end))
+                )
+
+    def _find_native_kvc_run(
+        self, req_idx: int, pos: int, count: int
+    ) -> Optional[_LayerKVNativeKvcRun]:
+        runs = self._native_kvc_runs_by_req.get(int(req_idx))
+        if not runs:
+            return None
+        pos = int(pos)
+        count = int(count)
+        for run in runs:
+            if run.contains(pos, count):
+                return run
+            if int(run.start) > pos:
+                break
+        return None
+
+    def _drop_native_kvc_runs_for_req(self, req_idx: int) -> None:
+        self._native_kvc_runs_by_req.pop(int(req_idx), None)
+
+    def _drop_offloaded_kvc_runs_for_req(self, req_idx: int) -> None:
+        req_idx = int(req_idx)
+        for key in list(self._per_layer_offloaded_runs_by_req_layer):
+            if int(key[0]) == req_idx:
+                self._per_layer_offloaded_runs_by_req_layer.pop(key, None)
+
+    def _prune_native_kvc_runs_for_active_lengths(
+        self, active_lens: Dict[int, int]
+    ) -> None:
+        for req_idx in list(self._native_kvc_runs_by_req):
+            active_len = active_lens.get(int(req_idx))
+            if active_len is None:
+                continue
+            active_len = int(active_len)
+            pruned: List[_LayerKVNativeKvcRun] = []
+            for run in self._native_kvc_runs_by_req.get(int(req_idx), []):
+                if int(run.start) >= active_len:
+                    continue
+                if int(run.end) > active_len:
+                    keep = max(0, active_len - int(run.start))
+                    run.end = active_len
+                    run.locs = tuple(run.locs[:keep])
+                if int(run.end) > int(run.start) and run.locs:
+                    pruned.append(run)
+            if pruned:
+                self._native_kvc_runs_by_req[int(req_idx)] = pruned
+            else:
+                self._native_kvc_runs_by_req.pop(int(req_idx), None)
+
+    def _prune_offloaded_kvc_runs_for_active_lengths(
+        self, active_lens: Dict[int, int]
+    ) -> None:
+        for key in list(self._per_layer_offloaded_runs_by_req_layer):
+            req_idx, _layer_id = (int(key[0]), int(key[1]))
+            active_len = active_lens.get(req_idx)
+            if active_len is None:
+                continue
+            pruned: List[_LayerKVResidencyEntry] = []
+            for run in self._per_layer_offloaded_runs_by_req_layer.get(key, []):
+                if int(run.pos) >= int(active_len):
+                    continue
+                if int(run.pos) + int(run.token_count) > int(active_len):
+                    keep = max(0, int(active_len) - int(run.pos))
+                    run.page_size = keep
+                    run.host_slots = run.host_slot_list()[:keep]
+                    if run.evicted_device_locs:
+                        run.evicted_device_locs = run.evicted_device_locs[:keep]
+                if int(run.token_count) > 0:
+                    pruned.append(run)
+            if pruned:
+                self._per_layer_offloaded_runs_by_req_layer[key] = pruned
+            else:
+                self._per_layer_offloaded_runs_by_req_layer.pop(key, None)
+
+    def _materialize_per_layer_resident_segment(
+        self, layer_id: int, req_idx: int, pos: int, count: int
+    ) -> Optional[List[_LayerKVResidencyEntry]]:
+        layer_id = int(layer_id)
+        req_idx = int(req_idx)
+        pos = int(pos)
+        count = int(count)
+        if count <= 0:
+            return []
+        native_run = self._find_native_kvc_run(req_idx, pos, count)
+        native_locs = native_run.loc_slice(pos, count) if native_run is not None else ()
+        if native_locs and len(native_locs) != count:
+            return None
+        start_key = (layer_id, req_idx, pos)
+        if (
+            native_locs
+            and self._optimized_profile_enabled()
+            and self._per_layer_allocator_enabled()
+            and start_key not in self._per_layer_residency
+        ):
+            mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
+            locs: List[int] = []
+            for native_loc in native_locs:
+                native_loc = int(native_loc)
+                loc = int(mapping.get(native_loc, native_loc))
+                if loc <= 0:
+                    return None
+                self._import_per_layer_arena_loc(layer_id, loc)
+                mapping.setdefault(native_loc, loc)
+                locs.append(loc)
+            entry = _LayerKVResidencyEntry(
+                req_idx=req_idx,
+                pos=pos,
+                state="resident",
+                layer_id=layer_id,
+                device_loc=locs[0],
+                device_locs=locs,
+                page_size=count,
+                last_access_step=self._decode_step,
+            )
+            self._per_layer_residency[start_key] = entry
+            self._per_layer_resident_token_count_fast += count
+            self._mark_active_req_per_layer_allocated(req_idx, [start_key])
+            self._sync_kvc_group_if_needed(entry)
+            return [entry]
+        range_keys = [
+            (layer_id, req_idx, int(token_pos)) for token_pos in range(pos, pos + count)
+        ]
+        existing_start = self._per_layer_residency.get(range_keys[0])
+        if (
+            existing_start is not None
+            and existing_start.state == "resident"
+            and int(existing_start.token_count) == count
+        ):
+            locs = existing_start.device_loc_list()
+            if len(locs) == count and all(int(loc) > 0 for loc in locs):
+                existing_start.last_access_step = self._decode_step
+                return [existing_start]
+        mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
+        segment_locs: List[int] = []
+        missing_keys: List[Tuple[int, int, int]] = []
+        can_segment = True
+        for offset, key in enumerate(range_keys):
+            entry = self._per_layer_residency.get(key)
+            if entry is None:
+                if not native_locs:
+                    can_segment = False
+                    break
+                native_loc = int(native_locs[offset])
+                loc = int(mapping.get(native_loc, native_loc))
+                if loc <= 0:
+                    can_segment = False
+                    break
+                self._import_per_layer_arena_loc(layer_id, loc)
+                mapping.setdefault(native_loc, loc)
+                segment_locs.append(loc)
+                missing_keys.append(key)
+                continue
+            if entry.state != "resident" or int(entry.token_count) != 1:
+                can_segment = False
+                break
+            locs = entry.device_loc_list()
+            if len(locs) != 1 or int(locs[0]) <= 0:
+                can_segment = False
+                break
+            segment_locs.append(int(locs[0]))
+        if can_segment and len(segment_locs) == count:
+            segment = self._per_layer_residency.get(range_keys[0])
+            if segment is None:
+                segment = _LayerKVResidencyEntry(
+                    req_idx=req_idx,
+                    pos=pos,
+                    state="resident",
+                    layer_id=layer_id,
+                    device_loc=segment_locs[0],
+                    device_locs=segment_locs,
+                    page_size=count,
+                    last_access_step=self._decode_step,
+                )
+                self._per_layer_residency[range_keys[0]] = segment
+            for key in range_keys[1:]:
+                self._per_layer_residency.pop(key, None)
+            segment.pos = pos
+            segment.page_size = count
+            segment.device_loc = segment_locs[0]
+            segment.device_locs = segment_locs
+            segment.last_access_step = self._decode_step
+            if missing_keys:
+                self._per_layer_resident_token_count_fast += len(missing_keys)
+                self._mark_active_req_per_layer_allocated(req_idx, [range_keys[0]])
+                self._sync_kvc_group_if_needed(segment)
+            return [segment]
+        if not any(key in self._per_layer_residency for key in range_keys):
+            if not native_locs:
+                return None
+            locs: List[int] = []
+            for native_loc in native_locs:
+                native_loc = int(native_loc)
+                loc = int(mapping.get(native_loc, native_loc))
+                if loc <= 0:
+                    return None
+                self._import_per_layer_arena_loc(layer_id, loc)
+                mapping.setdefault(native_loc, loc)
+                locs.append(loc)
+            entry = _LayerKVResidencyEntry(
+                req_idx=req_idx,
+                pos=pos,
+                state="resident",
+                layer_id=layer_id,
+                device_loc=locs[0],
+                device_locs=locs,
+                page_size=count,
+                last_access_step=self._decode_step,
+            )
+            self._per_layer_residency[range_keys[0]] = entry
+            self._per_layer_resident_token_count_fast += count
+            self._mark_active_req_per_layer_allocated(req_idx, [range_keys[0]])
+            self._sync_kvc_group_if_needed(entry)
+            return [entry]
+        entries: List[_LayerKVResidencyEntry] = []
+        created_keys: List[Tuple[int, int, int]] = []
+        mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
+        for offset, token_pos in enumerate(range(pos, pos + count)):
+            key = (layer_id, req_idx, int(token_pos))
+            entry = self._per_layer_residency.get(key)
+            if entry is None:
+                if not native_locs:
+                    return None
+                native_loc = int(native_locs[offset])
+                loc = int(mapping.get(native_loc, native_loc))
+                if loc <= 0:
+                    return None
+                self._import_per_layer_arena_loc(layer_id, loc)
+                mapping.setdefault(native_loc, loc)
+                entry = _LayerKVResidencyEntry(
+                    req_idx=req_idx,
+                    pos=int(token_pos),
+                    state="resident",
+                    layer_id=layer_id,
+                    device_loc=loc,
+                    device_locs=[loc],
+                    page_size=1,
+                    last_access_step=self._decode_step,
+                )
+                self._per_layer_residency[key] = entry
+                self._per_layer_resident_token_count_fast += 1
+                created_keys.append(key)
+                self._sync_kvc_group_if_needed(entry)
+            if entry.state != "resident" or int(entry.token_count) != 1:
+                return None
+            locs = entry.device_loc_list()
+            if len(locs) != 1 or int(locs[0]) <= 0:
+                return None
+            entry.last_access_step = self._decode_step
+            entries.append(entry)
+        if created_keys:
+            self._mark_active_req_per_layer_allocated(req_idx, created_keys)
+        return entries
+
     def allocate_per_layer_request_slots(
         self,
         *,
@@ -11940,6 +12649,8 @@ class LayerKVRuntime:
             )
         if not self._ensure_per_layer_physical_arena(required):
             return False
+        if for_prefill:
+            self._ensure_per_layer_common_free_current()
         self._refresh_per_layer_allocator_stats()
         available = (
             self.stats.kvc_per_layer_physical_arena_common_free_tokens
@@ -12128,6 +12839,55 @@ class LayerKVRuntime:
         self._per_layer_offloaded_sorted_by_req_layer.pop((req_idx, layer_id), None)
         self._per_layer_offloaded_positions_by_req_layer.pop((req_idx, layer_id), None)
 
+    def _track_per_layer_offloaded_keys_batch(
+        self, entries: List[_LayerKVResidencyEntry]
+    ) -> None:
+        if not entries:
+            return
+        tokens_by_layer: Dict[int, int] = {}
+        dirty_reqs: Set[int] = set()
+        dirty_req_layers: Set[Tuple[int, int]] = set()
+        changed = False
+        for entry in entries:
+            layer_id = int(entry.layer_id)
+            req_idx = int(entry.req_idx)
+            pos = int(entry.pos)
+            norm_key = (layer_id, req_idx, pos)
+            if norm_key in self._per_layer_offloaded_keys:
+                continue
+            self._per_layer_offloaded_keys.add(norm_key)
+            self._per_layer_offloaded_keys_by_req.setdefault(req_idx, set()).add(
+                norm_key
+            )
+            self._per_layer_offloaded_keys_by_req_layer.setdefault(
+                (req_idx, layer_id), set()
+            ).add(norm_key)
+            tokens = int(entry.token_count)
+            tokens_by_layer[layer_id] = int(tokens_by_layer.get(layer_id, 0)) + tokens
+            dirty_reqs.add(req_idx)
+            dirty_req_layers.add((req_idx, layer_id))
+            changed = True
+        if not changed:
+            return
+        for layer_id, tokens in tokens_by_layer.items():
+            self._per_layer_offloaded_token_count_by_layer[layer_id] = max(
+                0,
+                int(self._per_layer_offloaded_token_count_by_layer.get(layer_id, 0))
+                + int(tokens),
+            )
+        self._per_layer_offloaded_version += 1
+        self._per_layer_offloaded_dirty_reqs.update(dirty_reqs)
+        self._per_layer_offloaded_dirty_req_layers.update(dirty_req_layers)
+        for req_idx in dirty_reqs:
+            self._per_layer_offloaded_sorted_by_req.pop(int(req_idx), None)
+        for req_idx, layer_id in dirty_req_layers:
+            self._per_layer_offloaded_sorted_by_req_layer.pop(
+                (int(req_idx), int(layer_id)), None
+            )
+            self._per_layer_offloaded_positions_by_req_layer.pop(
+                (int(req_idx), int(layer_id)), None
+            )
+
     def _untrack_per_layer_offloaded_key(
         self, key: Tuple[int, int, int], token_count: Optional[int] = None
     ) -> None:
@@ -12166,6 +12926,194 @@ class LayerKVRuntime:
         self._per_layer_offloaded_sorted_by_req.pop(req_idx, None)
         self._per_layer_offloaded_sorted_by_req_layer.pop((req_idx, layer_id), None)
         self._per_layer_offloaded_positions_by_req_layer.pop((req_idx, layer_id), None)
+
+    def _track_per_layer_offloaded_runs(
+        self, entries: List[_LayerKVResidencyEntry]
+    ) -> None:
+        if not entries:
+            return
+        grouped: Dict[Tuple[int, int], List[_LayerKVResidencyEntry]] = {}
+        for entry in sorted(
+            entries,
+            key=lambda item: (int(item.layer_id), int(item.req_idx), int(item.pos)),
+        ):
+            if entry.state != "offloaded":
+                continue
+            host_slots = entry.host_slot_list()
+            if not host_slots:
+                continue
+            layer_id = int(entry.layer_id)
+            req_idx = int(entry.req_idx)
+            key = (req_idx, layer_id)
+            runs = grouped.setdefault(key, [])
+            device_locs = (
+                [int(x) for x in entry.evicted_device_locs]
+                if entry.evicted_device_locs
+                else []
+            )
+            if (
+                runs
+                and int(runs[-1].pos) + int(runs[-1].token_count) == int(entry.pos)
+            ):
+                previous = runs[-1]
+                previous.page_size = int(previous.token_count) + int(entry.token_count)
+                previous.host_slots = previous.host_slot_list() + host_slots
+                if device_locs:
+                    previous.evicted_device_locs = (
+                        [int(x) for x in previous.evicted_device_locs]
+                        if previous.evicted_device_locs
+                        else []
+                    ) + device_locs
+            else:
+                runs.append(
+                    _LayerKVResidencyEntry(
+                        req_idx=req_idx,
+                        pos=int(entry.pos),
+                        state="offloaded",
+                        layer_id=layer_id,
+                        host_slot=int(host_slots[0]),
+                        host_slots=[int(x) for x in host_slots],
+                        evicted_device_locs=device_locs or None,
+                        page_size=int(entry.token_count),
+                        last_access_step=self._decode_step,
+                    )
+                )
+        for key, new_runs in grouped.items():
+            runs = self._per_layer_offloaded_runs_by_req_layer.setdefault(key, [])
+            runs.extend(new_runs)
+            runs.sort(key=lambda item: int(item.pos))
+            merged: List[_LayerKVResidencyEntry] = []
+            for run in runs:
+                if (
+                    merged
+                    and int(merged[-1].pos) + int(merged[-1].token_count)
+                    == int(run.pos)
+                    and merged[-1].state == "offloaded"
+                    and run.state == "offloaded"
+                ):
+                    previous = merged[-1]
+                    previous.page_size = int(previous.token_count) + int(run.token_count)
+                    previous.host_slots = previous.host_slot_list() + run.host_slot_list()
+                    if run.evicted_device_locs:
+                        previous.evicted_device_locs = (
+                            [int(x) for x in previous.evicted_device_locs]
+                            if previous.evicted_device_locs
+                            else []
+                        ) + [int(x) for x in run.evicted_device_locs]
+                else:
+                    merged.append(run)
+            self._per_layer_offloaded_runs_by_req_layer[key] = merged
+
+    def _select_offloaded_run_entries_for_virtual_layer(
+        self, layer_id: int, active_lens: Dict[int, int]
+    ) -> List[_LayerKVResidencyEntry]:
+        layer_id = int(layer_id)
+        selected: List[_LayerKVResidencyEntry] = []
+        scanned = 0
+        for req_idx, required_prefix_len in active_lens.items():
+            runs = self._per_layer_offloaded_runs_by_req_layer.get(
+                (int(req_idx), layer_id)
+            )
+            if not runs:
+                continue
+            self.stats.kvc_layerwise_required_index_hit_count += 1
+            for run in runs:
+                scanned += 1
+                if run.state != "offloaded" or int(run.token_count) <= 0:
+                    continue
+                if int(run.pos) >= int(required_prefix_len):
+                    break
+                if int(run.pos) + int(run.token_count) <= int(required_prefix_len):
+                    selected.append(run)
+                    continue
+                keep = max(0, int(required_prefix_len) - int(run.pos))
+                if keep <= 0:
+                    continue
+                host_slots = run.host_slot_list()[:keep]
+                selected.append(
+                    _LayerKVResidencyEntry(
+                        req_idx=int(run.req_idx),
+                        pos=int(run.pos),
+                        state="offloaded",
+                        layer_id=layer_id,
+                        host_slot=int(host_slots[0]) if host_slots else None,
+                        host_slots=host_slots,
+                        evicted_device_locs=(
+                            [int(x) for x in run.evicted_device_locs[:keep]]
+                            if run.evicted_device_locs
+                            else None
+                        ),
+                        page_size=keep,
+                        last_access_step=self._decode_step,
+                    )
+                )
+        self.stats.kvc_layerwise_required_index_scan_count += scanned
+        self.stats.kvc_required_scanned_keys += scanned
+        return selected
+
+    def _remove_per_layer_offloaded_run_range(
+        self, layer_id: int, req_idx: int, pos: int, count: int
+    ) -> None:
+        key = (int(req_idx), int(layer_id))
+        runs = self._per_layer_offloaded_runs_by_req_layer.get(key)
+        if not runs:
+            return
+        remove_start = int(pos)
+        remove_end = remove_start + max(0, int(count))
+        if remove_end <= remove_start:
+            return
+        next_runs: List[_LayerKVResidencyEntry] = []
+        for run in runs:
+            run_start = int(run.pos)
+            run_end = run_start + int(run.token_count)
+            if remove_end <= run_start or remove_start >= run_end:
+                next_runs.append(run)
+                continue
+            host_slots = run.host_slot_list()
+            evicted_locs = (
+                [int(x) for x in run.evicted_device_locs]
+                if run.evicted_device_locs
+                else []
+            )
+            if remove_start > run_start:
+                left_len = remove_start - run_start
+                next_runs.append(
+                    _LayerKVResidencyEntry(
+                        req_idx=int(run.req_idx),
+                        pos=run_start,
+                        state="offloaded",
+                        layer_id=int(run.layer_id),
+                        host_slot=int(host_slots[0]) if host_slots else None,
+                        host_slots=host_slots[:left_len],
+                        evicted_device_locs=(
+                            evicted_locs[:left_len] if evicted_locs else None
+                        ),
+                        page_size=left_len,
+                        last_access_step=int(run.last_access_step),
+                    )
+                )
+            if remove_end < run_end:
+                right_offset = remove_end - run_start
+                right_slots = host_slots[right_offset:]
+                next_runs.append(
+                    _LayerKVResidencyEntry(
+                        req_idx=int(run.req_idx),
+                        pos=remove_end,
+                        state="offloaded",
+                        layer_id=int(run.layer_id),
+                        host_slot=int(right_slots[0]) if right_slots else None,
+                        host_slots=right_slots,
+                        evicted_device_locs=(
+                            evicted_locs[right_offset:] if evicted_locs else None
+                        ),
+                        page_size=run_end - remove_end,
+                        last_access_step=int(run.last_access_step),
+                    )
+                )
+        if next_runs:
+            self._per_layer_offloaded_runs_by_req_layer[key] = next_runs
+        else:
+            self._per_layer_offloaded_runs_by_req_layer.pop(key, None)
 
     def _sorted_per_layer_offloaded_keys_for_req_layer(
         self, req_idx: int, layer_id: int
@@ -12266,6 +13214,7 @@ class LayerKVRuntime:
         self._per_layer_offloaded_keys.clear()
         self._per_layer_offloaded_keys_by_req.clear()
         self._per_layer_offloaded_keys_by_req_layer.clear()
+        self._per_layer_offloaded_runs_by_req_layer.clear()
         self._per_layer_offloaded_token_count_by_layer.clear()
         self._per_layer_offloaded_sorted_by_req.clear()
         self._per_layer_offloaded_sorted_by_req_layer.clear()
@@ -12482,6 +13431,8 @@ class LayerKVRuntime:
         self._per_layer_kvc_prepared_layers.clear()
         self._virtual_materialize_plan = None
         self._virtual_materialize_plans_by_layer.clear()
+        self._virtual_batch_index_step = -1
+        self._virtual_batch_index_cache = None
         self._virtual_kvc_demands.clear()
         self._kvc_demand_signature_eval_step = None
         self._per_layer_kvc_current_metadata_key = None
@@ -13634,6 +14585,12 @@ class LayerKVRuntime:
                             (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
                             token_count=int(entry.token_count),
                         )
+                        self._remove_per_layer_offloaded_run_range(
+                            int(entry.layer_id),
+                            int(entry.req_idx),
+                            int(entry.pos),
+                            int(entry.token_count),
+                        )
                         self._per_layer_offloaded_token_count_fast = max(
                             0,
                             self._per_layer_offloaded_token_count_fast
@@ -13648,6 +14605,12 @@ class LayerKVRuntime:
                         self._untrack_per_layer_offloaded_key(
                             (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
                             token_count=int(entry.token_count),
+                        )
+                        self._remove_per_layer_offloaded_run_range(
+                            int(entry.layer_id),
+                            int(entry.req_idx),
+                            int(entry.pos),
+                            int(entry.token_count),
                         )
                         self._per_layer_offloaded_token_count_fast = max(
                             0,
@@ -13879,11 +14842,12 @@ class LayerKVRuntime:
             self.stats.selected_kvc_tokens_by_layer = self._kvc_tokens_by_layer_json(
                 token_count
             )
-        host_slots = (
-            self._host_store.alloc_per_layer(selected)
-            if self.config.kvc_backend == "per-layer-arena"
-            else self._host_store.alloc(token_count)
-        )
+        with self._profile("profile_kvc_host_alloc_ms"):
+            host_slots = (
+                self._host_store.alloc_per_layer(selected)
+                if self.config.kvc_backend == "per-layer-arena"
+                else self._host_store.alloc(token_count)
+            )
         if host_slots is None:
             self.stats.kvc_physical_failure_count += 1
             self.stats.comparable = False
@@ -13908,7 +14872,10 @@ class LayerKVRuntime:
         )
         try:
             if self.config.kvc_backend == "per-layer-arena":
-                elapsed_ms = self._host_store.backup_per_layer(selected, host_slots)
+                with self._profile("profile_kvc_backup_wall_ms"):
+                    elapsed_ms = self._host_store.backup_per_layer(
+                        selected, host_slots
+                    )
                 self.stats.kvc_allocator_available_before = (
                     self._allocator_available_size()
                 )
@@ -13960,7 +14927,8 @@ class LayerKVRuntime:
                 return
             else:
                 assert old_locs is not None
-                elapsed_ms = self._host_store.backup(old_locs, host_slots)
+                with self._profile("profile_kvc_backup_wall_ms"):
+                    elapsed_ms = self._host_store.backup(old_locs, host_slots)
                 self.stats.kvc_allocator_available_before = (
                     self._allocator_available_size()
                 )
@@ -13969,64 +14937,74 @@ class LayerKVRuntime:
                     self._allocator_available_size()
                 )
                 self.stats.kvc_allocator_free_count += 1
-            offset = 0
-            per_layer_locs_to_free: Dict[int, List[int]] = {}
-            for entry in selected:
-                page_host_slots = host_slots[offset : offset + entry.token_count]
-                offset += entry.token_count
-                entry.state = "offloaded"
-                if self.config.kvc_backend == "virtual-arena":
-                    self.stats.virtual_kvc_evict_count += int(entry.token_count)
+            with self._profile("profile_kvc_evict_commit_ms"):
+                offset = 0
+                per_layer_locs_to_free: Dict[int, List[int]] = {}
+                per_layer_offloaded_to_track: List[_LayerKVResidencyEntry] = []
+                for entry in selected:
+                    page_host_slots = host_slots[offset : offset + entry.token_count]
+                    offset += entry.token_count
+                    entry.state = "offloaded"
+                    if self.config.kvc_backend == "virtual-arena":
+                        self.stats.virtual_kvc_evict_count += int(entry.token_count)
+                    if self.config.kvc_backend == "per-layer-arena":
+                        per_layer_offloaded_to_track.append(entry)
+                        self._per_layer_resident_token_count_fast = max(
+                            0,
+                            self._per_layer_resident_token_count_fast
+                            - int(entry.token_count),
+                        )
+                        self._per_layer_offloaded_token_count_fast += int(
+                            entry.token_count
+                        )
+                        old_locs_for_free = entry.device_loc_list()
+                        entry.evicted_device_locs = (
+                            [int(x) for x in old_locs_for_free]
+                            if old_locs_for_free
+                            else None
+                        )
+                        if old_locs_for_free:
+                            per_layer_locs_to_free.setdefault(
+                                int(entry.layer_id), []
+                            ).extend(int(loc) for loc in old_locs_for_free)
+                        entry.device_loc = None
+                        entry.device_locs = None
+                    entry.host_slots = [int(x) for x in page_host_slots]
+                    entry.host_slot = (
+                        int(page_host_slots[0]) if page_host_slots else None
+                    )
+                    if self.config.kvc_backend != "per-layer-arena":
+                        entry.device_loc = None
+                        entry.device_locs = None
+                    entry.ready_event = None
+                    entry.ready_start_event = None
+                    entry.ready_waited = False
+                    entry.last_access_step = self._decode_step
+                    self._sync_kvc_group_if_needed(entry)
                 if self.config.kvc_backend == "per-layer-arena":
-                    self._track_per_layer_offloaded_key(
-                        (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
-                        token_count=int(entry.token_count),
+                    self._track_per_layer_offloaded_keys_batch(
+                        per_layer_offloaded_to_track
                     )
-                    self._per_layer_resident_token_count_fast = max(
-                        0,
-                        self._per_layer_resident_token_count_fast
-                        - int(entry.token_count),
+                    self._track_per_layer_offloaded_runs(selected)
+                if per_layer_locs_to_free:
+                    if not self._per_layer_virtual_scratch_enabled():
+                        for layer_id, locs in per_layer_locs_to_free.items():
+                            self._protect_per_layer_terminal_locs(layer_id, locs)
+                    with self._profile("profile_kvc_free_locs_ms"):
+                        self._free_per_layer_locs_batch(
+                            per_layer_locs_to_free, refresh=False
+                        )
+                    self._refresh_per_layer_allocator_stats()
+                if self.config.kvc_backend == "virtual-arena":
+                    for req_idx in {int(entry.req_idx) for entry in selected}:
+                        self._mark_req_virtualized(req_idx)
+                if (
+                    self.config.kvc_backend == "per-layer-arena"
+                    and self._per_layer_virtual_scratch_enabled()
+                ):
+                    self._invalidate_virtual_caches_for_layers(
+                        self._virtual_cache_layers_for_entries(selected)
                     )
-                    self._per_layer_offloaded_token_count_fast += int(entry.token_count)
-                    old_locs_for_free = entry.device_loc_list()
-                    entry.evicted_device_locs = (
-                        [int(x) for x in old_locs_for_free]
-                        if old_locs_for_free
-                        else None
-                    )
-                    if old_locs_for_free:
-                        per_layer_locs_to_free.setdefault(
-                            int(entry.layer_id), []
-                        ).extend(int(loc) for loc in old_locs_for_free)
-                    entry.device_loc = None
-                    entry.device_locs = None
-                entry.host_slots = [int(x) for x in page_host_slots]
-                entry.host_slot = int(page_host_slots[0]) if page_host_slots else None
-                if self.config.kvc_backend != "per-layer-arena":
-                    entry.device_loc = None
-                    entry.device_locs = None
-                entry.ready_event = None
-                entry.ready_start_event = None
-                entry.ready_waited = False
-                entry.last_access_step = self._decode_step
-                self._sync_kvc_group_if_needed(entry)
-            if per_layer_locs_to_free:
-                if not self._per_layer_virtual_scratch_enabled():
-                    for layer_id, locs in per_layer_locs_to_free.items():
-                        self._protect_per_layer_terminal_locs(layer_id, locs)
-                for layer_id, locs in per_layer_locs_to_free.items():
-                    self._free_per_layer_locs(layer_id, locs, refresh=False)
-                self._refresh_per_layer_allocator_stats()
-            if self.config.kvc_backend == "virtual-arena":
-                for req_idx in {int(entry.req_idx) for entry in selected}:
-                    self._mark_req_virtualized(req_idx)
-            if (
-                self.config.kvc_backend == "per-layer-arena"
-                and self._per_layer_virtual_scratch_enabled()
-            ):
-                self._invalidate_virtual_caches_for_layers(
-                    self._virtual_cache_layers_for_entries(selected)
-                )
         except Exception:
             if self.config.kvc_backend == "per-layer-arena":
                 offset = 0
@@ -14047,11 +15025,15 @@ class LayerKVRuntime:
         if self.config.kvc_backend == "per-layer-arena":
             self.stats.kvc_per_layer_evict_count += token_count
             self.stats.kvc_per_layer_backup_ms += elapsed_ms
-            self._record_kvc_layer_cost_observations(selected, elapsed_ms, kind="evict")
+            with self._profile("profile_kvc_cost_observe_ms"):
+                self._record_kvc_layer_cost_observations(
+                    selected, elapsed_ms, kind="evict"
+                )
         self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
         self.stats.kvc_physical_cycle_count += 1
         self.stats.layerkv_tasks_built += 1
-        self._refresh_kvc_residency_stats()
+        with self._profile("profile_kvc_refresh_stats_ms"):
+            self._refresh_kvc_residency_stats()
 
     def _limit_offloaded_tokens(self, reclaim_limit_mb: float) -> int:
         target_bytes = int(reclaim_limit_mb * 1024 * 1024)
@@ -14232,11 +15214,16 @@ class LayerKVRuntime:
             self._host_store is not None
             and self.config.kvc_backend == "per-layer-arena"
         ):
-            host_used_slots = {
-                (self._host_store.start_layer + layer_offset, int(slot))
-                for layer_offset, slots in enumerate(self._host_store.layer_used_slots)
-                for slot in slots
-            }
+            if getattr(self._host_store, "track_layer_used_sets", True):
+                host_used_slots = {
+                    (self._host_store.start_layer + layer_offset, int(slot))
+                    for layer_offset, slots in enumerate(
+                        self._host_store.layer_used_slots
+                    )
+                    for slot in slots
+                }
+            else:
+                host_used_slots = None
         else:
             host_used_slots = (
                 set(self._host_store.used_slots)
@@ -14307,7 +15294,9 @@ class LayerKVRuntime:
                         stale_count += 1
                         reasons.append("duplicate_host_slot")
                     elif (
-                        self._host_store is not None and host_key not in host_used_slots
+                        self._host_store is not None
+                        and host_used_slots is not None
+                        and host_key not in host_used_slots
                     ):
                         stale_count += 1
                         reasons.append("host_slot_not_marked_used")
@@ -14641,7 +15630,8 @@ class LayerKVRuntime:
             per_layer_to_drop = [
                 key for key in self._per_layer_residency if key[1] == req_idx
             ]
-        if not to_drop and not per_layer_to_drop:
+        native_runs = list(self._native_kvc_runs_by_req.get(req_idx, []))
+        if not to_drop and not per_layer_to_drop and not native_runs:
             return
         if self.config.kvc_backend == "virtual-arena":
             req.layerkv_virtualized_kvc = True
@@ -14656,8 +15646,11 @@ class LayerKVRuntime:
             entry = self._per_layer_residency.get(key)
             if entry is not None:
                 token_count += int(entry.token_count)
+        token_count += sum(max(0, int(run.end) - int(run.start)) for run in native_runs)
         self._drop_residency_keys(to_drop)
         self._drop_per_layer_residency_keys(per_layer_to_drop)
+        self._drop_native_kvc_runs_for_req(req_idx)
+        self._drop_offloaded_kvc_runs_for_req(req_idx)
         if self.config.kvc_backend == "per-layer-arena":
             self._per_layer_owned_req_indices.discard(req_idx)
             try:
@@ -14688,6 +15681,8 @@ class LayerKVRuntime:
             and entry.pos + entry.token_count > active_lens[key[1]]
         ]
         self._drop_per_layer_residency_keys(per_layer_to_drop)
+        self._prune_native_kvc_runs_for_active_lengths(active_lens)
+        self._prune_offloaded_kvc_runs_for_active_lengths(active_lens)
         for req_idx in list(self._kvc_evict_cursors):
             if req_idx not in active_lens:
                 continue
@@ -14748,6 +15743,12 @@ class LayerKVRuntime:
             entry = self._per_layer_residency.pop(key, None)
             if entry is not None:
                 if entry.state == "offloaded":
+                    self._remove_per_layer_offloaded_run_range(
+                        int(entry.layer_id),
+                        int(entry.req_idx),
+                        int(entry.pos),
+                        int(entry.token_count),
+                    )
                     self._per_layer_offloaded_token_count_fast = max(
                         0,
                         self._per_layer_offloaded_token_count_fast
@@ -15069,30 +16070,20 @@ class LayerKVRuntime:
                 run_entries: List[_LayerKVResidencyEntry] = []
                 run_locs: Optional[List[int]] = None
                 for layer_id in layer_ids:
-                    layer_entries: List[_LayerKVResidencyEntry] = []
-                    layer_locs: List[int] = []
-                    valid = True
-                    for token_pos in range(pos, pos + run_len):
-                        entry = self._materialize_per_layer_resident_entry(
-                            int(layer_id), req_idx, int(token_pos)
-                        )
-                        self.stats.kvc_evict_selector_scanned_entries += 1
-                        if (
-                            entry is None
-                            or entry.state != "resident"
-                            or int(entry.token_count) != 1
-                        ):
-                            valid = False
-                            break
-                        locs = entry.device_loc_list()
-                        if len(locs) != 1 or int(locs[0]) <= 0:
-                            valid = False
-                            break
-                        layer_entries.append(entry)
-                        layer_locs.append(int(locs[0]))
-                    if not valid:
+                    layer_entries = self._materialize_per_layer_resident_segment(
+                        int(layer_id), req_idx, int(pos), int(run_len)
+                    )
+                    self.stats.kvc_evict_selector_scanned_entries += int(run_len)
+                    if layer_entries is None or sum(
+                        int(entry.token_count) for entry in layer_entries
+                    ) != int(run_len):
                         run_entries = []
                         break
+                    layer_locs = [
+                        int(loc)
+                        for entry in layer_entries
+                        for loc in entry.device_loc_list()
+                    ]
                     if run_locs is None:
                         run_locs = layer_locs
                     elif run_locs != layer_locs:
@@ -15214,26 +16205,13 @@ class LayerKVRuntime:
             if not layer_segments:
                 continue
             for req_idx, pos, count in layer_segments:
-                segment_entries: List[_LayerKVResidencyEntry] = []
-                valid = True
-                for token_pos in range(int(pos), int(pos) + int(count)):
-                    entry = self._materialize_per_layer_resident_entry(
-                        layer_id, int(req_idx), int(token_pos)
-                    )
-                    self.stats.kvc_evict_selector_scanned_entries += 1
-                    if (
-                        entry is None
-                        or entry.state != "resident"
-                        or int(entry.token_count) != 1
-                    ):
-                        valid = False
-                        break
-                    locs = entry.device_loc_list()
-                    if len(locs) != 1 or int(locs[0]) <= 0:
-                        valid = False
-                        break
-                    segment_entries.append(entry)
-                if not valid or len(segment_entries) != int(count):
+                segment_entries = self._materialize_per_layer_resident_segment(
+                    layer_id, int(req_idx), int(pos), int(count)
+                )
+                self.stats.kvc_evict_selector_scanned_entries += int(count)
+                if segment_entries is None or sum(
+                    int(entry.token_count) for entry in segment_entries
+                ) != int(count):
                     continue
                 self.stats.kvc_evict_candidate_scan_tokens += int(count)
                 for entry in segment_entries:
@@ -15246,7 +16224,7 @@ class LayerKVRuntime:
                 old_cursor = self._kvc_evict_cursors_by_layer.get(cursor_key, 0)
                 if next_pos > old_cursor:
                     self._kvc_evict_cursors_by_layer[cursor_key] = next_pos
-        selected.sort(key=lambda x: (x.layer_id, x.pos, x.req_idx))
+        selected.sort(key=lambda x: (x.layer_id, x.req_idx, x.pos))
         selected_tokens = sum(entry.token_count for entry in selected)
         self.stats.kvc_evict_candidate_selected_tokens += selected_tokens
         self.stats.kvc_evict_selector_selected_entries += len(selected)

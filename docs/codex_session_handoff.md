@@ -1036,3 +1036,100 @@ Phase 5.4 feasibility audit:
 - Recommendation: keep the async compact prebuild path for Phase 5, and treat
   no-physical-shrink as a later kernel/runner design task rather than a local
   runtime patch.
+
+## KVC Virtual Reload Bottleneck
+
+Recorded: 2026-06-01T00:00:00Z
+
+Context:
+
+- The current CoResid regression on the batch-heavy 2048-token workload is no
+  longer primarily expert hotness, expert install, or ready-miss stall.
+- Dynamic KVC pressure falls back to KVC reclaim, but ordinary KVC-only reclaim
+  is not the optimization target. Future workloads may be more random, so the
+  path cannot simply be bypassed.
+
+Command:
+
+```bash
+PYTHONNOUSERSITE=1 /data/wenyan/conda/envs/moe-runtime/bin/python \
+  scripts/layerkv_policy_eval.py \
+  --backend server --gpu 1 \
+  --model-path /data/hf-cache/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39 \
+  --workload batch-heavy-2048 --max-total-tokens 225000 \
+  --policies coresid --dynamic-pressure-from-kvc --profile-detail \
+  --output-dir /data/wenyan/tmp/layerkv_fix59_kvc_reload_profile_225k \
+  --timeout-s 900 --startup-timeout-s 900 --request-timeout-s 900 \
+  --watchdog-timeout-s 1200 --log-level info
+```
+
+Measured result:
+
+- `request_wall_ms=20959.6`
+- `benchmark_decode0_latency_ms=1310.0`
+- `output_throughput_tok_s=97.7`
+- `layerkv_python_overhead_ms=2051.7`
+- `virtual_kvc_materialize_ms=2047.3`
+- `virtual_kvc_materialize_count=672`
+- `virtual_kvc_materialize_token_count=1432016`
+- `kvc_ready_miss_stall_ms=0.0`
+- `scheduler_exposed_wait_ms=1.5`
+
+Fine-grained reload profile:
+
+- `profile_virtual_reload_prepare_ms=1.2`
+- `profile_virtual_reload_contiguous_check_ms=8.5`
+- `profile_virtual_reload_issue_wall_ms=2061.5`
+- `profile_virtual_reload_sync_wall_ms=2.2`
+- `virtual_kvc_reload_async_count=327`
+- `virtual_kvc_reload_sync_count=345`
+- `virtual_kvc_reload_slice_count=61`
+- `virtual_kvc_reload_slice_token_count=51552`
+- `virtual_kvc_reload_index_count=611`
+- `virtual_kvc_reload_index_token_count=1380464`
+
+Interpretation:
+
+- This is not a ready-miss wait problem. Prefetch readiness is effectively
+  fine in this run.
+- The dominant cost is `reload_layer_to_locs()` issuing virtual KVC recovery.
+- Most reloads use the non-contiguous host-index path:
+  host `index_select` -> temporary GPU tensor -> GPU `index_copy_` into scratch.
+- The Python/PyTorch issue path itself accounts for nearly the whole
+  `virtual_kvc_materialize_ms`; index preparation and final synchronization are
+  small.
+- Peak KVC reclaim is only about `262 MiB`, but those prefix KV entries are
+  repeatedly replayed for attention across decode steps/layers. CoResid saves a
+  small amount of HBM but pays repeated materialization cost.
+
+Code instrumentation added:
+
+- `profile_virtual_reload_prepare_ms`
+- `profile_virtual_reload_contiguous_check_ms`
+- `profile_virtual_reload_issue_wall_ms`
+- `profile_virtual_reload_sync_wall_ms`
+- `virtual_kvc_reload_slice_count`
+- `virtual_kvc_reload_index_count`
+- `virtual_kvc_reload_async_count`
+- `virtual_kvc_reload_sync_count`
+- `virtual_kvc_reload_slice_token_count`
+- `virtual_kvc_reload_index_token_count`
+
+Next direction:
+
+1. Do not optimize by bypassing KVC-only reclaim entirely; that would hide the
+   real random-access problem.
+2. First reduce the physical reload cost:
+   - make host slots/runs more contiguous;
+   - keep offloaded runs as spans where possible;
+   - prefer true slice copies over gather-copy plus `index_copy_`;
+   - avoid temporary GPU tensors in the hot path if a direct copy/scatter path
+     can be introduced.
+3. Revisit planner admission after the physical path is improved. The planner
+   should account for repeated decode-horizon reload cost, not just bytes saved.
+
+Validation:
+
+- `PYTHONNOUSERSITE=1 /data/wenyan/conda/envs/moe-runtime/bin/python -m py_compile python/sglang/srt/layerkv/runtime.py python/sglang/srt/mem_cache/common.py`
+  passed.
+- `git diff --check` passed.
