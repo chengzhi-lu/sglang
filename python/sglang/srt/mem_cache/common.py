@@ -440,7 +440,8 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    reqs = batch.reqs
+    prefix_tensors = [r.prefix_indices for r in reqs]
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
@@ -457,7 +458,46 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        native_capacity = (
+            batch.token_to_kv_pool_allocator.available_size()
+            + batch.tree_cache.evictable_size()
+        )
+        out_cache_parts = []
+        attempted_layerkv = False
+        if native_capacity < batch.extend_num_tokens and batch.extend_num_tokens > 0:
+            kv_pool = batch.token_to_kv_pool_allocator.get_kvcache()
+            layerkv_runtime = getattr(
+                getattr(kv_pool, "layerkv_runtime", None),
+                "allocate_per_layer_request_slots",
+                None,
+            )
+            attempted_layerkv = layerkv_runtime is not None
+        else:
+            kv_pool = batch.token_to_kv_pool_allocator.get_kvcache()
+            layerkv_runtime = None
+        if layerkv_runtime is not None:
+            seq_lens_cpu_list = [int(x) for x in batch.seq_lens_cpu.tolist()]
+            for req, prefix_len, seq_len in zip(
+                reqs, batch.prefix_lens, seq_lens_cpu_list
+            ):
+                locs = layerkv_runtime(
+                    req=req,
+                    positions=list(range(int(prefix_len), int(seq_len))),
+                    common_physical_locs=True,
+                )
+                if locs is None:
+                    out_cache_parts = []
+                    break
+                out_cache_parts.append(locs)
+        if out_cache_parts:
+            out_cache_loc = torch.cat(out_cache_parts)
+        else:
+            runtime_owner = getattr(kv_pool, "layerkv_runtime", None)
+            if attempted_layerkv and runtime_owner is not None and getattr(
+                runtime_owner, "uses_per_layer_logical_allocator", lambda: False
+            )():
+                raise RuntimeError("LayerKV per-layer extend allocation failed")
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
         last_loc = [

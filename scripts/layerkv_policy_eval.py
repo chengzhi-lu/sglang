@@ -535,6 +535,7 @@ def policy_command(
         expert_copy_max_budget_mb=args.expert_copy_max_budget_mb,
         expert_copy_lookahead_layers=args.expert_copy_lookahead_layers,
         expert_copy_force_drain=args.expert_copy_force_drain,
+        dynamic_pressure_from_kvc=args.dynamic_pressure_from_kvc,
     )
 
 
@@ -746,6 +747,7 @@ def server_command(args: argparse.Namespace, spec: PolicyRun, port: int) -> List
             expert_copy_max_budget_mb=args.expert_copy_max_budget_mb,
             expert_copy_lookahead_layers=args.expert_copy_lookahead_layers,
             expert_copy_force_drain=args.expert_copy_force_drain,
+            dynamic_pressure_from_kvc=args.dynamic_pressure_from_kvc,
         )
     )
     return cmd
@@ -1214,6 +1216,11 @@ def main() -> int:
     parser.add_argument("--expert-copy-max-budget-mb", type=float, default=0.0)
     parser.add_argument("--expert-copy-lookahead-layers", type=int, default=0)
     parser.add_argument("--expert-copy-force-drain", action="store_true")
+    parser.add_argument(
+        "--dynamic-pressure-from-kvc",
+        action="store_true",
+        help="Use live KV allocator pressure instead of forcing the Fig4 reclaim target.",
+    )
     parser.add_argument("--tmpdir", default="/data/wenyan/tmp")
     parser.add_argument("--log-level", default="info")
     parser.add_argument("--timeout-s", type=int, default=1200)

@@ -42,6 +42,15 @@ FIG4_WORKLOADS = {
         "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
         "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
     },
+    "batch-heavy-2048": {
+        "batch_size": 128,
+        "input_len": 2048,
+        "min_ctx": 1536,
+        "max_ctx": 2048,
+        "output_len": 16,
+        "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
+        "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
+    },
     "context-heavy": {
         "batch_size": 8,
         "input_len": 32768,

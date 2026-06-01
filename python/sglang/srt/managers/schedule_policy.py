@@ -480,6 +480,27 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+    def _layerkv_prefill_credit_tokens(self) -> int:
+        try:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            runtime = getattr(kv_pool, "layerkv_runtime", None)
+            credit_fn = getattr(runtime, "get_scheduler_admission_credit_tokens", None)
+            if credit_fn is None:
+                return 0
+            return max(
+                0,
+                int(
+                    credit_fn(
+                        required_tokens=0,
+                        available_tokens=0,
+                        reason="decode_prealloc_admission",
+                    )
+                    or 0
+                ),
+            )
+        except Exception:
+            return 0
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
@@ -512,6 +533,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
+        available_and_evictable += self._layerkv_prefill_credit_tokens()
         return available_and_evictable - self.rem_total_token_offset
 
     @property
@@ -539,6 +561,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
+        available_and_evictable += self._layerkv_prefill_credit_tokens()
 
         return available_and_evictable - self.cur_rem_token_offset
 
