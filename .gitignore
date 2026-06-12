@@ -2,6 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.agents/
+.claude/
+.devcontainer/
+.github/
+
+
 
 # C extensions
 *.so
