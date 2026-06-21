@@ -1408,6 +1408,27 @@ class Scheduler(
         model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
         return getattr(model_runner, "layerkv_runtime", None)
 
+    def _layerkv_decode_profile_enabled(self, batch: Optional[ScheduleBatch]):
+        if batch is None:
+            return None
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is None or not getattr(forward_mode, "is_decode", lambda: False)():
+            return None
+        layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None:
+            return None
+        config = getattr(layerkv_runtime, "config", None)
+        if not bool(getattr(config, "profile_detail", False)):
+            return None
+        return layerkv_runtime
+
+    @staticmethod
+    def _layerkv_add_profile_ms(layerkv_runtime, field: str, elapsed_ms: float) -> None:
+        stats = getattr(layerkv_runtime, "stats", None)
+        if stats is None:
+            return
+        setattr(stats, field, float(getattr(stats, field, 0.0) or 0.0) + elapsed_ms)
+
     def _notify_layerkv_schedule_batch(self, batch: Optional[ScheduleBatch]) -> None:
         if batch is None:
             return
@@ -3110,6 +3131,12 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         self._notify_layerkv_schedule_batch(batch)
+        layerkv_decode_profile = self._layerkv_decode_profile_enabled(batch)
+        layerkv_decode_t0 = time.perf_counter() if layerkv_decode_profile is not None else 0.0
+        if layerkv_decode_profile is not None:
+            stats = getattr(layerkv_decode_profile, "stats", None)
+            if stats is not None:
+                stats.profile_decode_batch_count += 1
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -3145,10 +3172,21 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    layerkv_model_t0 = (
+                        time.perf_counter()
+                        if layerkv_decode_profile is not None
+                        else 0.0
+                    )
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
+                    if layerkv_decode_profile is not None:
+                        self._layerkv_add_profile_ms(
+                            layerkv_decode_profile,
+                            "profile_decode_model_forward_ms",
+                            (time.perf_counter() - layerkv_model_t0) * 1000.0,
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -3182,9 +3220,18 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                layerkv_model_t0 = (
+                    time.perf_counter() if layerkv_decode_profile is not None else 0.0
+                )
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
+                if layerkv_decode_profile is not None:
+                    self._layerkv_add_profile_ms(
+                        layerkv_decode_profile,
+                        "profile_decode_model_forward_ms",
+                        (time.perf_counter() - layerkv_model_t0) * 1000.0,
+                    )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3246,6 +3293,12 @@ class Scheduler(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
 
+        if layerkv_decode_profile is not None:
+            self._layerkv_add_profile_ms(
+                layerkv_decode_profile,
+                "profile_decode_scheduler_wall_ms",
+                (time.perf_counter() - layerkv_decode_t0) * 1000.0,
+            )
         return ret
 
     def launch_batch_sample_if_needed(
@@ -3281,6 +3334,10 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        layerkv_decode_profile = self._layerkv_decode_profile_enabled(batch)
+        layerkv_process_t0 = (
+            time.perf_counter() if layerkv_decode_profile is not None else 0.0
+        )
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -3304,6 +3361,12 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.update_device_timer()
+        if layerkv_decode_profile is not None:
+            self._layerkv_add_profile_ms(
+                layerkv_decode_profile,
+                "profile_decode_process_result_ms",
+                (time.perf_counter() - layerkv_process_t0) * 1000.0,
+            )
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

@@ -1,0 +1,720 @@
+"""Host-side KVC backing store for LayerKV."""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import torch
+
+if __package__:
+    from .config_stats import LayerKVStats
+    from .common_types import _LayerKVResidencyEntry
+else:  # pragma: no cover - direct file-loading smoke tests.
+    from config_stats import LayerKVStats
+    from common_types import _LayerKVResidencyEntry
+
+
+class _LayerKVHostKVStore:
+    """Compact pinned host backing for LayerKV-owned evicted MHA KV tokens."""
+
+    def __init__(
+        self,
+        kv_pool: Any,
+        capacity_tokens: int,
+        *,
+        per_layer_mode: bool = False,
+        stats: Optional[LayerKVStats] = None,
+    ):
+        self.kv_pool = kv_pool
+        self.capacity_tokens = max(1, int(capacity_tokens))
+        self.per_layer_mode = bool(per_layer_mode)
+        self.stats = stats
+        self.free_slots: List[int] = list(range(self.capacity_tokens))
+        self.used_slots = set()
+        self.layer_num = int(kv_pool.layer_num)
+        self.start_layer = int(kv_pool.start_layer)
+        self.device = kv_pool.device
+
+        k0 = kv_pool._get_key_buffer(self.start_layer)
+        v0 = kv_pool._get_value_buffer(self.start_layer)
+        self.k_buffers = []
+        self.v_buffers = []
+        self.layer_capacities: List[int] = [0 for _ in range(self.layer_num)]
+        self.layer_free_slots: List[List[int]] = [[] for _ in range(self.layer_num)]
+        self.layer_used_slots: List[Set[int]] = [set() for _ in range(self.layer_num)]
+        self.layer_used_counts: List[int] = [0 for _ in range(self.layer_num)]
+        self.track_layer_used_sets = not self.per_layer_mode
+        self.bytes_per_token_per_layer = int(k0[0].nbytes + v0[0].nbytes)
+        self.bytes_per_token_all_layers = int(
+            (k0[0].nbytes + v0[0].nbytes) * self.layer_num
+        )
+        if self.per_layer_mode:
+            self.k_buffers = [None for _ in range(self.layer_num)]
+            self.v_buffers = [None for _ in range(self.layer_num)]
+            return
+        for layer_offset in range(self.layer_num):
+            layer_id = self.start_layer + layer_offset
+            k_ref = kv_pool._get_key_buffer(layer_id)
+            v_ref = kv_pool._get_value_buffer(layer_id)
+            self.k_buffers.append(
+                self._empty_cpu(
+                    (self.capacity_tokens,) + tuple(k_ref.shape[1:]), k_ref.dtype
+                )
+            )
+            self.v_buffers.append(
+                self._empty_cpu(
+                    (self.capacity_tokens,) + tuple(v_ref.shape[1:]), v_ref.dtype
+                )
+            )
+
+    def _add_profile(self, field: str, elapsed_ms: float) -> None:
+        if self.stats is None:
+            return
+        try:
+            setattr(self.stats, field, float(getattr(self.stats, field)) + elapsed_ms)
+        except Exception:
+            pass
+
+    def _add_stat(self, field: str, value: int = 1) -> None:
+        if self.stats is None:
+            return
+        try:
+            setattr(self.stats, field, int(getattr(self.stats, field)) + int(value))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _empty_cpu(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        try:
+            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+        except Exception:
+            return torch.empty(shape, dtype=dtype, device="cpu")
+
+    @property
+    def used_count(self) -> int:
+        if self.per_layer_mode:
+            return sum(int(count) for count in self.layer_used_counts)
+        return len(self.used_slots)
+
+    @property
+    def used_mb(self) -> float:
+        if self.per_layer_mode:
+            return self.used_count * self.bytes_per_token_per_layer / float(1024 * 1024)
+        return self.used_count * self.bytes_per_token_all_layers / float(1024 * 1024)
+
+    @property
+    def capacity_mb(self) -> float:
+        if self.per_layer_mode:
+            return (
+                sum(self.layer_capacities)
+                * self.bytes_per_token_per_layer
+                / float(1024 * 1024)
+            )
+        return (
+            self.capacity_tokens * self.bytes_per_token_all_layers / float(1024 * 1024)
+        )
+
+    def _ensure_layer_capacity(self, layer_offset: int, need_free: int) -> None:
+        if not self.per_layer_mode or need_free <= len(
+            self.layer_free_slots[layer_offset]
+        ):
+            return
+        layer_id = self.start_layer + layer_offset
+        k_ref = self.kv_pool._get_key_buffer(layer_id)
+        v_ref = self.kv_pool._get_value_buffer(layer_id)
+        old_capacity = self.layer_capacities[layer_offset]
+        used = int(self.layer_used_counts[layer_offset])
+        required = used + int(need_free)
+        initial_chunk = min(max(1, int(self.capacity_tokens)), 4096)
+        new_capacity = max(
+            required,
+            old_capacity * 2 if old_capacity > 0 else 0,
+            initial_chunk,
+            64,
+        )
+        k_new = self._empty_cpu((new_capacity,) + tuple(k_ref.shape[1:]), k_ref.dtype)
+        v_new = self._empty_cpu((new_capacity,) + tuple(v_ref.shape[1:]), v_ref.dtype)
+        k_old = self.k_buffers[layer_offset]
+        v_old = self.v_buffers[layer_offset]
+        if old_capacity > 0 and k_old is not None and v_old is not None:
+            k_new[:old_capacity].copy_(k_old[:old_capacity])
+            v_new[:old_capacity].copy_(v_old[:old_capacity])
+        self.k_buffers[layer_offset] = k_new
+        self.v_buffers[layer_offset] = v_new
+        self.layer_free_slots[layer_offset].extend(range(old_capacity, new_capacity))
+        self.layer_capacities[layer_offset] = new_capacity
+
+    def alloc_per_layer(
+        self, entries: List["_LayerKVResidencyEntry"]
+    ) -> Optional[List[int]]:
+        if not self.per_layer_mode:
+            return self.alloc(sum(entry.token_count for entry in entries))
+        need_by_layer: Dict[int, int] = {}
+        entry_layers: List[int] = []
+        for entry in entries:
+            layer_offset = int(entry.layer_id) - self.start_layer
+            if layer_offset < 0 or layer_offset >= self.layer_num:
+                return None
+            entry_layers.append(layer_offset)
+            need_by_layer[layer_offset] = need_by_layer.get(layer_offset, 0) + int(
+                entry.token_count
+            )
+        for layer_offset, need in need_by_layer.items():
+            self._ensure_layer_capacity(layer_offset, need)
+        for layer_offset, need in need_by_layer.items():
+            if int(need) > len(self.layer_free_slots[layer_offset]):
+                return None
+        allocated_by_layer: Dict[int, List[int]] = {}
+        for layer_offset, need in need_by_layer.items():
+            free = self.layer_free_slots[layer_offset]
+            slots = free[-int(need) :]
+            del free[-int(need) :]
+            self.layer_used_counts[layer_offset] += len(slots)
+            if self.track_layer_used_sets:
+                self.layer_used_slots[layer_offset].update(slots)
+            allocated_by_layer[layer_offset] = slots
+        offsets_by_layer = {int(layer_offset): 0 for layer_offset in need_by_layer}
+        out: List[int] = []
+        for entry, layer_offset in zip(entries, entry_layers):
+            need = int(entry.token_count)
+            offset = offsets_by_layer[layer_offset]
+            slots = allocated_by_layer[layer_offset][offset : offset + need]
+            offsets_by_layer[layer_offset] = offset + need
+            out.extend(slots)
+        return out
+
+    def preallocate_per_layer_capacity(self, tokens_per_layer: int) -> None:
+        if not self.per_layer_mode:
+            return
+        tokens_per_layer = max(0, int(tokens_per_layer))
+        if tokens_per_layer <= 0:
+            return
+        for layer_offset in range(self.layer_num):
+            need = max(
+                0,
+                int(tokens_per_layer) - len(self.layer_free_slots[layer_offset]),
+            )
+            if need > 0:
+                self._ensure_layer_capacity(layer_offset, need)
+
+    def alloc(self, need: int) -> Optional[List[int]]:
+        if self.per_layer_mode:
+            raise RuntimeError("use alloc_per_layer for per-layer KVC host store")
+        if need > len(self.free_slots):
+            return None
+        slots = self.free_slots[-need:]
+        del self.free_slots[-need:]
+        self.used_slots.update(slots)
+        return slots
+
+    def free(self, slots: List[int]) -> None:
+        if self.per_layer_mode:
+            raise RuntimeError("use free_per_layer for per-layer KVC host store")
+        if not slots:
+            return
+        for slot in slots:
+            if slot in self.used_slots:
+                self.used_slots.remove(slot)
+                self.free_slots.append(slot)
+
+    def free_per_layer(self, layer_id: int, slots: List[int]) -> None:
+        if not self.per_layer_mode:
+            self.free(slots)
+            return
+        if not slots:
+            return
+        layer_offset = int(layer_id) - self.start_layer
+        if layer_offset < 0 or layer_offset >= self.layer_num:
+            return
+        free = self.layer_free_slots[layer_offset]
+        if not self.track_layer_used_sets:
+            free.extend(int(slot) for slot in slots)
+            self.layer_used_counts[layer_offset] = max(
+                0, int(self.layer_used_counts[layer_offset]) - len(slots)
+            )
+            return
+        used = self.layer_used_slots[layer_offset]
+        released = 0
+        for slot in slots:
+            slot = int(slot)
+            if slot in used:
+                used.remove(slot)
+                free.append(slot)
+                released += 1
+        self.layer_used_counts[layer_offset] = max(
+            0, int(self.layer_used_counts[layer_offset]) - released
+        )
+
+    @staticmethod
+    def _unit_stride_start(values: List[int]) -> Optional[int]:
+        if not values:
+            return None
+        start = int(values[0])
+        for idx, value in enumerate(values):
+            if int(value) != start + idx:
+                return None
+        return start
+
+    def backup(self, device_locs: torch.Tensor, host_slots: List[int]) -> float:
+        if device_locs.numel() == 0:
+            return 0.0
+        host_index = torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        start.record()
+        for layer_offset in range(self.layer_num):
+            layer_id = self.start_layer + layer_offset
+            k_src = (
+                self.kv_pool._get_key_buffer(layer_id)[device_locs]
+                .detach()
+                .to("cpu", non_blocking=True)
+            )
+            v_src = (
+                self.kv_pool._get_value_buffer(layer_id)[device_locs]
+                .detach()
+                .to("cpu", non_blocking=True)
+            )
+            self.k_buffers[layer_offset].index_copy_(0, host_index, k_src)
+            self.v_buffers[layer_offset].index_copy_(0, host_index, v_src)
+        end.record()
+        end.synchronize()
+        return float(start.elapsed_time(end))
+
+    def backup_to_staging_async(
+        self, device_locs: torch.Tensor, stream: Optional[torch.cuda.Stream]
+    ) -> Tuple[Optional[Any], Optional[Any], List[torch.Tensor], List[torch.Tensor]]:
+        if self.per_layer_mode:
+            raise RuntimeError("per-layer KVC eviction uses backup_per_layer")
+        if device_locs.numel() == 0 or stream is None:
+            return None, None, [], []
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        k_staging: List[torch.Tensor] = []
+        v_staging: List[torch.Tensor] = []
+        with torch.cuda.stream(stream):
+            start.record(stream)
+            for layer_offset in range(self.layer_num):
+                layer_id = self.start_layer + layer_offset
+                k_src = self.kv_pool._get_key_buffer(layer_id)[device_locs].detach()
+                v_src = self.kv_pool._get_value_buffer(layer_id)[device_locs].detach()
+                k_dst = self._empty_cpu(tuple(k_src.shape), k_src.dtype)
+                v_dst = self._empty_cpu(tuple(v_src.shape), v_src.dtype)
+                k_dst.copy_(k_src, non_blocking=True)
+                v_dst.copy_(v_src, non_blocking=True)
+                k_staging.append(k_dst)
+                v_staging.append(v_dst)
+            end.record(stream)
+        return start, end, k_staging, v_staging
+
+    def commit_staging_backup(
+        self,
+        host_slots: List[int],
+        k_staging: List[torch.Tensor],
+        v_staging: List[torch.Tensor],
+    ) -> None:
+        if self.per_layer_mode:
+            raise RuntimeError("per-layer KVC eviction uses backup_per_layer")
+        if not host_slots:
+            return
+        host_index = torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+        for layer_offset in range(self.layer_num):
+            if layer_offset >= len(k_staging) or layer_offset >= len(v_staging):
+                raise RuntimeError("incomplete async KVC eviction staging buffers")
+            self.k_buffers[layer_offset].index_copy_(
+                0, host_index, k_staging[layer_offset]
+            )
+            self.v_buffers[layer_offset].index_copy_(
+                0, host_index, v_staging[layer_offset]
+            )
+
+    def backup_per_layer(
+        self, entries: List[_LayerKVResidencyEntry], host_slots: List[int]
+    ) -> float:
+        if not entries or not host_slots:
+            return 0.0
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        start.record()
+        by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
+        offset = 0
+        for entry in entries:
+            layer_offset = int(entry.layer_id) - self.start_layer
+            if layer_offset < 0 or layer_offset >= self.layer_num:
+                raise RuntimeError(f"invalid per-layer KVC layer_id={entry.layer_id}")
+            count = entry.token_count
+            slots = host_slots[offset : offset + count]
+            offset += count
+            layer_device_locs, layer_host_slots = by_layer.setdefault(
+                layer_offset, ([], [])
+            )
+            layer_device_locs.extend(entry.device_loc_list())
+            layer_host_slots.extend(int(slot) for slot in slots)
+        for layer_offset, (device_loc_list, host_slot_list) in by_layer.items():
+            if not device_loc_list or not host_slot_list:
+                continue
+            layer_id = self.start_layer + layer_offset
+            device_locs = torch.tensor(
+                device_loc_list, dtype=torch.int64, device=self.device
+            )
+            k_src = self.kv_pool._get_key_buffer(layer_id)[device_locs].detach()
+            v_src = self.kv_pool._get_value_buffer(layer_id)[device_locs].detach()
+            host_start = self._unit_stride_start(host_slot_list)
+            if host_start is not None:
+                host_end = int(host_start) + len(host_slot_list)
+                self.k_buffers[layer_offset][host_start:host_end].copy_(
+                    k_src, non_blocking=True
+                )
+                self.v_buffers[layer_offset][host_start:host_end].copy_(
+                    v_src, non_blocking=True
+                )
+            else:
+                host_index = torch.tensor(
+                    host_slot_list, dtype=torch.int64, device="cpu"
+                )
+                self.k_buffers[layer_offset].index_copy_(
+                    0, host_index, k_src.to("cpu", non_blocking=True)
+                )
+                self.v_buffers[layer_offset].index_copy_(
+                    0, host_index, v_src.to("cpu", non_blocking=True)
+                )
+        end.record()
+        end.synchronize()
+        return float(start.elapsed_time(end))
+
+    def reload(
+        self,
+        host_slots: List[int],
+        device_locs: torch.Tensor,
+        stream: Optional[torch.cuda.Stream] = None,
+        async_copy: bool = False,
+    ) -> Tuple[float, Optional[Any], Optional[Any]]:
+        if device_locs.numel() == 0:
+            return 0.0, None, None
+        host_index = torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        active_stream = stream if async_copy and stream is not None else None
+
+        def issue_copy() -> None:
+            if active_stream is not None:
+                start.record(active_stream)
+            else:
+                start.record()
+            for layer_offset in range(self.layer_num):
+                layer_id = self.start_layer + layer_offset
+                k_src = (
+                    self.k_buffers[layer_offset]
+                    .index_select(0, host_index)
+                    .to(self.device, non_blocking=True)
+                )
+                v_src = (
+                    self.v_buffers[layer_offset]
+                    .index_select(0, host_index)
+                    .to(self.device, non_blocking=True)
+                )
+                self.kv_pool._get_key_buffer(layer_id).index_copy_(
+                    0, device_locs, k_src
+                )
+                self.kv_pool._get_value_buffer(layer_id).index_copy_(
+                    0, device_locs, v_src
+                )
+            if active_stream is not None:
+                end.record(active_stream)
+            else:
+                end.record()
+
+        if active_stream is not None:
+            with torch.cuda.stream(active_stream):
+                issue_copy()
+            return 0.0, start, end
+
+        issue_copy()
+        end.synchronize()
+        return float(start.elapsed_time(end)), start, end
+
+    def reload_per_layer(
+        self,
+        entries: List[_LayerKVResidencyEntry],
+        stream: Optional[torch.cuda.Stream] = None,
+        async_copy: bool = False,
+    ) -> Tuple[float, Optional[Any], Optional[Any]]:
+        if not entries:
+            return 0.0, None, None
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        active_stream = stream if async_copy and stream is not None else None
+
+        def issue_copy() -> None:
+            if active_stream is not None:
+                start.record(active_stream)
+            else:
+                start.record()
+            by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
+            for entry in entries:
+                layer_offset = int(entry.layer_id) - self.start_layer
+                if layer_offset < 0 or layer_offset >= self.layer_num:
+                    raise RuntimeError(
+                        f"invalid per-layer KVC layer_id={entry.layer_id}"
+                    )
+                host_slots = entry.host_slot_list()
+                device_locs_list = entry.device_loc_list()
+                if not host_slots or not device_locs_list:
+                    continue
+                layer_host_slots, layer_device_locs = by_layer.setdefault(
+                    layer_offset, ([], [])
+                )
+                layer_host_slots.extend(int(slot) for slot in host_slots)
+                layer_device_locs.extend(int(loc) for loc in device_locs_list)
+            for layer_offset, (host_slot_list, device_loc_list) in by_layer.items():
+                if not host_slot_list or not device_loc_list:
+                    continue
+                layer_id = self.start_layer + layer_offset
+                host_index = torch.tensor(
+                    host_slot_list, dtype=torch.int64, device="cpu"
+                )
+                device_locs = torch.tensor(
+                    device_loc_list, dtype=torch.int64, device=self.device
+                )
+                k_src = (
+                    self.k_buffers[layer_offset]
+                    .index_select(0, host_index)
+                    .to(self.device, non_blocking=True)
+                )
+                v_src = (
+                    self.v_buffers[layer_offset]
+                    .index_select(0, host_index)
+                    .to(self.device, non_blocking=True)
+                )
+                self.kv_pool._get_key_buffer(layer_id).index_copy_(
+                    0, device_locs, k_src
+                )
+                self.kv_pool._get_value_buffer(layer_id).index_copy_(
+                    0, device_locs, v_src
+                )
+            if active_stream is not None:
+                end.record(active_stream)
+            else:
+                end.record()
+
+        if active_stream is not None:
+            with torch.cuda.stream(active_stream):
+                issue_copy()
+            return 0.0, start, end
+
+        issue_copy()
+        end.synchronize()
+        return float(start.elapsed_time(end)), start, end
+
+    def reload_layer_to_locs(
+        self,
+        layer_id: int,
+        entries: List[_LayerKVResidencyEntry],
+        device_locs: torch.Tensor,
+        stream: Optional[torch.cuda.Stream] = None,
+        async_copy: bool = False,
+        host_index: Optional[torch.Tensor] = None,
+        host_slice: Optional[Tuple[int, int]] = None,
+        host_spans: Tuple[Tuple[int, int, int], ...] = (),
+        device_slice: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[float, Optional[Any], Optional[Any]]:
+        if not entries or int(device_locs.numel()) == 0:
+            return 0.0, None, None
+        prepare_t0 = time.perf_counter()
+        layer_offset = int(layer_id) - self.start_layer
+        if layer_offset < 0 or layer_offset >= self.layer_num:
+            raise RuntimeError(f"invalid virtual KVC layer_id={layer_id}")
+        host_slice_obj: Optional[slice] = None
+        if host_slice is not None and int(host_slice[0]) >= 0:
+            first_slot = int(host_slice[0])
+            token_count = int(host_slice[1])
+            if token_count != int(device_locs.numel()):
+                raise RuntimeError(
+                    f"virtual KVC scratch reload mismatch: host={token_count} device={int(device_locs.numel())}"
+                )
+            host_slice_obj = slice(first_slot, first_slot + token_count)
+        elif host_spans:
+            span_tokens = sum(
+                max(0, int(length)) for _start, _offset, length in host_spans
+            )
+            if span_tokens != int(device_locs.numel()):
+                raise RuntimeError(
+                    f"virtual KVC scratch reload mismatch: spans={span_tokens} device={int(device_locs.numel())}"
+                )
+        elif host_index is None:
+            host_slots: List[int] = []
+            for entry in entries:
+                host_slots.extend(entry.host_slot_list())
+            if len(host_slots) != int(device_locs.numel()):
+                raise RuntimeError(
+                    f"virtual KVC scratch reload mismatch: host={len(host_slots)} device={int(device_locs.numel())}"
+                )
+            host_index = torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+        elif int(host_index.numel()) != int(device_locs.numel()):
+            raise RuntimeError(
+                f"virtual KVC scratch reload mismatch: host={int(host_index.numel())} device={int(device_locs.numel())}"
+            )
+        self._add_profile(
+            "profile_virtual_reload_prepare_ms",
+            (time.perf_counter() - prepare_t0) * 1000.0,
+        )
+        contiguous_check_t0 = time.perf_counter()
+        if (
+            host_slice_obj is None
+            and host_index is not None
+            and host_index.device.type == "cpu"
+            and int(host_index.numel()) > 0
+        ):
+            first_slot = int(host_index[0])
+            token_count = int(host_index.numel())
+            last_slot = int(host_index[-1])
+            if last_slot - first_slot + 1 == token_count:
+                expected = torch.arange(
+                    first_slot,
+                    first_slot + token_count,
+                    dtype=host_index.dtype,
+                    device="cpu",
+                )
+                if bool(torch.equal(host_index, expected)):
+                    host_slice_obj = slice(first_slot, first_slot + token_count)
+        self._add_profile(
+            "profile_virtual_reload_contiguous_check_ms",
+            (time.perf_counter() - contiguous_check_t0) * 1000.0,
+        )
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        active_stream = stream if async_copy and stream is not None else None
+        token_count = int(device_locs.numel())
+        device_slice_obj: Optional[slice] = None
+        if device_slice is not None and int(device_slice[0]) >= 0:
+            device_start = int(device_slice[0])
+            device_count = int(device_slice[1])
+            if device_count >= token_count:
+                device_slice_obj = slice(device_start, device_start + token_count)
+        if host_slice_obj is not None:
+            self._add_stat("virtual_kvc_reload_slice_count")
+            self._add_stat("virtual_kvc_reload_slice_token_count", token_count)
+        elif host_spans:
+            self._add_stat("virtual_kvc_reload_span_count")
+            self._add_stat("virtual_kvc_reload_span_segment_count", len(host_spans))
+            self._add_stat("virtual_kvc_reload_span_token_count", token_count)
+        else:
+            self._add_stat("virtual_kvc_reload_index_count")
+            self._add_stat("virtual_kvc_reload_index_token_count", token_count)
+        if device_slice_obj is not None:
+            self._add_stat("virtual_kvc_reload_direct_count")
+            self._add_stat("virtual_kvc_reload_direct_token_count", token_count)
+        if active_stream is not None:
+            self._add_stat("virtual_kvc_reload_async_count")
+        else:
+            self._add_stat("virtual_kvc_reload_sync_count")
+
+        def issue_copy() -> None:
+            if active_stream is not None:
+                start.record(active_stream)
+            else:
+                start.record()
+            if host_slice_obj is not None:
+                k_src = self.k_buffers[layer_offset][host_slice_obj].to(
+                    self.device, non_blocking=True
+                )
+                v_src = self.v_buffers[layer_offset][host_slice_obj].to(
+                    self.device, non_blocking=True
+                )
+                if device_slice_obj is not None:
+                    self.kv_pool._get_key_buffer(layer_id)[device_slice_obj].copy_(k_src)
+                    self.kv_pool._get_value_buffer(layer_id)[device_slice_obj].copy_(
+                        v_src
+                    )
+                else:
+                    self.kv_pool._get_key_buffer(layer_id).index_copy_(
+                        0, device_locs, k_src
+                    )
+                    self.kv_pool._get_value_buffer(layer_id).index_copy_(
+                        0, device_locs, v_src
+                    )
+            elif host_spans:
+                k_buffer = self.kv_pool._get_key_buffer(layer_id)
+                v_buffer = self.kv_pool._get_value_buffer(layer_id)
+                for host_start, scratch_offset, length in host_spans:
+                    host_start = int(host_start)
+                    scratch_offset = int(scratch_offset)
+                    length = int(length)
+                    if length <= 0:
+                        continue
+                    span_host_slice = slice(host_start, host_start + length)
+                    scratch_slice = slice(scratch_offset, scratch_offset + length)
+                    span_device_locs = device_locs[scratch_slice]
+                    k_src = self.k_buffers[layer_offset][span_host_slice].to(
+                        self.device, non_blocking=True
+                    )
+                    v_src = self.v_buffers[layer_offset][span_host_slice].to(
+                        self.device, non_blocking=True
+                    )
+                    if device_slice_obj is not None:
+                        direct_slice = slice(
+                            int(device_slice_obj.start) + scratch_offset,
+                            int(device_slice_obj.start) + scratch_offset + length,
+                        )
+                        k_buffer[direct_slice].copy_(k_src)
+                        v_buffer[direct_slice].copy_(v_src)
+                    else:
+                        k_buffer.index_copy_(0, span_device_locs, k_src)
+                        v_buffer.index_copy_(0, span_device_locs, v_src)
+            else:
+                k_src = (
+                    self.k_buffers[layer_offset]
+                    .index_select(0, host_index)
+                    .to(self.device, non_blocking=True)
+                )
+                v_src = (
+                    self.v_buffers[layer_offset]
+                    .index_select(0, host_index)
+                    .to(self.device, non_blocking=True)
+                )
+                if device_slice_obj is not None:
+                    self.kv_pool._get_key_buffer(layer_id)[device_slice_obj].copy_(k_src)
+                    self.kv_pool._get_value_buffer(layer_id)[device_slice_obj].copy_(
+                        v_src
+                    )
+                else:
+                    self.kv_pool._get_key_buffer(layer_id).index_copy_(
+                        0, device_locs, k_src
+                    )
+                    self.kv_pool._get_value_buffer(layer_id).index_copy_(
+                        0, device_locs, v_src
+                    )
+            if active_stream is not None:
+                end.record(active_stream)
+            else:
+                end.record()
+
+        if active_stream is not None:
+            with torch.cuda.stream(active_stream):
+                issue_t0 = time.perf_counter()
+                issue_copy()
+                self._add_profile(
+                    "profile_virtual_reload_issue_wall_ms",
+                    (time.perf_counter() - issue_t0) * 1000.0,
+                )
+            return 0.0, start, end
+
+        issue_t0 = time.perf_counter()
+        issue_copy()
+        self._add_profile(
+            "profile_virtual_reload_issue_wall_ms",
+            (time.perf_counter() - issue_t0) * 1000.0,
+        )
+        sync_t0 = time.perf_counter()
+        end.synchronize()
+        self._add_profile(
+            "profile_virtual_reload_sync_wall_ms",
+            (time.perf_counter() - sync_t0) * 1000.0,
+        )
+        return float(start.elapsed_time(end)), start, end

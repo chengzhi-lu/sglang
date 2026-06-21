@@ -1,0 +1,1541 @@
+"""LayerKV LayerKVKvcVirtualMixin implementation."""
+
+from __future__ import annotations
+
+import bisect
+import contextlib
+import json
+import logging
+import math
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+import torch
+
+if __package__:
+    from .common_types import (
+        _LayerKVKvcDemand,
+        _LayerKVMetadataPatchCacheEntry,
+        _LayerKVNativeKvcRun,
+        _LayerKVPendingEviction,
+        _LayerKVPendingReload,
+        _LayerKVPendingVirtualMaterialize,
+        _LayerKVRecoveryTask,
+        _LayerKVResidencyEntry,
+        _LayerKVVirtualMaterializePlan,
+        _LayerKVVirtualScratchCacheEntry,
+    )
+else:  # pragma: no cover - direct file-loading smoke tests.
+    from common_types import (
+        _LayerKVKvcDemand,
+        _LayerKVMetadataPatchCacheEntry,
+        _LayerKVNativeKvcRun,
+        _LayerKVPendingEviction,
+        _LayerKVPendingReload,
+        _LayerKVPendingVirtualMaterialize,
+        _LayerKVRecoveryTask,
+        _LayerKVResidencyEntry,
+        _LayerKVVirtualMaterializePlan,
+        _LayerKVVirtualScratchCacheEntry,
+    )
+
+logger = logging.getLogger(__name__)
+
+
+class LayerKVKvcVirtualMixin:
+    def _prepare_per_layer_kvc_attention(self, layer_id: int) -> None:
+        if not self._uses_per_layer_attention_override():
+            return
+        if self.config.kvc_backend == "virtual-arena":
+            self._prepare_virtual_kvc_attention(layer_id)
+            return
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and not self._per_layer_req_to_token_owned
+            and not self._has_offloaded_kvc_entries()
+        ):
+            return
+        if not self._per_layer_residency and not self._per_layer_req_to_token_owned:
+            return
+        if self._last_forward_batch is None or self._runner is None:
+            return
+        layer_id = int(layer_id)
+        key = (int(self._decode_step), layer_id)
+        if key in self._per_layer_kvc_prepared_layers:
+            self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
+            return
+        self._per_layer_kvc_prepared_layers.add(key)
+        self.stats.kvc_per_layer_override_layer_count = len(
+            self._per_layer_req_to_token_overrides
+        )
+        override = self._per_layer_req_to_token_overrides.get(layer_id)
+        if override is None:
+            if (
+                self.config.kvc_backend == "per-layer-arena"
+                and self._has_offloaded_kvc_entries()
+            ):
+                if self._per_layer_virtual_scratch_enabled():
+                    self._prepare_virtual_kvc_attention(layer_id, guard=False)
+                    return
+                selected = [
+                    entry
+                    for entry in self._select_required_offloaded_per_layer_entries(
+                        self._last_forward_batch
+                    )
+                    if int(entry.layer_id) == int(layer_id)
+                ]
+                if selected:
+                    with self._profile("profile_kvc_reload_required_ms"):
+                        self._reload_required_kvc(
+                            self._last_forward_batch, selected_entries=selected
+                        )
+                    return
+            # The hook is active even before the arena allocator produces a
+            # layer-specific mapping. Keep this cheap only when no recovery is
+            # required for the current use point.
+            self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
+            return
+        try:
+            table = getattr(self._req_to_token_pool, "req_to_token", None)
+            if table is not None and int(override.data_ptr()) == int(table.data_ptr()):
+                metadata_key = (
+                    "canonical",
+                    int(table.data_ptr()),
+                    tuple(self._current_forward_req_lens),
+                    int(self._decode_step),
+                )
+            else:
+                metadata_key = (
+                    "layer",
+                    int(layer_id),
+                    int(override.data_ptr()),
+                    int(self._per_layer_req_to_token_versions.get(layer_id, 0)),
+                    tuple(self._current_forward_req_lens),
+                    int(self._decode_step),
+                )
+            if self._per_layer_kvc_current_metadata_key == metadata_key:
+                self.stats.kvc_metadata_dirty_guard_skip_count += 1
+                self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
+                return
+        except Exception:
+            metadata_key = None
+        ok = self._rewrite_attention_metadata_for_layer(layer_id, override)
+        if ok:
+            if metadata_key is not None:
+                self._per_layer_kvc_current_metadata_key = metadata_key
+            self.stats.kvc_per_layer_metadata_rewrite_count += 1
+        else:
+            self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and self._has_offloaded_kvc_entries()
+        ):
+            if self._per_layer_virtual_scratch_enabled():
+                self._prepare_virtual_kvc_attention(layer_id, guard=False)
+                return
+            selected = [
+                entry
+                for entry in self._select_required_offloaded_per_layer_entries(
+                    self._last_forward_batch
+                )
+                if int(entry.layer_id) == int(layer_id)
+            ]
+            if selected:
+                with self._profile("profile_kvc_reload_required_ms"):
+                    self._reload_required_kvc(
+                        self._last_forward_batch, selected_entries=selected
+                    )
+
+    def _prepare_virtual_kvc_attention(self, layer_id: int, *, guard: bool = True) -> None:
+        if not self._residency and not (
+            self.config.kvc_backend == "per-layer-arena" and self._per_layer_residency
+        ):
+            return
+        if self._last_forward_batch is None or self._runner is None:
+            return
+        if not self._ensure_virtual_scratch():
+            return
+        layer_id = int(layer_id)
+        key = (int(self._decode_step), layer_id)
+        if guard and key in self._per_layer_kvc_prepared_layers:
+            self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
+            return
+        if guard:
+            self._per_layer_kvc_prepared_layers.add(key)
+        demand = self._get_virtual_kvc_demand(layer_id)
+        if demand is None or not demand.entries:
+            return
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and self._virtual_scratch_locs is not None
+            and int(demand.token_count) > int(self._virtual_scratch_locs.numel())
+        ):
+            capacity = int(self._virtual_scratch_locs.numel())
+            overflow_entries: List[_LayerKVResidencyEntry] = []
+            kept_tokens = 0
+            for entry in demand.entries:
+                entry_tokens = int(entry.token_count)
+                if kept_tokens + entry_tokens <= capacity:
+                    kept_tokens += entry_tokens
+                else:
+                    overflow_entries.append(entry)
+            if overflow_entries:
+                with self._profile("profile_kvc_reload_required_ms"):
+                    self._reload_required_kvc(
+                        self._last_forward_batch,
+                        selected_entries=overflow_entries,
+                    )
+                self._virtual_materialize_plans_by_layer.pop(layer_id, None)
+                self._virtual_kvc_demands.pop((int(self._decode_step), layer_id), None)
+                self._invalidate_virtual_layer_cache(layer_id)
+                demand = self._get_virtual_kvc_demand(layer_id)
+                if demand is None or not demand.entries:
+                    return
+            if int(demand.token_count) > int(self._virtual_scratch_locs.numel()):
+                self.stats.virtual_kvc_scratch_overflow_count += 1
+                self.stats.kvc_guard_pass = False
+                self.stats.kvc_guard_reason = "virtual_scratch_capacity_exceeded"
+                return
+        pending_key = (int(self._decode_step), layer_id, demand.signature)
+        cached = self._lookup_virtual_scratch_cache(demand)
+        if cached is not None:
+            scratch_locs = cached.scratch_locs
+            buffer_idx = int(cached.buffer_idx)
+        else:
+            pending = self._pending_virtual_kvc_materialize.pop(pending_key, None)
+            if pending is not None:
+                scratch_locs = self._wait_for_virtual_materialize(pending)
+                if scratch_locs is None:
+                    return
+                buffer_idx = int(pending.buffer_idx)
+                self._store_virtual_scratch_cache(demand, scratch_locs, buffer_idx)
+            else:
+                buffer_idx = self._choose_virtual_scratch_buffer(
+                    demand.token_count, exclude_buffer_idx=None
+                )
+                if buffer_idx < 0:
+                    scratch_locs = self._materialize_virtual_kvc_sync(demand)
+                    self.stats.virtual_kvc_prefetch_fallback_sync_count += 1
+                    if scratch_locs is None:
+                        return
+                    buffer_idx = -1
+                else:
+                    scratch_locs = self._materialize_virtual_kvc_sync(
+                        demand,
+                        buffer_idx=buffer_idx,
+                    )
+                    if scratch_locs is None:
+                        return
+                self._store_virtual_scratch_cache(demand, scratch_locs, buffer_idx)
+        self._rewrite_virtual_kvc_attention(
+            layer_id,
+            scratch_locs,
+            demand,
+        )
+        self._issue_next_virtual_kvc_prefetch(
+            layer_id,
+            demand,
+            buffer_idx,
+        )
+
+    def _lookup_virtual_scratch_cache(
+        self, demand: _LayerKVKvcDemand, *, record_stats: bool = True
+    ) -> Optional[_LayerKVVirtualScratchCacheEntry]:
+        entry = self._virtual_scratch_cache_by_layer.get(int(demand.layer_id))
+        if (
+            entry is None
+            or (
+                self.config.kvc_backend == "per-layer-arena"
+                and int(entry.last_step) != int(self._decode_step)
+            )
+            or int(entry.token_count) != int(demand.token_count)
+            or (
+                entry.host_signature != demand.host_signature
+                if demand.host_signature != (0, 0, 0, 0)
+                else entry.host_slots != demand.host_slots
+            )
+            or (
+                demand.host_slice[0] >= 0
+                and entry.host_slice != demand.host_slice
+            )
+            or (
+                demand.host_slots == ()
+                and demand.host_slice[0] < 0
+                and demand.host_index_cpu is not None
+                and (
+                    entry.host_index_cpu is None
+                    or not bool(torch.equal(entry.host_index_cpu, demand.host_index_cpu))
+                )
+            )
+            or entry.scratch_locs is None
+            or int(entry.scratch_locs.numel()) != int(demand.token_count)
+        ):
+            if record_stats:
+                self.stats.virtual_kvc_persistent_cache_miss_count += 1
+            return None
+        if record_stats:
+            self.stats.virtual_kvc_persistent_cache_hit_count += 1
+            entry.last_step = int(self._decode_step)
+        return entry
+
+    def _store_virtual_scratch_cache(
+        self,
+        demand: _LayerKVKvcDemand,
+        scratch_locs: torch.Tensor,
+        buffer_idx: int,
+    ) -> None:
+        previous = self._virtual_scratch_cache_by_layer.get(int(demand.layer_id))
+        previous_same = False
+        if previous is not None:
+            previous_same = (
+                previous.host_signature == demand.host_signature
+                if demand.host_signature != (0, 0, 0, 0)
+                else previous.host_slots == demand.host_slots
+            )
+            if (
+                previous_same
+                and demand.host_slice[0] >= 0
+            ):
+                previous_same = previous.host_slice == demand.host_slice
+            if (
+                previous_same
+                and demand.host_slots == ()
+                and demand.host_slice[0] < 0
+                and demand.host_index_cpu is not None
+            ):
+                previous_same = previous.host_index_cpu is not None and bool(
+                    torch.equal(previous.host_index_cpu, demand.host_index_cpu)
+                )
+        if previous is not None and not previous_same:
+            self.stats.virtual_kvc_persistent_cache_invalidate_count += 1
+        self._virtual_scratch_cache_by_layer[int(demand.layer_id)] = (
+            _LayerKVVirtualScratchCacheEntry(
+                layer_id=int(demand.layer_id),
+                host_slots=demand.host_slots,
+                host_signature=demand.host_signature,
+                host_slice=demand.host_slice,
+                host_index_cpu=demand.host_index_cpu,
+                token_count=int(demand.token_count),
+                scratch_locs=scratch_locs,
+                buffer_idx=int(buffer_idx),
+                last_step=int(self._decode_step),
+            )
+        )
+        self.stats.virtual_kvc_persistent_cache_store_count += 1
+
+    def _invalidate_virtual_layer_cache(self, layer_id: int) -> None:
+        if int(layer_id) in self._virtual_scratch_cache_by_layer:
+            self._virtual_scratch_cache_by_layer.pop(int(layer_id), None)
+            self.stats.virtual_kvc_persistent_cache_invalidate_count += 1
+
+    def _invalidate_virtual_caches(self) -> None:
+        if self._virtual_scratch_cache_by_layer:
+            self.stats.virtual_kvc_persistent_cache_invalidate_count += len(
+                self._virtual_scratch_cache_by_layer
+            )
+            self._virtual_scratch_cache_by_layer.clear()
+        self._virtual_materialize_plan = None
+        self._virtual_materialize_plans_by_layer.clear()
+        self._virtual_kvc_demands.clear()
+        self._metadata_patch_cache.clear()
+        self._metadata_patch_tensor_cache.clear()
+        self._pending_virtual_kvc_materialize.clear()
+
+    def _invalidate_virtual_caches_for_layers(self, layer_ids: Set[int]) -> None:
+        if not layer_ids:
+            return
+        if any(int(layer_id) < 0 for layer_id in layer_ids):
+            self._invalidate_virtual_caches()
+            return
+        for layer_id in {int(layer_id) for layer_id in layer_ids}:
+            self._invalidate_virtual_layer_cache(layer_id)
+            self._virtual_materialize_plans_by_layer.pop(layer_id, None)
+            for key in list(self._virtual_kvc_demands):
+                if int(key[1]) == layer_id:
+                    self._virtual_kvc_demands.pop(key, None)
+            for key in list(self._pending_virtual_kvc_materialize):
+                if len(key) >= 2 and int(key[1]) == layer_id:
+                    self._pending_virtual_kvc_materialize.pop(key, None)
+            for key in list(self._metadata_patch_cache):
+                if key and int(key[0]) == layer_id:
+                    self._metadata_patch_cache.pop(key, None)
+        # Shared tensor entries intentionally have no layer in the key.  Drop
+        # them when any layer is invalidated so exact-match reuse remains safe.
+        self._metadata_patch_tensor_cache.clear()
+        self._kvc_demand_signature_eval_step = None
+
+    def _virtual_cache_layers_for_entries(
+        self, entries: List[_LayerKVResidencyEntry]
+    ) -> Set[int]:
+        layers = {int(entry.layer_id) for entry in entries if entry is not None}
+        if any(layer_id < 0 for layer_id in layers):
+            return set(int(layer_id) for layer_id in self._kvc_layer_ids()) or {-1}
+        return layers
+
+    def _get_virtual_kvc_demand(self, layer_id: int) -> Optional[_LayerKVKvcDemand]:
+        layer_id = int(layer_id)
+        key = (int(self._decode_step), layer_id)
+        cached = self._virtual_kvc_demands.get(key)
+        if cached is not None:
+            return cached
+        plan = self._get_virtual_materialize_plan_for_layer(layer_id)
+        if plan is None or not plan.selected:
+            return None
+        signature = self._kvc_demand_signature(layer_id, plan)
+        base_signature = self._kvc_demand_signature_without_layer(signature)
+        demand = _LayerKVKvcDemand(
+            layer_id=layer_id,
+            entries=tuple(plan.selected),
+            req_indices=plan.req_indices,
+            positions=plan.positions,
+            row_indices=plan.row_indices,
+            flat_indices=plan.flat_indices,
+            flat_spans=plan.flat_spans,
+            row_spans=plan.row_spans,
+            token_count=int(plan.token_count),
+            deadline_layer=layer_id,
+            benefit_score=float(plan.token_count),
+            signature=signature,
+            base_signature=base_signature,
+            backend_semantics=str(self.stats.layerkv_kvc_backend_semantics or ""),
+            host_slots=plan.host_slots,
+            host_signature=plan.host_signature,
+            host_slice=plan.host_slice,
+            host_spans=plan.host_spans,
+            host_index_cpu=plan.host_index_cpu,
+            max_row_index=plan.max_row_index,
+            max_position=plan.max_position,
+            max_flat_index=plan.max_flat_index,
+        )
+        self._virtual_kvc_demands[key] = demand
+        self.stats.kvc_demand_layer_count += 1
+        self.stats.kvc_layerwise_demand_count += 1
+        self.stats.kvc_layerwise_demand_token_count += int(demand.token_count)
+        layer_count = max(1, len(self._kvc_layer_ids()))
+        if len(
+            self._virtual_kvc_demands
+        ) >= layer_count and self._kvc_demand_signature_eval_step != int(
+            self._decode_step
+        ):
+            base_signatures = {
+                self._kvc_demand_base_signature(item)
+                for item in self._virtual_kvc_demands.values()
+            }
+            if len(base_signatures) == 1:
+                self.stats.kvc_demand_shared_signature_count += 1
+            else:
+                self.stats.kvc_demand_signature_mismatch_count += 1
+            self._kvc_demand_signature_eval_step = int(self._decode_step)
+        return demand
+
+    def _kvc_demand_base_signature(self, demand: _LayerKVKvcDemand) -> str:
+        if demand.base_signature:
+            return demand.base_signature
+        return self._kvc_demand_signature_without_layer(demand.signature)
+
+    def _kvc_demand_signature_without_layer(self, signature: str) -> str:
+        return "|".join(str(signature).split("|")[1:])
+
+    def _kvc_demand_signature(
+        self, layer_id: int, plan: _LayerKVVirtualMaterializePlan
+    ) -> str:
+        if not plan.selected:
+            return f"L{int(layer_id)}|empty|step{int(self._decode_step)}"
+        first = plan.selected[0]
+        last = plan.selected[-1]
+        return (
+            f"L{int(layer_id)}|step{int(self._decode_step)}"
+            f"|n{len(plan.selected)}|tok{int(plan.token_count)}"
+            f"|first{int(first.req_idx)}:{int(first.pos)}:{int(first.token_count)}"
+            f"|last{int(last.req_idx)}:{int(last.pos)}:{int(last.token_count)}"
+            f"|host{int(plan.host_signature[0])}"
+        )
+
+    def _get_virtual_materialize_plan_for_layer(
+        self, layer_id: int
+    ) -> Optional[_LayerKVVirtualMaterializePlan]:
+        layer_id = int(layer_id)
+        cached = self._virtual_materialize_plans_by_layer.get(layer_id)
+        if cached is not None and int(cached.step) == int(self._decode_step):
+            return cached
+        plan = self._build_virtual_materialize_plan(layer_id=layer_id)
+        if plan is not None:
+            self._virtual_materialize_plans_by_layer[layer_id] = plan
+        return plan
+
+    def _get_virtual_materialize_plan(
+        self,
+    ) -> Optional[_LayerKVVirtualMaterializePlan]:
+        if self._virtual_materialize_plan is not None and int(
+            self._virtual_materialize_plan.step
+        ) == int(self._decode_step):
+            return self._virtual_materialize_plan
+        self.stats.kvc_layerwise_selector_fallback_count += 1
+        self._virtual_materialize_plan = self._build_virtual_materialize_plan(
+            layer_id=None
+        )
+        return self._virtual_materialize_plan
+
+    def _virtual_batch_index_context(
+        self,
+    ) -> Tuple[
+        List[Tuple[int, int]],
+        Dict[int, int],
+        Dict[int, int],
+        Dict[int, int],
+    ]:
+        if (
+            int(self._virtual_batch_index_step) == int(self._decode_step)
+            and self._virtual_batch_index_cache is not None
+        ):
+            return self._virtual_batch_index_cache
+        batch_req_lens = self._batch_req_indices_and_lens(self._last_forward_batch)
+        active_lens = {
+            int(req_idx): self._align_tokens_down(max(0, int(seq_len) - 1))
+            for req_idx, seq_len in batch_req_lens
+        }
+        row_by_req: Dict[int, int] = {}
+        flat_base_by_req: Dict[int, int] = {}
+        flat_base = 0
+        for row, (req_idx, seq_len) in enumerate(batch_req_lens):
+            req_idx = int(req_idx)
+            row_by_req[req_idx] = int(row)
+            flat_base_by_req[req_idx] = int(flat_base)
+            flat_base += max(0, int(seq_len))
+        cache = (batch_req_lens, active_lens, row_by_req, flat_base_by_req)
+        self._virtual_batch_index_cache = cache
+        self._virtual_batch_index_step = int(self._decode_step)
+        return cache
+
+    def _build_virtual_materialize_plan(
+        self, *, layer_id: Optional[int]
+    ) -> Optional[_LayerKVVirtualMaterializePlan]:
+        table = getattr(self._req_to_token_pool, "req_to_token", None)
+        if table is None:
+            return None
+        target_layer = None if layer_id is None else int(layer_id)
+        direct_kv_indices_only = target_layer is not None
+        with self._profile("profile_virtual_select_ms"):
+            (
+                batch_req_lens,
+                active_lens,
+                row_by_req,
+                flat_base_by_req,
+            ) = self._virtual_batch_index_context()
+            if self.config.kvc_backend == "per-layer-arena" and target_layer is not None:
+                selected = self._select_offloaded_run_entries_for_virtual_layer(
+                    int(target_layer), active_lens
+                )
+            else:
+                source_entries = (
+                    self._per_layer_residency.values()
+                    if self.config.kvc_backend == "per-layer-arena"
+                    else self._residency.values()
+                )
+                selected = [
+                    entry
+                    for entry in source_entries
+                    if entry.state == "offloaded"
+                    and (
+                        target_layer is None
+                        or int(entry.layer_id) < 0
+                        or int(entry.layer_id) == target_layer
+                    )
+                    and int(entry.req_idx) in active_lens
+                    and int(entry.pos) + int(entry.token_count)
+                    <= active_lens[int(entry.req_idx)]
+                ]
+        if not selected:
+            return _LayerKVVirtualMaterializePlan(
+                step=int(self._decode_step),
+                selected=[],
+                req_indices=(),
+                positions=(),
+                row_indices=(),
+                flat_indices=(),
+                flat_spans=(),
+                row_spans=(),
+                req_tensor=None,
+                pos_tensor=None,
+                row_tensor=None,
+                flat_tensor=None,
+                host_slots=(),
+                host_signature=(0, 0, 0, 0),
+                host_slice=(-1, 0),
+                host_spans=(),
+                host_index_cpu=None,
+                max_row_index=-1,
+                max_position=-1,
+                max_flat_index=-1,
+                token_count=0,
+            )
+        with self._profile("profile_virtual_index_build_ms"):
+            selected.sort(key=lambda entry: (entry.req_idx, entry.pos))
+            token_count = sum(entry.token_count for entry in selected)
+            req_indices: List[int] = []
+            positions: List[int] = []
+            row_indices: List[int] = []
+            flat_indices: List[int] = []
+            flat_spans: List[Tuple[int, int, int]] = []
+            row_spans: List[Tuple[int, int, int, int]] = []
+            span_start = -1
+            span_scratch_start = 0
+            span_len = 0
+            row_span_row = -1
+            row_span_start = -1
+            row_span_scratch_start = 0
+            row_span_len = 0
+            scratch_offset = 0
+            for entry in selected:
+                req_idx = int(entry.req_idx)
+                token_count_for_entry = int(entry.token_count)
+                pos_start = int(entry.pos)
+                base = int(flat_base_by_req[req_idx])
+                row = int(row_by_req[req_idx])
+                if direct_kv_indices_only:
+                    run_len = int(token_count_for_entry)
+                    flat_start = base + pos_start
+                    if span_len > 0 and flat_start == span_start + span_len:
+                        span_len += run_len
+                    else:
+                        if span_len > 0:
+                            flat_spans.append(
+                                (span_start, span_scratch_start, span_len)
+                            )
+                        span_start = int(flat_start)
+                        span_scratch_start = int(scratch_offset)
+                        span_len = int(run_len)
+                    if (
+                        row_span_len > 0
+                        and row == row_span_row
+                        and pos_start == row_span_start + row_span_len
+                    ):
+                        row_span_len += run_len
+                    else:
+                        if row_span_len > 0:
+                            row_spans.append(
+                                (
+                                    row_span_row,
+                                    row_span_start,
+                                    row_span_scratch_start,
+                                    row_span_len,
+                                )
+                            )
+                        row_span_row = int(row)
+                        row_span_start = int(pos_start)
+                        row_span_scratch_start = int(scratch_offset)
+                        row_span_len = int(run_len)
+                    scratch_offset += run_len
+                    continue
+                for pos in range(pos_start, pos_start + token_count_for_entry):
+                    flat_index = base + int(pos)
+                    flat_indices.append(flat_index)
+                if not direct_kv_indices_only:
+                    req_indices.extend([req_idx] * token_count_for_entry)
+                    positions.extend(range(pos_start, pos_start + token_count_for_entry))
+                    row_indices.extend([row] * token_count_for_entry)
+            if direct_kv_indices_only and span_len > 0:
+                flat_spans.append((span_start, span_scratch_start, span_len))
+            if direct_kv_indices_only and row_span_len > 0:
+                row_spans.append(
+                    (
+                        row_span_row,
+                        row_span_start,
+                        row_span_scratch_start,
+                        row_span_len,
+                    )
+                )
+            host_slots: List[int] = []
+            for entry in selected:
+                if entry.host_slots is not None:
+                    host_slots.extend(entry.host_slots)
+                elif entry.host_slot is not None:
+                    host_slots.append(int(entry.host_slot))
+            host_signature = self._host_slot_signature(host_slots)
+            host_slice = self._contiguous_host_slice(host_slots)
+            host_spans = (
+                ()
+                if host_slice[0] >= 0
+                else self._contiguous_host_spans(host_slots)
+            )
+            # Very fragmented spans create many small H2D/index_copy operations;
+            # keep the original gather path in that case.
+            if len(host_spans) > 64:
+                host_spans = ()
+            host_index_cpu = (
+                None
+                if host_slice[0] >= 0 or host_spans
+                else torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+            )
+            max_row_index = max(row_indices) if row_indices else -1
+            max_position = max(positions) if positions else -1
+            if row_spans:
+                max_row_index = max(max_row_index, max(row for row, _start, _offset, _length in row_spans))
+                max_position = max(
+                    max_position,
+                    max(start + length - 1 for _row, start, _offset, length in row_spans),
+                )
+            if flat_indices:
+                max_flat_index = max(flat_indices)
+            elif flat_spans:
+                max_flat_index = max(start + length - 1 for start, _offset, length in flat_spans)
+            else:
+                max_flat_index = -1
+        return _LayerKVVirtualMaterializePlan(
+            step=int(self._decode_step),
+            selected=selected,
+            req_indices=tuple(int(x) for x in req_indices),
+            positions=tuple(int(x) for x in positions),
+            row_indices=tuple(int(x) for x in row_indices),
+            flat_indices=tuple(int(x) for x in flat_indices),
+            flat_spans=tuple(
+                (int(start), int(offset), int(length))
+                for start, offset, length in flat_spans
+            ),
+            row_spans=tuple(
+                (int(row), int(start), int(offset), int(length))
+                for row, start, offset, length in row_spans
+            ),
+            req_tensor=None,
+            pos_tensor=None,
+            row_tensor=None,
+            flat_tensor=None,
+            host_slots=() if direct_kv_indices_only else tuple(int(x) for x in host_slots),
+            host_signature=host_signature,
+            host_slice=host_slice,
+            host_spans=host_spans,
+            host_index_cpu=host_index_cpu,
+            max_row_index=int(max_row_index),
+            max_position=int(max_position),
+            max_flat_index=int(max_flat_index),
+            token_count=int(token_count),
+        )
+
+    def _virtual_metadata_uses_kv_indices(self) -> bool:
+        forward_batch = self._last_forward_batch
+        attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
+            self._runner, "attn_backend", None
+        )
+        metadata = getattr(attn_backend, "forward_metadata", None)
+        if metadata is None:
+            return False
+        return getattr(metadata, "kv_indices", None) is not None
+
+    @staticmethod
+    def _host_slot_signature(host_slots: List[int]) -> Tuple[int, int, int, int]:
+        if not host_slots:
+            return (0, 0, 0, 0)
+        checksum = int(sum(host_slots)) & 0x7FFFFFFF
+        return (
+            len(host_slots),
+            int(host_slots[0]),
+            int(host_slots[-1]),
+            int(checksum),
+        )
+
+    @staticmethod
+    def _contiguous_host_slice(host_slots: List[int]) -> Tuple[int, int]:
+        if not host_slots:
+            return (-1, 0)
+        first = int(host_slots[0])
+        last = int(host_slots[-1])
+        if last - first + 1 != len(host_slots):
+            return (-1, 0)
+        for offset, slot in enumerate(host_slots):
+            if int(slot) != first + int(offset):
+                return (-1, 0)
+        return (first, len(host_slots))
+
+    @staticmethod
+    def _contiguous_host_spans(
+        host_slots: List[int],
+    ) -> Tuple[Tuple[int, int, int], ...]:
+        if not host_slots:
+            return ()
+        spans: List[Tuple[int, int, int]] = []
+        start_slot = int(host_slots[0])
+        scratch_start = 0
+        length = 1
+        prev_slot = start_slot
+        for offset, slot in enumerate(host_slots[1:], start=1):
+            slot = int(slot)
+            if slot == prev_slot + 1:
+                length += 1
+            else:
+                spans.append((start_slot, scratch_start, length))
+                start_slot = slot
+                scratch_start = int(offset)
+                length = 1
+            prev_slot = slot
+        spans.append((start_slot, scratch_start, length))
+        if (
+            len(spans) == 1
+            and int(spans[0][1]) == 0
+            and int(spans[0][2]) == len(host_slots)
+        ):
+            return ()
+        return tuple(spans)
+
+    def _build_virtual_scatter_indices(
+        self, entries: Tuple[_LayerKVResidencyEntry, ...]
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        if not entries:
+            return (), ()
+        req_indices: List[int] = []
+        positions: List[int] = []
+        for entry in entries:
+            req_idx = int(entry.req_idx)
+            logical_positions = entry.logical_positions()
+            req_indices.extend([req_idx] * int(entry.token_count))
+            positions.extend(logical_positions)
+        return tuple(int(x) for x in req_indices), tuple(int(x) for x in positions)
+
+    def _choose_virtual_scratch_buffer(
+        self, token_count: int, *, exclude_buffer_idx: Optional[int]
+    ) -> int:
+        if len(self._virtual_scratch_buffers) < 2:
+            return -1
+        for idx, locs in enumerate(self._virtual_scratch_buffers):
+            if exclude_buffer_idx is not None and idx == int(exclude_buffer_idx):
+                continue
+            if int(locs.numel()) >= int(token_count):
+                return idx
+        return -1
+
+    def _materialize_virtual_kvc_sync(
+        self,
+        demand: _LayerKVKvcDemand,
+        *,
+        buffer_idx: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        token_count = int(demand.token_count)
+        if self._virtual_scratch_locs is None or token_count > int(
+            self._virtual_scratch_locs.numel()
+        ):
+            self.stats.virtual_kvc_scratch_overflow_count += 1
+            self.stats.kvc_guard_pass = False
+            self.stats.kvc_guard_reason = "virtual_scratch_capacity_exceeded"
+            return None
+        if buffer_idx is None:
+            scratch_locs = self._virtual_scratch_locs[:token_count]
+            device_slice = (
+                self._virtual_scratch_buffer_slices[0]
+                if self._virtual_scratch_buffer_slices
+                else (-1, 0)
+            )
+        else:
+            scratch_locs = self._virtual_scratch_buffers[int(buffer_idx)][:token_count]
+            device_slice = (
+                self._virtual_scratch_buffer_slices[int(buffer_idx)]
+                if int(buffer_idx) < len(self._virtual_scratch_buffer_slices)
+                else (-1, 0)
+            )
+        self._ensure_host_store()
+        elapsed_ms, _start_event, _ready_event = self._host_store.reload_layer_to_locs(
+            int(demand.layer_id),
+            list(demand.entries),
+            scratch_locs,
+            host_index=demand.host_index_cpu,
+            host_slice=demand.host_slice,
+            host_spans=demand.host_spans,
+            device_slice=device_slice,
+        )
+        self._record_virtual_materialize(token_count, elapsed_ms)
+        return scratch_locs
+
+    def _record_virtual_materialize(self, token_count: int, elapsed_ms: float) -> None:
+        self.stats.virtual_kvc_materialize_count += 1
+        self.stats.virtual_kvc_materialize_layer_count += 1
+        self.stats.virtual_kvc_materialize_token_count += int(token_count)
+        self.stats.virtual_kvc_materialize_ms += elapsed_ms
+        self.stats.virtual_scratch_used_tokens = max(
+            self.stats.virtual_scratch_used_tokens, int(token_count)
+        )
+        self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
+
+    def _rewrite_virtual_kvc_attention(
+        self,
+        layer_id: int,
+        scratch_locs: torch.Tensor,
+        demand: _LayerKVKvcDemand,
+    ) -> None:
+        with self._profile("profile_virtual_direct_metadata_patch_ms"):
+            direct_ok = self._patch_virtual_attention_metadata(
+                layer_id, scratch_locs, demand
+            )
+        if direct_ok:
+            self.stats.virtual_kvc_direct_metadata_patch_count += 1
+            self.stats.kvc_per_layer_slot_override_count += 1
+            self.stats.kvc_per_layer_slot_override_token_count += int(
+                demand.token_count
+            )
+            self.stats.kvc_per_layer_metadata_rewrite_count += 1
+            return
+        self.stats.virtual_kvc_direct_metadata_patch_fallback_count += 1
+        self.stats.metadata_patch_layer_fallback_count += 1
+        if self.config.kvc_backend == "per-layer-arena":
+            # A full per-layer req_to_token clone is too expensive on the
+            # decode path.  If direct metadata patching is unavailable, recover
+            # the demand into stable arena slots and rely on the existing
+            # canonical mapping when the original locations are still free.
+            with self._profile("profile_kvc_reload_required_ms"):
+                reloaded = self._reload_required_kvc(
+                    self._last_forward_batch,
+                    selected_entries=list(demand.entries),
+                    strict=False,
+                )
+            if not reloaded:
+                self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
+                return
+            table = self._per_layer_req_to_token_overrides.get(int(layer_id))
+            if table is not None:
+                with self._profile("profile_virtual_metadata_rewrite_ms"):
+                    ok = self._rewrite_attention_metadata_for_layer(layer_id, table)
+                if ok:
+                    self.stats.kvc_per_layer_metadata_rewrite_count += 1
+                else:
+                    self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
+            return
+        else:
+            table = getattr(self._req_to_token_pool, "req_to_token", None)
+            if table is None:
+                return
+        req_indices = demand.req_indices
+        positions = demand.positions
+        if not req_indices or not positions:
+            req_indices, positions = self._build_virtual_scatter_indices(
+                demand.entries
+            )
+            if not req_indices or not positions:
+                self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
+                return
+        with self._profile("profile_virtual_req_to_token_scatter_ms"):
+            req_tensor = torch.tensor(
+                req_indices, dtype=torch.int64, device=table.device
+            )
+            pos_tensor = torch.tensor(
+                positions, dtype=torch.int64, device=table.device
+            )
+            table[req_tensor, pos_tensor] = scratch_locs.to(
+                dtype=table.dtype, device=table.device
+            )
+        if self.config.kvc_backend == "per-layer-arena":
+            self._per_layer_req_to_token_versions[int(layer_id)] = (
+                int(self._per_layer_req_to_token_versions.get(int(layer_id), 0)) + 1
+            )
+        self.stats.kvc_per_layer_slot_override_count += 1
+        self.stats.kvc_per_layer_slot_override_token_count += int(demand.token_count)
+        with self._profile("profile_virtual_metadata_rewrite_ms"):
+            ok = self._rewrite_attention_metadata_for_layer(layer_id, table)
+        if ok:
+            self.stats.kvc_per_layer_metadata_rewrite_count += 1
+        else:
+            self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
+
+    def _patch_virtual_attention_metadata(
+        self,
+        layer_id: int,
+        scratch_locs: torch.Tensor,
+        demand: _LayerKVKvcDemand,
+    ) -> bool:
+        if demand.token_count <= 0:
+            return False
+        forward_batch = self._last_forward_batch
+        attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
+            self._runner, "attn_backend", None
+        )
+        if attn_backend is None:
+            return False
+        metadata = getattr(attn_backend, "forward_metadata", None)
+        if metadata is None:
+            return False
+        try:
+            cache_entry = self._metadata_patch_cache_entry(
+                int(layer_id), demand, metadata, scratch_locs
+            )
+            kv_indices = getattr(metadata, "kv_indices", None)
+            kv_indptr = getattr(metadata, "kv_indptr", None)
+            if kv_indices is not None and kv_indptr is not None:
+                if kv_indices.dim() != 1 or not kv_indices.is_contiguous():
+                    return False
+                if not demand.flat_indices and not demand.flat_spans:
+                    return False
+                if int(demand.max_flat_index) >= int(kv_indices.numel()):
+                    return False
+                if cache_entry.scratch_tensor is None or (
+                    cache_entry.scratch_tensor.device != kv_indices.device
+                    or cache_entry.scratch_tensor.dtype != kv_indices.dtype
+                    or int(cache_entry.scratch_tensor.numel())
+                    != int(scratch_locs.numel())
+                    or int(cache_entry.scratch_tensor.data_ptr())
+                    != int(scratch_locs.data_ptr())
+                ):
+                    cache_entry.scratch_tensor = scratch_locs.to(
+                        device=kv_indices.device, dtype=kv_indices.dtype
+                    )
+                if demand.flat_spans:
+                    if (
+                        len(demand.flat_spans) > 16
+                        and demand.flat_indices
+                        and len(demand.flat_indices) == int(demand.token_count)
+                    ):
+                        if cache_entry.flat_tensor is None or (
+                            cache_entry.flat_tensor.device != kv_indices.device
+                        ):
+                            cache_entry.flat_tensor = torch.tensor(
+                                demand.flat_indices,
+                                dtype=torch.int64,
+                                device=kv_indices.device,
+                            )
+                        kv_indices[cache_entry.flat_tensor] = cache_entry.scratch_tensor
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                    if len(demand.flat_spans) > 16:
+                        if cache_entry.flat_span_tensor is None or (
+                            cache_entry.flat_span_tensor.device != kv_indices.device
+                        ):
+                            (
+                                cache_entry.flat_span_tensor,
+                                cache_entry.flat_span_scratch_tensor,
+                            ) = self._metadata_flat_span_scatter_tensors(
+                                demand.flat_spans,
+                                int(demand.token_count),
+                                kv_indices.device,
+                            )
+                        kv_indices[cache_entry.flat_span_tensor] = (
+                            cache_entry.scratch_tensor[
+                                cache_entry.flat_span_scratch_tensor
+                            ]
+                        )
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                    for start, scratch_start, length in demand.flat_spans:
+                        start = int(start)
+                        scratch_start = int(scratch_start)
+                        length = int(length)
+                        if (
+                            length <= 0
+                            or start + length > int(kv_indices.numel())
+                            or scratch_start + length
+                            > int(cache_entry.scratch_tensor.numel())
+                        ):
+                            return False
+                        kv_indices[start : start + length] = cache_entry.scratch_tensor[
+                            scratch_start : scratch_start + length
+                        ]
+                    self.stats.metadata_patch_slice_count += len(demand.flat_spans)
+                    self.stats.metadata_patch_slice_token_count += int(
+                        demand.token_count
+                    )
+                    return True
+                if not cache_entry.flat_slice_checked:
+                    cache_entry.flat_slice = self._contiguous_index_slice(
+                        demand.flat_indices
+                    )
+                    cache_entry.flat_slice_checked = True
+                if cache_entry.flat_slice is not None:
+                    start, end = cache_entry.flat_slice
+                    if end <= int(kv_indices.numel()) and (end - start) == int(
+                        demand.token_count
+                    ):
+                        kv_indices[start:end] = cache_entry.scratch_tensor
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                if cache_entry.flat_tensor is None or (
+                    cache_entry.flat_tensor.device != kv_indices.device
+                ):
+                    cache_entry.flat_tensor = torch.tensor(
+                        demand.flat_indices,
+                        dtype=torch.int64,
+                        device=kv_indices.device,
+                    )
+                kv_indices[cache_entry.flat_tensor] = cache_entry.scratch_tensor
+                return True
+
+            page_table = getattr(metadata, "page_table", None)
+            if page_table is not None:
+                if int(self._page_size) != 1 or page_table.dim() < 2:
+                    return False
+                if not demand.row_indices and not demand.row_spans:
+                    return False
+                if int(demand.max_row_index) >= int(page_table.shape[0]):
+                    return False
+                if int(demand.max_position) >= int(page_table.shape[1]):
+                    return False
+                if cache_entry.scratch_tensor is None or (
+                    cache_entry.scratch_tensor.device != page_table.device
+                    or cache_entry.scratch_tensor.dtype != page_table.dtype
+                    or int(cache_entry.scratch_tensor.numel())
+                    != int(scratch_locs.numel())
+                    or int(cache_entry.scratch_tensor.data_ptr())
+                    != int(scratch_locs.data_ptr())
+                ):
+                    cache_entry.scratch_tensor = scratch_locs.to(
+                        device=page_table.device, dtype=page_table.dtype
+                    )
+                if demand.row_spans:
+                    if (
+                        len(demand.row_spans) > 16
+                        and demand.row_indices
+                        and demand.positions
+                        and len(demand.row_indices) == int(demand.token_count)
+                        and len(demand.positions) == int(demand.token_count)
+                    ):
+                        if cache_entry.row_tensor is None or (
+                            cache_entry.row_tensor.device != page_table.device
+                        ):
+                            cache_entry.row_tensor = torch.tensor(
+                                demand.row_indices,
+                                dtype=torch.int64,
+                                device=page_table.device,
+                            )
+                        if cache_entry.pos_tensor is None or (
+                            cache_entry.pos_tensor.device != page_table.device
+                        ):
+                            cache_entry.pos_tensor = torch.tensor(
+                                demand.positions,
+                                dtype=torch.int64,
+                                device=page_table.device,
+                            )
+                        page_table[cache_entry.row_tensor, cache_entry.pos_tensor] = (
+                            cache_entry.scratch_tensor
+                        )
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                    if len(demand.row_spans) > 16:
+                        if cache_entry.row_span_row_tensor is None or (
+                            cache_entry.row_span_row_tensor.device
+                            != page_table.device
+                        ):
+                            (
+                                cache_entry.row_span_row_tensor,
+                                cache_entry.row_span_pos_tensor,
+                                cache_entry.row_span_scratch_tensor,
+                            ) = self._metadata_row_span_scatter_tensors(
+                                demand.row_spans,
+                                int(demand.token_count),
+                                page_table.device,
+                            )
+                        page_table[
+                            cache_entry.row_span_row_tensor,
+                            cache_entry.row_span_pos_tensor,
+                        ] = cache_entry.scratch_tensor[
+                            cache_entry.row_span_scratch_tensor
+                        ]
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                    for row, start, scratch_start, length in demand.row_spans:
+                        row = int(row)
+                        start = int(start)
+                        scratch_start = int(scratch_start)
+                        length = int(length)
+                        if (
+                            length <= 0
+                            or row >= int(page_table.shape[0])
+                            or start + length > int(page_table.shape[1])
+                            or scratch_start + length
+                            > int(cache_entry.scratch_tensor.numel())
+                        ):
+                            return False
+                        page_table[row, start : start + length] = (
+                            cache_entry.scratch_tensor[
+                                scratch_start : scratch_start + length
+                            ]
+                        )
+                    self.stats.metadata_patch_slice_count += len(demand.row_spans)
+                    self.stats.metadata_patch_slice_token_count += int(
+                        demand.token_count
+                    )
+                    return True
+                if not cache_entry.page_slice_checked:
+                    cache_entry.page_slice = self._page_table_index_slice(
+                        demand.row_indices, demand.positions
+                    )
+                    cache_entry.page_slice_checked = True
+                if cache_entry.page_slice is not None:
+                    row, start, end = cache_entry.page_slice
+                    if (
+                        row < int(page_table.shape[0])
+                        and end <= int(page_table.shape[1])
+                        and (end - start) == int(demand.token_count)
+                    ):
+                        page_table[row, start:end] = cache_entry.scratch_tensor
+                        self.stats.metadata_patch_slice_count += 1
+                        self.stats.metadata_patch_slice_token_count += int(
+                            demand.token_count
+                        )
+                        return True
+                if cache_entry.row_tensor is None or (
+                    cache_entry.row_tensor.device != page_table.device
+                ):
+                    cache_entry.row_tensor = torch.tensor(
+                        demand.row_indices,
+                        dtype=torch.int64,
+                        device=page_table.device,
+                    )
+                if cache_entry.pos_tensor is None or (
+                    cache_entry.pos_tensor.device != page_table.device
+                ):
+                    cache_entry.pos_tensor = torch.tensor(
+                        demand.positions,
+                        dtype=torch.int64,
+                        device=page_table.device,
+                    )
+                page_table[cache_entry.row_tensor, cache_entry.pos_tensor] = (
+                    cache_entry.scratch_tensor
+                )
+                return True
+        except Exception:
+            self.stats.metadata_patch_cache_fallback_count += 1
+            return False
+        return False
+
+    @staticmethod
+    def _contiguous_index_slice(indices: Tuple[int, ...]) -> Optional[Tuple[int, int]]:
+        if not indices:
+            return None
+        start = int(indices[0])
+        for offset, value in enumerate(indices):
+            if int(value) != start + offset:
+                return None
+        return start, start + len(indices)
+
+    @staticmethod
+    def _page_table_index_slice(
+        rows: Tuple[int, ...], positions: Tuple[int, ...]
+    ) -> Optional[Tuple[int, int, int]]:
+        if not rows or not positions or len(rows) != len(positions):
+            return None
+        row = int(rows[0])
+        start = int(positions[0])
+        for offset, (candidate_row, position) in enumerate(zip(rows, positions)):
+            if int(candidate_row) != row or int(position) != start + offset:
+                return None
+        return row, start, start + len(positions)
+
+    @staticmethod
+    def _metadata_flat_span_scatter_tensors(
+        spans: Tuple[Tuple[int, int, int], ...],
+        token_count: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        starts = torch.tensor(
+            [int(start) for start, _offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        scratch_starts = torch.tensor(
+            [int(offset) for _start, offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        lengths = torch.tensor(
+            [int(length) for _start, _offset, length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        span_ids = torch.repeat_interleave(
+            torch.arange(int(lengths.numel()), dtype=torch.int64, device=device),
+            lengths,
+        )
+        span_bases = torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
+        offsets = torch.arange(int(token_count), dtype=torch.int64, device=device)
+        local_offsets = offsets - span_bases
+        return starts[span_ids] + local_offsets, scratch_starts[span_ids] + local_offsets
+
+    @staticmethod
+    def _metadata_row_span_scatter_tensors(
+        spans: Tuple[Tuple[int, int, int, int], ...],
+        token_count: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = torch.tensor(
+            [int(row) for row, _start, _offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        starts = torch.tensor(
+            [int(start) for _row, start, _offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        scratch_starts = torch.tensor(
+            [int(offset) for _row, _start, offset, _length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        lengths = torch.tensor(
+            [int(length) for _row, _start, _offset, length in spans],
+            dtype=torch.int64,
+            device=device,
+        )
+        span_ids = torch.repeat_interleave(
+            torch.arange(int(lengths.numel()), dtype=torch.int64, device=device),
+            lengths,
+        )
+        span_bases = torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
+        offsets = torch.arange(int(token_count), dtype=torch.int64, device=device)
+        local_offsets = offsets - span_bases
+        return (
+            rows[span_ids],
+            starts[span_ids] + local_offsets,
+            scratch_starts[span_ids] + local_offsets,
+        )
+
+    def _metadata_patch_cache_entry(
+        self,
+        layer_id: int,
+        demand: _LayerKVKvcDemand,
+        metadata: Any,
+        scratch_locs: torch.Tensor,
+    ) -> _LayerKVMetadataPatchCacheEntry:
+        kv_indices = getattr(metadata, "kv_indices", None)
+        page_table = getattr(metadata, "page_table", None)
+        if kv_indices is not None:
+            metadata_kind = "kv_indices"
+            metadata_shape = tuple(int(x) for x in kv_indices.shape)
+            metadata_device = str(kv_indices.device)
+        elif page_table is not None:
+            metadata_kind = "page_table"
+            metadata_shape = tuple(int(x) for x in page_table.shape)
+            metadata_device = str(page_table.device)
+        else:
+            metadata_kind = "unknown"
+            metadata_shape = ()
+            metadata_device = ""
+        metadata_signature = (
+            self._metadata_int_tuple_signature(demand.req_indices),
+            self._metadata_int_tuple_signature(demand.positions),
+            self._metadata_int_tuple_signature(demand.row_indices),
+            self._metadata_int_tuple_signature(demand.flat_indices),
+            self._metadata_span_signature(demand.flat_spans),
+            self._metadata_span_signature(demand.row_spans),
+        )
+        stable_key = (
+            int(layer_id),
+            metadata_kind,
+            metadata_shape,
+            metadata_device,
+            metadata_signature,
+        )
+        shared_key = (
+            metadata_kind,
+            metadata_shape,
+            metadata_device,
+            metadata_signature,
+        )
+        lookup_key = (int(layer_id), metadata_kind)
+        entry = self._metadata_patch_cache.get(lookup_key)
+        if entry is None or entry.key != stable_key:
+            entry = _LayerKVMetadataPatchCacheEntry(key=stable_key)
+            shared = self._metadata_patch_tensor_cache.get(shared_key)
+            if shared is not None:
+                entry.row_tensor = shared.row_tensor
+                entry.pos_tensor = shared.pos_tensor
+                entry.flat_tensor = shared.flat_tensor
+                entry.flat_span_tensor = shared.flat_span_tensor
+                entry.flat_span_scratch_tensor = shared.flat_span_scratch_tensor
+                entry.row_span_row_tensor = shared.row_span_row_tensor
+                entry.row_span_pos_tensor = shared.row_span_pos_tensor
+                entry.row_span_scratch_tensor = shared.row_span_scratch_tensor
+                shared.hit_count += 1
+                self.stats.metadata_patch_cache_hit_count += 1
+            else:
+                self._metadata_patch_tensor_cache[shared_key] = entry
+            self._metadata_patch_cache[lookup_key] = entry
+            self.stats.metadata_patch_cache_miss_count += 1
+        else:
+            entry.hit_count += 1
+            self.stats.metadata_patch_cache_hit_count += 1
+        return entry
+
+    @staticmethod
+    def _metadata_int_tuple_signature(
+        values: Tuple[int, ...],
+    ) -> Tuple[int, int, int, int]:
+        if not values:
+            return (0, 0, 0, 0)
+        return (
+            len(values),
+            int(values[0]),
+            int(values[-1]),
+            int(hash(values)),
+        )
+
+    @staticmethod
+    def _metadata_span_signature(
+        values: Tuple[Tuple[int, ...], ...],
+    ) -> Tuple[int, Tuple[int, ...], Tuple[int, ...], int]:
+        if not values:
+            return (0, (), (), 0)
+        return (
+            len(values),
+            tuple(int(x) for x in values[0]),
+            tuple(int(x) for x in values[-1]),
+            int(hash(values)),
+        )
+
+    def _next_kvc_layer_id(self, layer_id: int) -> Optional[int]:
+        layer_ids = self._kvc_layer_ids()
+        for idx, candidate in enumerate(layer_ids):
+            if int(candidate) == int(layer_id) and idx + 1 < len(layer_ids):
+                return int(layer_ids[idx + 1])
+        return None
+
+    def _issue_next_virtual_kvc_prefetch(
+        self,
+        layer_id: int,
+        demand: _LayerKVKvcDemand,
+        current_buffer_idx: int,
+    ) -> None:
+        if (
+            self.config.kvc_scheduler != "async-deadline"
+            or not self._optimized_profile_enabled()
+            or self._copy_stream is None
+        ):
+            return
+        next_layer = self._next_kvc_layer_id(layer_id)
+        if next_layer is None:
+            return
+        next_demand = self._get_virtual_kvc_demand(int(next_layer))
+        if next_demand is None or not next_demand.entries:
+            return
+        if self._lookup_virtual_scratch_cache(next_demand) is not None:
+            return
+        self._issue_virtual_kvc_prefetch(
+            next_demand, exclude_buffer_idx=current_buffer_idx
+        )
+
+    def _issue_virtual_kvc_prefetch(
+        self,
+        demand: _LayerKVKvcDemand,
+        *,
+        exclude_buffer_idx: Optional[int],
+    ) -> bool:
+        if (
+            self.config.kvc_scheduler != "async-deadline"
+            or not self._optimized_profile_enabled()
+            or self._copy_stream is None
+        ):
+            return False
+        if demand is None or not demand.entries:
+            return False
+        key = (int(self._decode_step), int(demand.layer_id), demand.signature)
+        if key in self._pending_virtual_kvc_materialize:
+            return False
+        buffer_idx = self._choose_virtual_scratch_buffer(
+            demand.token_count, exclude_buffer_idx=exclude_buffer_idx
+        )
+        if buffer_idx < 0:
+            return False
+        scratch_locs = self._virtual_scratch_buffers[buffer_idx][: demand.token_count]
+        device_slice = (
+            self._virtual_scratch_buffer_slices[int(buffer_idx)]
+            if int(buffer_idx) < len(self._virtual_scratch_buffer_slices)
+            else (-1, 0)
+        )
+        self._ensure_host_store()
+        with self._profile("profile_virtual_prefetch_issue_ms"):
+            elapsed_ms, start_event, ready_event = (
+                self._host_store.reload_layer_to_locs(
+                    int(demand.layer_id),
+                    list(demand.entries),
+                    scratch_locs,
+                    stream=self._copy_stream,
+                    async_copy=True,
+                    host_index=demand.host_index_cpu,
+                    host_slice=demand.host_slice,
+                    host_spans=demand.host_spans,
+                    device_slice=device_slice,
+                )
+            )
+        if ready_event is None or start_event is None:
+            self._record_virtual_materialize(demand.token_count, elapsed_ms)
+            return True
+        self.stats.virtual_kvc_prefetch_count += 1
+        self.stats.virtual_kvc_materialize_count += 1
+        self.stats.virtual_kvc_materialize_layer_count += 1
+        self.stats.virtual_kvc_materialize_token_count += int(demand.token_count)
+        self.stats.virtual_scratch_used_tokens = max(
+            self.stats.virtual_scratch_used_tokens, int(demand.token_count)
+        )
+        self._pending_virtual_kvc_materialize[key] = _LayerKVPendingVirtualMaterialize(
+            start_event=start_event,
+            ready_event=ready_event,
+            layer_id=int(demand.layer_id),
+            entries=list(demand.entries),
+            scratch_locs=scratch_locs,
+            req_indices=demand.req_indices,
+            positions=demand.positions,
+            token_count=int(demand.token_count),
+            buffer_idx=int(buffer_idx),
+        )
+        return True
+
+    def _wait_for_virtual_materialize(
+        self, pending: _LayerKVPendingVirtualMaterialize
+    ) -> Optional[torch.Tensor]:
+        self.stats.virtual_kvc_prefetch_wait_count += 1
+        self.stats.kvc_ready_use_check_count += 1
+        self.stats.scheduler_ready_use_check_count += 1
+        ready = bool(pending.ready_event.query())
+        if ready:
+            self.stats.virtual_kvc_prefetch_ready_before_use_count += 1
+            self.stats.kvc_ready_before_use_count += 1
+            self.stats.scheduler_ready_before_use_count += 1
+        else:
+            self.stats.layerkv_deadline_miss_count += 1
+            self.stats.scheduler_deadline_miss_count += 1
+        stream = torch.cuda.current_stream(device=self._kv_pool.device)
+        t_wait = time.perf_counter()
+        wait_start = None
+        wait_end = None
+        if not ready:
+            try:
+                wait_start = torch.cuda.Event(enable_timing=True)
+                wait_end = torch.cuda.Event(enable_timing=True)
+                wait_start.record(stream)
+            except Exception:
+                wait_start = None
+                wait_end = None
+        stream.wait_event(pending.ready_event)
+        if wait_end is not None:
+            try:
+                wait_end.record(stream)
+            except Exception:
+                wait_end = None
+        self.stats.scheduler_exposed_wait_ms += (time.perf_counter() - t_wait) * 1000.0
+        self.stats.layerkv_copy_event_wait_count += 1
+        if wait_start is not None and wait_end is not None:
+            try:
+                wait_end.synchronize()
+                stall_ms = float(wait_start.elapsed_time(wait_end))
+                self.stats.kvc_ready_miss_stall_ms += stall_ms
+                self.stats.layerkv_main_stream_wait_ms += stall_ms
+                self.stats.kvc_ready_miss_stall_count += 1
+            except Exception:
+                pass
+        try:
+            elapsed_ms = float(pending.start_event.elapsed_time(pending.ready_event))
+            self.stats.virtual_kvc_materialize_ms += elapsed_ms
+            self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
+        except Exception:
+            pass
+        self._refresh_ready_before_use_ratio()
+        return pending.scratch_locs
+
