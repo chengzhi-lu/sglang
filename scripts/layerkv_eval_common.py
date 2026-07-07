@@ -31,7 +31,7 @@ FIG4_WORKLOADS = {
         "max_ctx": 1024,
         "output_len": 16,
         "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
-        "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
+        "dataset_path": "/root/.cache/huggingface/dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
     },
     "batch_heavy": {
         "batch_size": 256,
@@ -40,7 +40,7 @@ FIG4_WORKLOADS = {
         "max_ctx": 1024,
         "output_len": 16,
         "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
-        "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
+        "dataset_path": "/root/.cache/huggingface/dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
     },
     "batch-heavy-2048": {
         "batch_size": 128,
@@ -49,7 +49,7 @@ FIG4_WORKLOADS = {
         "max_ctx": 2048,
         "output_len": 16,
         "dataset_name": "ShareGPT_V3_unfiltered_cleaned_split",
-        "dataset_path": "/4IR-dataset/common/request_dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
+        "dataset_path": "/root/.cache/huggingface/dataset/ShareGPT_V3_unfiltered_cleaned_split.json",
     },
     "context-heavy": {
         "batch_size": 8,
@@ -79,7 +79,10 @@ def apply_fig4_workload(args: Any) -> None:
         args.fig4_dataset_name = ""
         args.fig4_dataset_path = ""
         return
-    args.batch_size = int(preset["batch_size"])
+    if not getattr(args, "_fig4_cli_batch_size", False):
+        args.batch_size = int(preset["batch_size"])
+    else:
+        args.batch_size = int(args.batch_size)
     args.input_len = int(preset["input_len"])
     args.output_len = int(preset["output_len"])
     args.min_ctx = int(preset["min_ctx"])

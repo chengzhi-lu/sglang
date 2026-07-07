@@ -305,3 +305,95 @@ def transfer_kv_all_layer_mla_lf_pf(
         block_quota,
         num_warps_per_block,
     )
+
+
+def layerkv_copy_kv_span_scatter(
+    src_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_k: torch.Tensor,
+    dst_v: torch.Tensor,
+    spans: torch.Tensor,
+    src_base_slot: int,
+    dst_base_slot: int,
+    item_size: int,
+    num_warps_per_block: int = 8,
+):
+    torch.ops.sgl_kernel.layerkv_copy_kv_span_scatter.default(
+        src_k,
+        src_v,
+        dst_k,
+        dst_v,
+        spans,
+        src_base_slot,
+        dst_base_slot,
+        item_size,
+        num_warps_per_block,
+    )
+
+
+def layerkv_copy_kv_span_scatter_batched(
+    src_ks: List[torch.Tensor],
+    src_vs: List[torch.Tensor],
+    dst_ks: List[torch.Tensor],
+    dst_vs: List[torch.Tensor],
+    spans: torch.Tensor,
+    span_batch_ids: torch.Tensor,
+    src_base_slots: torch.Tensor,
+    dst_base_slots: torch.Tensor,
+    item_size: int,
+    num_warps_per_block: int = 8,
+):
+    torch.ops.sgl_kernel.layerkv_copy_kv_span_scatter_batched.default(
+        src_ks,
+        src_vs,
+        dst_ks,
+        dst_vs,
+        spans,
+        span_batch_ids,
+        src_base_slots,
+        dst_base_slots,
+        item_size,
+        num_warps_per_block,
+    )
+
+
+def layerkv_copy_kv_contiguous_batched(
+    src_ks: List[torch.Tensor],
+    src_vs: List[torch.Tensor],
+    dst_ks: List[torch.Tensor],
+    dst_vs: List[torch.Tensor],
+    src_base_slots: torch.Tensor,
+    dst_base_slots: torch.Tensor,
+    token_counts: torch.Tensor,
+    item_size: int,
+):
+    torch.ops.sgl_kernel.layerkv_copy_kv_contiguous_batched.default(
+        src_ks,
+        src_vs,
+        dst_ks,
+        dst_vs,
+        src_base_slots,
+        dst_base_slots,
+        token_counts,
+        item_size,
+    )
+
+
+def layerkv_copy_kv_span_backup_batched(
+    src_ks: List[torch.Tensor],
+    src_vs: List[torch.Tensor],
+    dst_ks: List[torch.Tensor],
+    dst_vs: List[torch.Tensor],
+    spans: torch.Tensor,
+    span_batch_ids: torch.Tensor,
+    item_size: int,
+):
+    torch.ops.sgl_kernel.layerkv_copy_kv_span_backup_batched.default(
+        src_ks,
+        src_vs,
+        dst_ks,
+        dst_vs,
+        spans,
+        span_batch_ids,
+        item_size,
+    )

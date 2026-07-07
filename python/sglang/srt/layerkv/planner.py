@@ -224,6 +224,7 @@ class LayerKVPlannerMixin:
         """
         if schedule_batch is None:
             return
+        self._finalize_kvc_evictions(block=False)
         context = dict(scheduler_context or {})
         self._last_scheduler_context = context
         self._last_scheduled_req_lens = self._schedule_batch_req_lens(schedule_batch)
@@ -258,7 +259,9 @@ class LayerKVPlannerMixin:
         self.stats.native_schedule_overlap_enabled = bool(
             context.get("enable_overlap", False)
         )
-        self._record_scheduler_budget_observation(context, self._last_scheduled_req_lens)
+        self._record_scheduler_budget_observation(
+            context, self._last_scheduled_req_lens
+        )
 
     def _record_scheduler_budget_observation(
         self, context: Dict[str, Any], req_lens: List[Tuple[int, int]]
@@ -326,23 +329,53 @@ class LayerKVPlannerMixin:
         if not self.physical_kvc_supported:
             return 0, 0, "physical_kvc_unsupported"
         raw_offloaded = int(max(0, self._offloaded_token_count()))
-        if self.config.kvc_backend == "per-layer-arena":
-            layer_ids = self._kvc_layer_ids()
-            if not layer_ids:
-                return 0, raw_offloaded, "no_kvc_layers"
+        if self.config.kvc_backend == "per-layer-arena" and reason in (
+            "decode_allocatable",
+            "pre_retract_decode_mem",
+        ):
             self._refresh_per_layer_allocator_stats()
-            if reason == "decode_prealloc_admission":
-                self._ensure_per_layer_common_free_current()
-                self.stats.kvc_per_layer_physical_arena_common_free_tokens = len(
-                    self._per_layer_arena_common_free_locs
-                )
-                credit = int(
-                    self.stats.kvc_per_layer_physical_arena_common_free_tokens
-                )
-            else:
-                credit = int(self.stats.kvc_per_layer_physical_arena_min_free_tokens)
+            credit = int(self.stats.kvc_per_layer_physical_arena_min_free_tokens)
             return max(0, credit), raw_offloaded, "per_layer_arena_physical_allocator"
-        return raw_offloaded, raw_offloaded, ""
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and reason == "decode_prealloc_admission"
+        ):
+            self._ensure_per_layer_common_free_current()
+            credit = int(len(self._per_layer_arena_common_free_locs))
+            self.stats.kvc_per_layer_physical_arena_common_free_tokens = credit
+            return max(0, credit), raw_offloaded, "per_layer_arena_physical_allocator"
+        planner_credit = self._planner_scheduler_credit_tokens()
+        if planner_credit > 0:
+            return int(planner_credit), raw_offloaded, "planner_kvc_reclaim_budget"
+        if self.config.kvc_backend == "per-layer-arena":
+            return 0, raw_offloaded, "no_planner_kvc_reclaim_budget"
+        return raw_offloaded, raw_offloaded, "physical_offloaded_tokens"
+
+    def _planner_scheduler_credit_tokens(self) -> int:
+        if self._bytes_per_token_all_layers <= 0:
+            return 0
+        reclaim_mb = max(
+            0.0,
+            float(getattr(self.stats, "planner_selected_kvc_reclaim_mb", 0.0) or 0.0),
+            float(getattr(self.stats, "effective_kvc_reclaim_mb", 0.0) or 0.0),
+            float(getattr(self.stats, "planned_kvc_reclaim_mb", 0.0) or 0.0),
+        )
+        credit_from_mb = int(
+            reclaim_mb * 1024.0 * 1024.0 / float(self._bytes_per_token_all_layers)
+        )
+        credit_from_plan = 0
+        if self.config.kvc_backend == "per-layer-arena":
+            layer_count = max(1, len(self._kvc_layer_ids()))
+            credit_from_plan = (
+                int(max(0, self._planned_kvc_token_target)) // layer_count
+            )
+        else:
+            credit_from_plan = int(max(0, self._planned_kvc_token_target))
+        credit = max(credit_from_mb, credit_from_plan)
+        total_tokens = self._allocator_total_size()
+        if total_tokens > 0:
+            credit = min(int(credit), int(total_tokens))
+        return max(0, int(credit))
 
     def _kvc_reclaim_is_scheduler_visible(self) -> bool:
         if self.config.mode not in ("kvc-only", "kvc-expert"):
@@ -383,6 +416,22 @@ class LayerKVPlannerMixin:
             self.stats.scheduler_budget_credit_denied_count += 1
         return credit
 
+    def get_scheduler_allocatable_tokens(
+        self,
+        *,
+        required_tokens: int = 0,
+        available_tokens: int = 0,
+        reason: str = "decode_allocatable",
+    ) -> int:
+        """Return scheduler-visible decode capacity without choosing KV slots."""
+        available = max(0, int(available_tokens or 0))
+        credit = self.get_scheduler_admission_credit_tokens(
+            required_tokens=required_tokens,
+            available_tokens=available,
+            reason=reason,
+        )
+        return int(available) + max(0, int(credit or 0))
+
     def prepare_reclaim_for_scheduler(
         self,
         *,
@@ -392,100 +441,75 @@ class LayerKVPlannerMixin:
         reason: str = "scheduler_pressure",
         wait: bool = True,
     ) -> int:
-        """Reclaim KVC for real scheduler pressure and return committed credit."""
+        """Record scheduler pressure and reclaim only for active decode safety."""
         visible_available = int(available_tokens)
         if self.config.kvc_backend == "per-layer-arena":
-            self._refresh_per_layer_allocator_stats()
-            if reason == "decode_prealloc_admission":
-                self._ensure_per_layer_common_free_current()
-                self.stats.kvc_per_layer_physical_arena_common_free_tokens = len(
-                    self._per_layer_arena_common_free_locs
-                )
-                visible_available = int(available_tokens) + int(
-                    self.stats.kvc_per_layer_physical_arena_common_free_tokens
-                )
-            else:
+            if reason == "pre_retract_decode_mem":
+                self._refresh_per_layer_allocator_stats()
                 visible_available = int(
                     self.stats.kvc_per_layer_physical_arena_min_free_tokens
                 )
+            elif reason == "decode_prealloc_admission":
+                self._ensure_per_layer_common_free_current()
+                visible_available = int(len(self._per_layer_arena_common_free_locs))
+                self.stats.kvc_per_layer_physical_arena_common_free_tokens = (
+                    visible_available
+                )
         shortage = max(0, int(required_tokens) - int(visible_available))
         self._scheduler_pressure_tokens = shortage
-        self._scheduler_pressure_kvc_blocked = False
-        self.stats.scheduler_budget_pressure_tokens = shortage
-        if shortage <= 0:
-            self.get_scheduler_admission_credit_tokens(
-                required_tokens=required_tokens,
-                available_tokens=available_tokens,
-                reason=reason,
-            )
-            return self.stats.scheduler_budget_credit_tokens
-        if (
-            self.config.kvc_backend == "per-layer-arena"
-            and reason in ("decode_prealloc_admission", "pre_retract_decode_mem")
-        ):
-            # Attention needs every running request's KV on every decode step.
-            # Reclaiming the current running batch here creates immediate
-            # evict/reload churn and does not provide durable scheduler capacity.
-            # Online pressure traces show this path can spend scheduler time
-            # while native retraction still reports #new_tokens_gained=0.
-            # Only expose already-free arena slots to admission; deeper KVC
-            # reclaim should be planned outside the current decode deadline.
-            self.stats.kvc_layerwise_scheduler_deadline_reject_count += 1
-            self._scheduler_pressure_kvc_blocked = True
-            return self.get_scheduler_admission_credit_tokens(
-                required_tokens=required_tokens,
-                available_tokens=available_tokens,
-                reason=reason,
-            )
-        block_tokens = max(1, int(getattr(self.config, "kvc_block_tokens", 1) or 1))
-        if shortage < block_tokens:
-            self.stats.scheduler_budget_small_shortage_skip_count += 1
-            credit = self.get_scheduler_admission_credit_tokens(
-                required_tokens=required_tokens,
-                available_tokens=available_tokens,
-                reason=reason,
-            )
-            self._scheduler_pressure_tokens = 0
-            self._scheduler_pressure_kvc_blocked = False
-            self.stats.scheduler_budget_pressure_tokens = 0
-            return credit
-        if not self._kvc_reclaim_is_scheduler_visible():
-            self.stats.kvc_scheduler_invisible_skip_count += 1
-            self.stats.kvc_scheduler_invisible_skip_tokens += int(shortage)
-            credit = self.get_scheduler_admission_credit_tokens(
-                required_tokens=required_tokens,
-                available_tokens=available_tokens,
-                reason=reason,
-            )
-            self._scheduler_pressure_tokens = 0
-            self._scheduler_pressure_kvc_blocked = False
-            self.stats.scheduler_budget_pressure_tokens = 0
-            return credit
-        before_credit, _, _ = self._scheduler_credit_tokens(reason=reason)
-        t0 = time.perf_counter()
-        self.try_reclaim_kvc_before_retract(
-            schedule_batch=schedule_batch,
-            required_tokens=required_tokens,
-            available_tokens=available_tokens,
-            reason=reason,
-        )
-        if wait:
-            self._finalize_kvc_evictions(block=True)
-        self.stats.scheduler_budget_pre_retract_wait_ms += (
-            time.perf_counter() - t0
-        ) * 1000.0
+        if shortage > 0 and reason == "pre_retract_decode_mem":
+            if self._kvc_reclaim_is_scheduler_visible():
+                t0 = time.perf_counter()
+                self.try_reclaim_kvc_before_retract(
+                    schedule_batch=schedule_batch,
+                    required_tokens=required_tokens,
+                    available_tokens=visible_available,
+                    reason=reason,
+                )
+                self._finalize_kvc_evictions(block=bool(wait))
+                self.stats.scheduler_budget_pre_retract_wait_ms += (
+                    time.perf_counter() - t0
+                ) * 1000.0
+                if self.config.kvc_backend == "per-layer-arena":
+                    self._refresh_per_layer_allocator_stats()
+                    visible_available = int(
+                        self.stats.kvc_per_layer_physical_arena_min_free_tokens
+                    )
+                else:
+                    visible_available = int(self._allocator_available_size())
+                shortage = max(0, int(required_tokens) - int(visible_available))
+                self._scheduler_pressure_tokens = shortage
+            else:
+                self.stats.kvc_scheduler_invisible_skip_count += 1
+                self.stats.kvc_scheduler_invisible_skip_tokens += int(shortage)
         credit = self.get_scheduler_admission_credit_tokens(
             required_tokens=required_tokens,
-            available_tokens=available_tokens,
+            available_tokens=visible_available,
             reason=reason,
         )
-        self._scheduler_pressure_tokens = max(0, shortage - credit)
-        self._scheduler_pressure_kvc_blocked = False
-        self.stats.scheduler_budget_pressure_tokens = int(self._scheduler_pressure_tokens)
-        success = available_tokens + credit >= required_tokens
-        if success and credit > before_credit:
+        self._scheduler_pressure_kvc_blocked = bool(shortage > credit)
+        self.stats.scheduler_budget_pressure_tokens = max(
+            0, int(shortage) - int(credit)
+        )
+        if shortage > credit:
+            self.stats.kvc_layerwise_scheduler_deadline_reject_count += 1
+        if shortage <= 0:
+            self._scheduler_pressure_tokens = 0
+            self._scheduler_pressure_kvc_blocked = False
+            self.stats.scheduler_budget_pressure_tokens = 0
+        if shortage > 0 and credit >= shortage:
             self.stats.scheduler_budget_credit_prevented_retract_count += 1
             self.stats.scheduler_budget_credit_used_tokens += min(shortage, credit)
+        if shortage > 0 and credit <= 0:
+            block_tokens = max(1, int(getattr(self.config, "kvc_block_tokens", 1) or 1))
+            if shortage < block_tokens:
+                self.stats.scheduler_budget_small_shortage_skip_count += 1
+            if not self._kvc_reclaim_is_scheduler_visible():
+                self.stats.kvc_scheduler_invisible_skip_count += 1
+                self.stats.kvc_scheduler_invisible_skip_tokens += int(shortage)
+            self._scheduler_pressure_tokens = 0
+            self._scheduler_pressure_kvc_blocked = False
+            self.stats.scheduler_budget_pressure_tokens = 0
         return credit
 
     def _residency_key(
@@ -723,8 +747,7 @@ class LayerKVPlannerMixin:
                 kvc_groups = sum(
                     1
                     for entry in kvc_entries
-                    if entry.state
-                    in ("resident", "offloaded", "reloading", "evicting")
+                    if entry.state in ("resident", "offloaded", "reloading", "evicting")
                 )
                 kvc_resident = self._resident_token_count()
                 kvc_offloaded = self._offloaded_token_count()
@@ -812,6 +835,7 @@ class LayerKVPlannerMixin:
         self._allocator = getattr(runner, "token_to_kv_pool_allocator", None)
         self._req_to_token_pool = getattr(runner, "req_to_token_pool", None)
         self._install_kv_pool_hooks(getattr(runner, "token_to_kv_pool", None))
+        self._install_allocator_hooks(self._allocator)
         if (
             self.config.mode in ("kvc-only", "kvc-expert")
             and self.physical_kvc_supported
@@ -870,6 +894,91 @@ class LayerKVPlannerMixin:
         ):
             self.stats.comparable = False
             self.stats.comparability_reason = self.unsupported_reason
+
+    def _install_allocator_hooks(self, allocator: Any) -> None:
+        if allocator is None or getattr(allocator, "_layerkv_allocator_wrapped", False):
+            return
+        orig_alloc = getattr(allocator, "alloc", None)
+        orig_free = getattr(allocator, "free", None)
+        if (
+            orig_alloc is None
+            or not callable(orig_alloc)
+            or orig_free is None
+            or not callable(orig_free)
+        ):
+            return
+        self._wrapped_methods["allocator.alloc"] = orig_alloc
+        self._wrapped_methods["allocator.free"] = orig_free
+
+        @functools.wraps(orig_alloc)
+        def wrapped_alloc(need_size: int, *args, **kwargs):
+            if (
+                self.config.kvc_backend != "per-layer-arena"
+                or not self._per_layer_arena_reserved_locs
+            ):
+                return orig_alloc(need_size, *args, **kwargs)
+            need = max(0, int(need_size))
+            if need <= 0:
+                return orig_alloc(need_size, *args, **kwargs)
+            selected: List[int] = []
+            seen: Set[int] = set()
+            attempts = 0
+            while len(selected) < need and attempts < 4:
+                chunk = orig_alloc(need - len(selected), *args, **kwargs)
+                attempts += 1
+                if chunk is None or int(chunk.numel()) == 0:
+                    break
+                try:
+                    locs = chunk.detach().cpu().to(torch.int64).flatten().tolist()
+                except Exception:
+                    return chunk
+                for loc in locs:
+                    loc = int(loc)
+                    if (
+                        loc <= 0
+                        or loc in seen
+                        or loc in self._per_layer_arena_reserved_locs
+                    ):
+                        continue
+                    selected.append(loc)
+                    seen.add(loc)
+                    if len(selected) >= need:
+                        break
+            if len(selected) < need:
+                return None
+            return torch.tensor(selected, dtype=torch.int64, device=allocator.device)
+
+        @functools.wraps(orig_free)
+        def wrapped_free(free_index: torch.Tensor, *args, **kwargs):
+            if (
+                self.config.kvc_backend != "per-layer-arena"
+                or not self._per_layer_arena_reserved_locs
+                or free_index is None
+                or int(free_index.numel()) == 0
+            ):
+                return orig_free(free_index, *args, **kwargs)
+            try:
+                free_cpu = free_index.detach().cpu().to(torch.int64).flatten()
+                keep_locs = [
+                    int(loc)
+                    for loc in free_cpu.tolist()
+                    if int(loc) > 0
+                    and int(loc) not in self._per_layer_arena_reserved_locs
+                ]
+                if not keep_locs:
+                    return None
+                filtered = torch.unique(
+                    torch.tensor(keep_locs, dtype=torch.int64, device=allocator.device)
+                )
+                return orig_free(filtered, *args, **kwargs)
+            except Exception:
+                return orig_free(free_index, *args, **kwargs)
+
+        setattr(allocator, "alloc", wrapped_alloc)
+        setattr(allocator, "free", wrapped_free)
+        allocator._layerkv_allocator_wrapped = True
+        allocator._layerkv_free_wrapped = True
+        allocator.layerkv_runtime = self
 
     def _can_support_kvc_pool(self, kv_pool: Any) -> bool:
         try:
@@ -956,6 +1065,10 @@ class LayerKVPlannerMixin:
         self._virtual_scratch_locs = locs.to(dtype=torch.int64)
         self._virtual_scratch_capacity = int(locs.numel())
         self._virtual_scratch_cache_by_layer.clear()
+        self._virtual_materialize_plan_reuse_cache.clear()
+        self._virtual_scratch_buffer_generations_by_layer.clear()
+        self._virtual_materialize_recorded_event_groups.clear()
+        self._virtual_scratch_single_generation = 0
         self._metadata_patch_cache.clear()
         self._metadata_patch_tensor_cache.clear()
         scratch_slice = self._contiguous_device_locs_slice(self._virtual_scratch_locs)
@@ -976,9 +1089,11 @@ class LayerKVPlannerMixin:
                 ]
             else:
                 self._virtual_scratch_buffer_slices = [(-1, 0), (-1, 0)]
+            self._virtual_scratch_buffer_generations = [0, 0]
         else:
             self._virtual_scratch_buffers = [self._virtual_scratch_locs]
             self._virtual_scratch_buffer_slices = [scratch_slice]
+            self._virtual_scratch_buffer_generations = [0]
         self.stats.virtual_scratch_capacity_tokens = self._virtual_scratch_capacity
         self.stats.layerkv_kvc_backend_ready = True
         self.stats.layerkv_kvc_backend_reason = ""

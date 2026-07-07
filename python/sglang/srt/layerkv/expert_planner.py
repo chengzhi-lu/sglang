@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import functools
 import heapq
 import json
@@ -420,6 +421,8 @@ class LayerKVExpertPlannerMixin:
                 List[Tuple[float, int, int, int, float, float, float]],
             ]
         ],
+        *,
+        max_reclaim_mb: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         if precomputed is None:
             return None
@@ -435,6 +438,21 @@ class LayerKVExpertPlannerMixin:
             layer_id = int(candidate[2])
             candidates_by_layer.setdefault(layer_id, []).append(candidate)
         layer_ids = sorted(int(layer_id) for layer_id in base_capacities)
+        max_layer_reclaim_bytes = 0
+        for layer_id in layer_ids:
+            full_capacity = int(base_capacities[layer_id])
+            min_capacity = int(min_capacities.get(layer_id, full_capacity))
+            layer_candidates = candidates_by_layer.get(layer_id, [])
+            max_evict = max(0, full_capacity - min_capacity)
+            max_layer_reclaim_bytes = max(
+                max_layer_reclaim_bytes,
+                sum(int(candidate[1]) for candidate in layer_candidates[:max_evict]),
+            )
+        max_reclaim_bytes: Optional[int] = None
+        if max_reclaim_mb is not None and max_reclaim_mb > 0.0:
+            max_reclaim_bytes = (
+                int(max_reclaim_mb * 1024 * 1024) + max_layer_reclaim_bytes
+            )
         states: Dict[
             int,
             Tuple[
@@ -536,6 +554,11 @@ class LayerKVExpertPlannerMixin:
                     point_materialize,
                 ) in points:
                     total_bytes = int(prev_bytes) + int(point_bytes)
+                    if (
+                        max_reclaim_bytes is not None
+                        and total_bytes > max_reclaim_bytes
+                    ):
+                        continue
                     candidate_state = (
                         float(prev_cost + point_cost),
                         float(prev_calls + point_calls),
@@ -1170,6 +1193,8 @@ class LayerKVExpertPlannerMixin:
             layer_ids=layer_ids,
             max_tokens_per_layer=max_tokens_per_layer,
             block_tokens=block_tokens,
+            avg_prefix=self._avg_prefix_len(forward_batch),
+            batch_size=max(1, len(self._batch_req_indices_and_lens(forward_batch))),
         )
 
     def _kvc_tokens_by_layer_json(self, token_count: Any) -> str:
@@ -1282,8 +1307,6 @@ class LayerKVExpertPlannerMixin:
         return min(configured, dynamic_needed) if configured > 0.0 else dynamic_needed
 
     def _no_pressure_fast_path_active(self, forward_batch: Any = None) -> bool:
-        if not self.config.dynamic_pressure_from_kvc:
-            return False
         if self.config.mode not in ("kvc-only", "kvc-expert"):
             return False
         if self._current_forward_mode != "decode":
@@ -1309,8 +1332,11 @@ class LayerKVExpertPlannerMixin:
             return False
 
         configured = max(0.0, float(self.config.reclaim_limit_mb))
-        needed = self._dynamic_runtime_pressure_mb(forward_batch)
-        if needed > 1e-3:
+        if self.config.dynamic_pressure_from_kvc:
+            needed = self._dynamic_runtime_pressure_mb(forward_batch)
+            if needed > 1e-3:
+                return False
+        elif configured > 0.0:
             return False
         self._set_no_pressure_reclaim_stats(configured)
         return True
@@ -1733,5 +1759,3 @@ class LayerKVExpertPlannerMixin:
             ):
                 self.stats.comparable = True
                 self.stats.comparability_reason = ""
-
-

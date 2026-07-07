@@ -2158,11 +2158,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        if self.token_to_kv_pool_allocator.available_size() >= num_tokens:
+        available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if available_tokens >= num_tokens:
             return True
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        runtime = getattr(kv_pool, "layerkv_runtime", None)
+        allocatable_fn = getattr(runtime, "get_scheduler_allocatable_tokens", None)
+        if allocatable_fn is not None:
+            return (
+                int(
+                    allocatable_fn(
+                        required_tokens=num_tokens,
+                        available_tokens=available_tokens,
+                        reason="decode_allocatable",
+                    )
+                    or 0
+                )
+                >= num_tokens
+            )
         layerkv_runtime = getattr(
-            getattr(kv_pool, "layerkv_runtime", None),
+            runtime,
             "can_satisfy_decode_allocation",
             None,
         )

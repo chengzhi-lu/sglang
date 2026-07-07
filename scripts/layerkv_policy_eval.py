@@ -129,6 +129,10 @@ CSV_FIELDS = [
     "kvc_per_layer_arena_entry_count",
     "kvc_per_layer_arena_resident_token_count",
     "kvc_per_layer_arena_offloaded_token_count",
+    "kvc_per_layer_invalid_reuse_count",
+    "kvc_per_layer_invalid_reuse_token_count",
+    "kvc_per_layer_overwrite_reuse_count",
+    "kvc_per_layer_overwrite_reuse_token_count",
     "kvc_per_layer_evict_count",
     "kvc_per_layer_reload_count",
     "kvc_per_layer_reload_mb_total",
@@ -391,6 +395,13 @@ CSV_FIELDS = [
     "layerkv_copy_event_wait_count",
     "layerkv_copy_stream_busy_ms",
     "layerkv_python_overhead_ms",
+    "layerkv_prewarm_count",
+    "layerkv_prewarm_ms",
+    "layerkv_prewarm_kvc_evict_ms",
+    "layerkv_prewarm_kvc_tokens",
+    "layerkv_prewarm_pressure_mb",
+    "layerkv_prewarm_skipped_count",
+    "layerkv_prewarm_skipped_reason",
     "unified_residency_enabled",
     "resident_group_count",
     "resident_group_kvc_count",
@@ -406,6 +417,46 @@ CSV_FIELDS = [
     "profile_install_ms",
     "profile_set_kv_ms",
     "profile_forward_begin_ms",
+    "profile_forward_begin_bookkeeping_ms",
+    "profile_forward_begin_metadata_current_ms",
+    "profile_forward_begin_fastpath_check_ms",
+    "profile_forward_begin_expert_control_ms",
+    "profile_forward_begin_hotness_prepare_ms",
+    "profile_forward_begin_scheduler_control_ms",
+    "profile_forward_begin_extend_cleanup_ms",
+    "profile_cleanup_req_indices_ms",
+    "profile_cleanup_cursor_ms",
+    "profile_cleanup_global_scan_ms",
+    "profile_cleanup_global_drop_ms",
+    "profile_cleanup_per_layer_keys_ms",
+    "profile_cleanup_per_layer_drop_ms",
+    "profile_cleanup_per_layer_loop_ms",
+    "profile_cleanup_per_layer_run_range_ms",
+    "profile_cleanup_per_layer_event_sync_ms",
+    "profile_cleanup_per_layer_collect_ms",
+    "profile_cleanup_per_layer_free_locs_ms",
+    "profile_cleanup_per_layer_refresh_allocator_ms",
+    "profile_cleanup_per_layer_host_free_ms",
+    "profile_cleanup_refresh_stats_ms",
+    "profile_cleanup_drop_entries_ms",
+    "profile_cleanup_finished_ms",
+    "profile_cleanup_release_ms",
+    "profile_cleanup_drop_entries_call_count",
+    "profile_cleanup_drop_entries_req_count",
+    "profile_cleanup_drop_entries_key_count",
+    "profile_cleanup_drop_entries_token_count",
+    "profile_cleanup_drop_entries_max_req_idx",
+    "profile_cleanup_drop_entries_max_req_key_count",
+    "profile_cleanup_drop_entries_max_req_token_count",
+    "profile_cleanup_drop_entries_max_req_seq_len",
+    "profile_cleanup_drop_entries_modes",
+    "profile_cleanup_drop_entries_req_summary",
+    "profile_cleanup_finished_call_count",
+    "profile_cleanup_finished_key_count",
+    "profile_cleanup_finished_token_count",
+    "profile_cleanup_release_call_count",
+    "profile_cleanup_release_key_count",
+    "profile_cleanup_release_token_count",
     "profile_forward_end_ms",
     "profile_decode_scheduler_wall_ms",
     "profile_decode_model_forward_ms",
@@ -429,13 +480,63 @@ CSV_FIELDS = [
     "profile_kvc_cost_observe_ms",
     "profile_kvc_refresh_stats_ms",
     "profile_req_to_token_rewrite_ms",
+    "profile_virtual_select_ms",
+    "profile_virtual_plan_cache_lookup_ms",
+    "profile_virtual_plan_sort_ms",
+    "profile_virtual_host_order_ms",
+    "profile_virtual_plan_key_ms",
+    "profile_virtual_plan_lookup_only_ms",
+    "profile_virtual_index_build_ms",
+    "profile_virtual_req_to_token_scatter_ms",
+    "profile_virtual_metadata_rewrite_ms",
+    "profile_virtual_direct_metadata_patch_ms",
+    "profile_virtual_prefetch_issue_ms",
+    "profile_virtual_prefetch_next_layer_ms",
+    "profile_virtual_prefetch_demand_ms",
+    "profile_virtual_prefetch_cache_lookup_ms",
+    "profile_virtual_prefetch_buffer_select_ms",
+    "profile_virtual_prefetch_setup_ms",
+    "profile_virtual_prefetch_reload_call_ms",
+    "profile_virtual_prefetch_record_ms",
     "profile_virtual_reload_issue_wall_ms",
     "profile_virtual_reload_prepare_ms",
     "profile_virtual_reload_contiguous_check_ms",
+    "profile_virtual_reload_event_record_ms",
+    "profile_virtual_reload_slice_path_ms",
+    "profile_virtual_reload_span_path_ms",
+    "profile_virtual_reload_span_coalesce_check_ms",
+    "profile_virtual_reload_span_bulk_copy_ms",
+    "profile_virtual_reload_span_fused_ms",
+    "profile_virtual_reload_span_scatter_ms",
+    "profile_virtual_reload_index_path_ms",
+    "profile_virtual_reload_tensor_h2d_ms",
+    "profile_virtual_reload_device_write_ms",
     "profile_virtual_reload_sync_wall_ms",
+    "virtual_kvc_materialize_ms",
+    "virtual_kvc_materialize_count",
+    "virtual_kvc_materialize_token_count",
+    "virtual_kvc_plan_cache_hit_count",
+    "virtual_kvc_plan_cache_miss_count",
+    "virtual_kvc_plan_cache_reuse_token_count",
+    "virtual_kvc_host_order_plan_count",
+    "virtual_kvc_host_order_plan_token_count",
+    "virtual_kvc_prefetch_count",
+    "virtual_kvc_prefetch_ready_before_use_count",
+    "virtual_kvc_prefetch_fallback_sync_count",
+    "virtual_kvc_persistent_cache_hit_count",
+    "virtual_kvc_persistent_cache_miss_count",
+    "virtual_kvc_scratch_generation_miss_count",
     "virtual_kvc_reload_slice_count",
     "virtual_kvc_reload_span_count",
     "virtual_kvc_reload_span_segment_count",
+    "virtual_kvc_reload_span_coalesce_count",
+    "virtual_kvc_reload_span_coalesce_token_count",
+    "virtual_kvc_reload_span_coalesce_copied_token_count",
+    "virtual_kvc_reload_span_direct_copy_count",
+    "virtual_kvc_reload_span_direct_copy_token_count",
+    "virtual_kvc_reload_span_fused_count",
+    "virtual_kvc_reload_span_fused_token_count",
+    "virtual_kvc_reload_span_fused_fallback_count",
     "virtual_kvc_reload_direct_count",
     "virtual_kvc_reload_index_count",
     "virtual_kvc_reload_async_count",
@@ -635,8 +736,6 @@ def _response_latency_stats(response: Any, output_len: int) -> Dict[str, float]:
 
 
 def _terminate(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -652,7 +751,17 @@ def _terminate(proc: subprocess.Popen) -> None:
         pass
 
 
-def _tail(path: Path, max_chars: int = 50000) -> str:
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _tail(path: Path, max_chars: int = 5_000_000) -> str:
     if not path.exists():
         return ""
     return path.read_text(errors="replace")[-max_chars:]
@@ -1021,12 +1130,19 @@ def run_policy_server(
         try:
             deadline = time.time() + args.startup_timeout_s
             ready_url = f"http://127.0.0.1:{port}/model_info"
+            server_ready = False
             while time.time() < deadline:
-                if proc.poll() is not None:
-                    break
                 if _http_get(ready_url, timeout=5.0):
+                    server_ready = True
+                    break
+                if proc.poll() is not None and not _process_group_alive(proc.pid):
                     break
                 time.sleep(2.0)
+            if not server_ready:
+                raise RuntimeError(
+                    f"server did not become ready within "
+                    f"{args.startup_timeout_s:.1f}s; returncode={proc.poll()}"
+                )
             if not hasattr(args, "fig4_input_ids"):
                 raise RuntimeError(
                     "missing Fig4 real input_ids; refusing synthetic payload"
@@ -1261,6 +1377,10 @@ def main() -> int:
         choices=[spec.scenario for spec in POLICY_RUNS],
     )
     args = parser.parse_args()
+    args._fig4_cli_batch_size = any(
+        arg == "--batch-size" or arg.startswith("--batch-size=")
+        for arg in sys.argv[1:]
+    )
     apply_fig4_workload(args)
 
     output_dir = Path(args.output_dir)

@@ -410,10 +410,7 @@ class LayerKVExpertHooksMixin:
             self._expert_plan_applied
             or self._expert_install_state in {"installing_slots", "queued"}
         )
-        if (
-            topk_fastpath_enabled
-            and fast_in_range
-        ):
+        if topk_fastpath_enabled and fast_in_range:
             gpu_result = self._try_gpu_expert_topk_remap(state, topk_output, remap)
             if gpu_result is not None:
                 rewritten_topk, missing_logical_ids = gpu_result
@@ -624,7 +621,11 @@ class LayerKVExpertHooksMixin:
             return True
         if self._current_forward_mode != "decode":
             return True
-        if self._expert_install_queue or self._expert_plan_applied or self._expert_layers:
+        if (
+            self._expert_install_queue
+            or self._expert_plan_applied
+            or self._expert_layers
+        ):
             return True
         if not self.config.dynamic_pressure_from_kvc:
             return True
@@ -632,12 +633,23 @@ class LayerKVExpertHooksMixin:
             return True
         if float(self.stats.policy_expert_fraction) > 1e-6:
             return True
+        if (
+            str(self.stats.planner_fallback_reason)
+            == "dynamic_kvc_pressure_requires_kvc_reclaim"
+        ):
+            return False
+        if self._has_prefill_expert_hotness():
+            return False
         return True
 
     def _expert_hotness_cpu_snapshot_needed(self, mode: str) -> bool:
         if self.config.expert_collector_only:
             return True
-        if self._expert_install_queue or self._expert_plan_applied or self._expert_layers:
+        if (
+            self._expert_install_queue
+            or self._expert_plan_applied
+            or self._expert_layers
+        ):
             return True
         if not self.config.dynamic_pressure_from_kvc:
             return True
@@ -652,7 +664,11 @@ class LayerKVExpertHooksMixin:
             return True
         if not self._expert_hotness_counter_needed():
             return False
-        if self._expert_install_queue or self._expert_plan_applied or self._expert_layers:
+        if (
+            self._expert_install_queue
+            or self._expert_plan_applied
+            or self._expert_layers
+        ):
             return True
         if not self.config.dynamic_pressure_from_kvc:
             return True
@@ -660,7 +676,10 @@ class LayerKVExpertHooksMixin:
             return True
         if float(self.stats.policy_expert_fraction) > 1e-6:
             return True
-        if str(self.stats.planner_fallback_reason) == "dynamic_kvc_pressure_requires_kvc_reclaim":
+        if (
+            str(self.stats.planner_fallback_reason)
+            == "dynamic_kvc_pressure_requires_kvc_reclaim"
+        ):
             return False
         if self._has_prefill_expert_hotness():
             return False
@@ -699,13 +718,13 @@ class LayerKVExpertHooksMixin:
             gpu_store[int(layer_id)] = buf
         return buf
 
-    def _expert_hotness_ones(
-        self, device: torch.device, numel: int
-    ) -> torch.Tensor:
+    def _expert_hotness_ones(self, device: torch.device, numel: int) -> torch.Tensor:
         key = (str(device), int(numel))
         cached = self._expert_hotness_ones_cache.get(key)
-        if cached is not None and cached.device == device and int(cached.numel()) == int(
-            numel
+        if (
+            cached is not None
+            and cached.device == device
+            and int(cached.numel()) == int(numel)
         ):
             self.stats.expert_hotness_ones_reuse_count += 1
             return cached
@@ -811,17 +830,14 @@ class LayerKVExpertHooksMixin:
             prefill_counts = torch.zeros(
                 (int(full_num_experts),), dtype=torch.int32, device=device
             )
-        expert_ids = torch.arange(int(full_num_experts), dtype=torch.long, device=device)
+        expert_ids = torch.arange(
+            int(full_num_experts), dtype=torch.long, device=device
+        )
         # Match CPU ordering: decode hotness desc, then prefill desc, then id asc.
         scale = 1_000_000_000
         scores = (
-            (
-                decode_counts.to(torch.long) * scale
-                + prefill_counts.to(torch.long)
-            )
-            * (int(full_num_experts) + 1)
-            + (int(full_num_experts) - expert_ids)
-        )
+            decode_counts.to(torch.long) * scale + prefill_counts.to(torch.long)
+        ) * (int(full_num_experts) + 1) + (int(full_num_experts) - expert_ids)
         order = torch.argsort(scores, descending=True).to(torch.int32)
         try:
             cpu_order = torch.empty_like(order, device="cpu", pin_memory=True)
@@ -847,7 +863,12 @@ class LayerKVExpertHooksMixin:
         if not self._expert_candidate_pending_snapshots:
             return
         remaining = []
-        for layer_id, cpu_order, event, order in self._expert_candidate_pending_snapshots:
+        for (
+            layer_id,
+            cpu_order,
+            event,
+            order,
+        ) in self._expert_candidate_pending_snapshots:
             keep_pending = False
             try:
                 if block:
@@ -921,10 +942,16 @@ class LayerKVExpertHooksMixin:
     def _materialize_expert_hotness_gpu_counts(
         self, *, mode: Optional[str] = None
     ) -> None:
-        stores: List[Tuple[str, Dict[int, torch.Tensor], Dict[int, Dict[int, int]]]] = []
+        stores: List[Tuple[str, Dict[int, torch.Tensor], Dict[int, Dict[int, int]]]] = (
+            []
+        )
         if mode in (None, "prefill"):
             stores.append(
-                ("prefill", self._expert_hotness_gpu_prefill, self._expert_hotness_prefill)
+                (
+                    "prefill",
+                    self._expert_hotness_gpu_prefill,
+                    self._expert_hotness_prefill,
+                )
             )
         if mode in (None, "decode"):
             stores.append(
@@ -1027,6 +1054,12 @@ class LayerKVExpertHooksMixin:
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
     ) -> None:
         if topk_ids.numel() == 0:
+            return
+        if (
+            self._current_forward_mode == "decode"
+            and not self._decode_expert_hotness_collection_needed()
+        ):
+            self._expert_hotness_sample_skip_pending += 1
             return
         if not self._should_sample_expert_hotness(layer_id):
             self._expert_hotness_sample_skip_pending += 1
@@ -1363,7 +1396,9 @@ class LayerKVExpertHooksMixin:
         if not materialized:
             return
         descriptor_reason = (
-            f"materialize_{reason}_async" if async_copy else f"materialize_{reason}_sync"
+            f"materialize_{reason}_async"
+            if async_copy
+            else f"materialize_{reason}_sync"
         )
         for logical_id, slot_id, source_params in materialized:
             self._record_expert_copy_descriptor(
@@ -1597,5 +1632,3 @@ class LayerKVExpertHooksMixin:
         if self.stats.comparability_reason == "INSUFFICIENT_EXPERT_RECLAIM":
             self.stats.comparable = True
             self.stats.comparability_reason = ""
-
-

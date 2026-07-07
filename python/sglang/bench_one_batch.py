@@ -436,6 +436,24 @@ class TreeCacheNamespace(SimpleNamespace):
     def evict(self, params: EvictParams):
         pass
 
+    def evictable_size(self) -> int:
+        return 0
+
+    def full_evictable_size(self) -> int:
+        return 0
+
+    def swa_evictable_size(self) -> int:
+        return 0
+
+    def protected_size(self) -> int:
+        return 0
+
+    def full_protected_size(self) -> int:
+        return 0
+
+    def swa_protected_size(self) -> int:
+        return 0
+
 
 @torch.no_grad
 def extend(reqs, model_runner):

@@ -3,6 +3,9 @@ import sys
 import pytest
 import torch
 from sgl_kernel.kvcacheio import (
+    layerkv_copy_kv_span_backup_batched,
+    layerkv_copy_kv_span_scatter,
+    layerkv_copy_kv_span_scatter_batched,
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_all_layer_lf_ph,
@@ -709,6 +712,157 @@ def test_transfer_kv_page_head(
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(32,), (4, 16)])
+def test_layerkv_copy_kv_span_scatter(dtype: torch.dtype, shape: tuple[int, ...]):
+    device = "cuda"
+    src_base_slot = 10
+    dst_base_slot = 64
+    host_first = src_base_slot
+    host_last = 42
+    total_dst_tokens = 128
+    spans = ((10, 0, 3), (18, 3, 5), (31, 8, 4))
+    token_count = sum(length for _start, _offset, length in spans)
+
+    src_shape = (host_last - host_first, *shape)
+    dst_shape = (total_dst_tokens, *shape)
+    src_k = torch.randn(src_shape, dtype=dtype, device=device)
+    src_v = torch.randn(src_shape, dtype=dtype, device=device)
+    dst_k = torch.zeros(dst_shape, dtype=dtype, device=device)
+    dst_v = torch.zeros(dst_shape, dtype=dtype, device=device)
+    ref_k = torch.zeros_like(dst_k)
+    ref_v = torch.zeros_like(dst_v)
+
+    spans_tensor = torch.tensor(spans, dtype=torch.int64, device=device)
+    item_size = src_k[0].numel() * src_k.element_size()
+    layerkv_copy_kv_span_scatter(
+        src_k,
+        src_v,
+        dst_k,
+        dst_v,
+        spans_tensor,
+        src_base_slot,
+        dst_base_slot,
+        item_size,
+        8,
+    )
+
+    for host_start, scratch_offset, length in spans:
+        src_slice = slice(
+            host_start - src_base_slot, host_start - src_base_slot + length
+        )
+        dst_slice = slice(
+            dst_base_slot + scratch_offset,
+            dst_base_slot + scratch_offset + length,
+        )
+        ref_k[dst_slice].copy_(src_k[src_slice])
+        ref_v[dst_slice].copy_(src_v[src_slice])
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst_k, ref_k)
+    torch.testing.assert_close(dst_v, ref_v)
+    assert token_count == 12
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(32,), (4, 16)])
+def test_layerkv_copy_kv_span_scatter_batched(
+    dtype: torch.dtype, shape: tuple[int, ...]
+):
+    device = "cuda"
+    spans = ((10, 0, 3), (18, 3, 5), (31, 8, 4), (70, 0, 6), (81, 6, 2))
+    span_batch_ids = (0, 0, 0, 1, 1)
+    src_base_slots = (10, 70)
+    dst_base_slots = (64, 96)
+
+    src_ks = [
+        torch.randn((40, *shape), dtype=dtype, device="cpu").pin_memory(),
+        torch.randn((32, *shape), dtype=dtype, device="cpu").pin_memory(),
+    ]
+    src_vs = [
+        torch.randn((40, *shape), dtype=dtype, device="cpu").pin_memory(),
+        torch.randn((32, *shape), dtype=dtype, device="cpu").pin_memory(),
+    ]
+    dst_ks = [torch.zeros((128, *shape), dtype=dtype, device=device) for _ in range(2)]
+    dst_vs = [torch.zeros((128, *shape), dtype=dtype, device=device) for _ in range(2)]
+    ref_ks = [torch.zeros_like(dst) for dst in dst_ks]
+    ref_vs = [torch.zeros_like(dst) for dst in dst_vs]
+
+    layerkv_copy_kv_span_scatter_batched(
+        src_ks,
+        src_vs,
+        dst_ks,
+        dst_vs,
+        torch.tensor(spans, dtype=torch.int64, device="cpu"),
+        torch.tensor(span_batch_ids, dtype=torch.int64, device="cpu"),
+        torch.tensor(src_base_slots, dtype=torch.int64, device="cpu"),
+        torch.tensor(dst_base_slots, dtype=torch.int64, device="cpu"),
+        src_ks[0][0].numel() * src_ks[0].element_size(),
+        8,
+    )
+
+    for span, batch_id in zip(spans, span_batch_ids):
+        host_start, scratch_offset, length = span
+        src_slice = slice(
+            host_start - src_base_slots[batch_id],
+            host_start - src_base_slots[batch_id] + length,
+        )
+        dst_slice = slice(
+            dst_base_slots[batch_id] + scratch_offset,
+            dst_base_slots[batch_id] + scratch_offset + length,
+        )
+        ref_ks[batch_id][dst_slice].copy_(src_ks[batch_id][src_slice])
+        ref_vs[batch_id][dst_slice].copy_(src_vs[batch_id][src_slice])
+
+    torch.cuda.synchronize()
+    for got, ref in zip(dst_ks, ref_ks):
+        torch.testing.assert_close(got, ref)
+    for got, ref in zip(dst_vs, ref_vs):
+        torch.testing.assert_close(got, ref)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(32,), (4, 16)])
+def test_layerkv_copy_kv_span_backup_batched(
+    dtype: torch.dtype, shape: tuple[int, ...]
+):
+    device = "cuda"
+    spans = ((2, 11, 4), (9, 21, 3), (20, 5, 6), (4, 31, 5))
+    span_batch_ids = (0, 0, 1, 1)
+    src_ks = [torch.randn((64, *shape), dtype=dtype, device=device) for _ in range(2)]
+    src_vs = [torch.randn((64, *shape), dtype=dtype, device=device) for _ in range(2)]
+    dst_ks = [
+        torch.zeros((64, *shape), dtype=dtype, device="cpu").pin_memory()
+        for _ in range(2)
+    ]
+    dst_vs = [
+        torch.zeros((64, *shape), dtype=dtype, device="cpu").pin_memory()
+        for _ in range(2)
+    ]
+
+    layerkv_copy_kv_span_backup_batched(
+        src_ks,
+        src_vs,
+        dst_ks,
+        dst_vs,
+        torch.tensor(spans, dtype=torch.int64, device="cpu"),
+        torch.tensor(span_batch_ids, dtype=torch.int64, device="cpu"),
+        src_ks[0][0].numel() * src_ks[0].element_size(),
+    )
+
+    torch.cuda.synchronize()
+    for span, batch_id in zip(spans, span_batch_ids):
+        src_start, dst_start, length = span
+        src_slice = slice(src_start, src_start + length)
+        dst_slice = slice(dst_start, dst_start + length)
+        torch.testing.assert_close(
+            dst_ks[batch_id][dst_slice], src_ks[batch_id][src_slice].cpu()
+        )
+        torch.testing.assert_close(
+            dst_vs[batch_id][dst_slice], src_vs[batch_id][src_slice].cpu()
+        )
 
 
 if __name__ == "__main__":

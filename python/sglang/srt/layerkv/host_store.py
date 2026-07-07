@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -13,6 +13,59 @@ if __package__:
 else:  # pragma: no cover - direct file-loading smoke tests.
     from config_stats import LayerKVStats
     from common_types import _LayerKVResidencyEntry
+
+
+_FUSED_SPAN_SCATTER_OP: Optional[Any] = None
+_FUSED_SPAN_SCATTER_CHECKED = False
+_FUSED_SPAN_SCATTER_BATCHED_OP: Optional[Any] = None
+_FUSED_SPAN_SCATTER_BATCHED_CHECKED = False
+_FUSED_SPAN_BACKUP_BATCHED_OP: Optional[Any] = None
+_FUSED_SPAN_BACKUP_BATCHED_CHECKED = False
+
+
+def _get_fused_span_scatter_op() -> Optional[Any]:
+    global _FUSED_SPAN_SCATTER_OP, _FUSED_SPAN_SCATTER_CHECKED
+    if _FUSED_SPAN_SCATTER_CHECKED:
+        return _FUSED_SPAN_SCATTER_OP
+    _FUSED_SPAN_SCATTER_CHECKED = True
+    try:
+        import sgl_kernel  # noqa: F401
+
+        op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_scatter", None)
+        _FUSED_SPAN_SCATTER_OP = getattr(op, "default", op)
+    except Exception:
+        _FUSED_SPAN_SCATTER_OP = None
+    return _FUSED_SPAN_SCATTER_OP
+
+
+def _get_fused_span_scatter_batched_op() -> Optional[Any]:
+    global _FUSED_SPAN_SCATTER_BATCHED_OP, _FUSED_SPAN_SCATTER_BATCHED_CHECKED
+    if _FUSED_SPAN_SCATTER_BATCHED_CHECKED:
+        return _FUSED_SPAN_SCATTER_BATCHED_OP
+    _FUSED_SPAN_SCATTER_BATCHED_CHECKED = True
+    try:
+        import sgl_kernel  # noqa: F401
+
+        op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_scatter_batched", None)
+        _FUSED_SPAN_SCATTER_BATCHED_OP = getattr(op, "default", op)
+    except Exception:
+        _FUSED_SPAN_SCATTER_BATCHED_OP = None
+    return _FUSED_SPAN_SCATTER_BATCHED_OP
+
+
+def _get_fused_span_backup_batched_op() -> Optional[Any]:
+    global _FUSED_SPAN_BACKUP_BATCHED_OP, _FUSED_SPAN_BACKUP_BATCHED_CHECKED
+    if _FUSED_SPAN_BACKUP_BATCHED_CHECKED:
+        return _FUSED_SPAN_BACKUP_BATCHED_OP
+    _FUSED_SPAN_BACKUP_BATCHED_CHECKED = True
+    try:
+        import sgl_kernel  # noqa: F401
+
+        op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_backup_batched", None)
+        _FUSED_SPAN_BACKUP_BATCHED_OP = getattr(op, "default", op)
+    except Exception:
+        _FUSED_SPAN_BACKUP_BATCHED_OP = None
+    return _FUSED_SPAN_BACKUP_BATCHED_OP
 
 
 class _LayerKVHostKVStore:
@@ -45,6 +98,16 @@ class _LayerKVHostKVStore:
         self.layer_used_slots: List[Set[int]] = [set() for _ in range(self.layer_num)]
         self.layer_used_counts: List[int] = [0 for _ in range(self.layer_num)]
         self.track_layer_used_sets = not self.per_layer_mode
+        self._span_tensor_cache: Dict[
+            Tuple[Tuple[int, int, int], ...], torch.Tensor
+        ] = {}
+        self._cpu_span_tensor_cache: Dict[
+            Tuple[
+                Tuple[Tuple[int, int, int], ...],
+                Tuple[int, ...],
+            ],
+            Tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         self.bytes_per_token_per_layer = int(k0[0].nbytes + v0[0].nbytes)
         self.bytes_per_token_all_layers = int(
             (k0[0].nbytes + v0[0].nbytes) * self.layer_num
@@ -90,6 +153,44 @@ class _LayerKVHostKVStore:
             return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
         except Exception:
             return torch.empty(shape, dtype=dtype, device="cpu")
+
+    def _host_spans_tensor(
+        self, host_spans: Tuple[Tuple[int, int, int], ...]
+    ) -> torch.Tensor:
+        key = tuple(
+            (int(start), int(offset), int(length))
+            for start, offset, length in host_spans
+        )
+        cached = self._span_tensor_cache.get(key)
+        if cached is not None and cached.device == self.device:
+            return cached
+        if len(self._span_tensor_cache) >= 128:
+            self._span_tensor_cache.pop(next(iter(self._span_tensor_cache)))
+        tensor = torch.tensor(key, dtype=torch.int64, device=self.device)
+        self._span_tensor_cache[key] = tensor
+        return tensor
+
+    def _cpu_spans_and_batch_tensors(
+        self,
+        spans: List[Tuple[int, int, int]],
+        span_batch_ids: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        span_key = tuple(
+            (int(src), int(dst), int(length)) for src, dst, length in spans
+        )
+        batch_key = tuple(int(batch_id) for batch_id in span_batch_ids)
+        key = (span_key, batch_key)
+        cached = self._cpu_span_tensor_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._cpu_span_tensor_cache) >= 128:
+            self._cpu_span_tensor_cache.pop(next(iter(self._cpu_span_tensor_cache)))
+        tensors = (
+            torch.tensor(span_key, dtype=torch.int64, device="cpu"),
+            torch.tensor(batch_key, dtype=torch.int64, device="cpu"),
+        )
+        self._cpu_span_tensor_cache[key] = tensors
+        return tensors
 
     @property
     def used_count(self) -> int:
@@ -256,6 +357,30 @@ class _LayerKVHostKVStore:
                 return None
         return start
 
+    @staticmethod
+    def _paired_contiguous_spans(
+        src_slots: List[int], dst_slots: List[int]
+    ) -> Tuple[Tuple[int, int, int], ...]:
+        if not src_slots or not dst_slots or len(src_slots) != len(dst_slots):
+            return ()
+        pairs = sorted((int(src), int(dst)) for src, dst in zip(src_slots, dst_slots))
+        spans: List[Tuple[int, int, int]] = []
+        src_start, dst_start = pairs[0]
+        prev_src, prev_dst = src_start, dst_start
+        length = 1
+        for src, dst in pairs[1:]:
+            src = int(src)
+            dst = int(dst)
+            if src == prev_src + 1 and dst == prev_dst + 1:
+                length += 1
+            else:
+                spans.append((src_start, dst_start, length))
+                src_start, dst_start = src, dst
+                length = 1
+            prev_src, prev_dst = src, dst
+        spans.append((src_start, dst_start, length))
+        return tuple(spans)
+
     def backup(self, device_locs: torch.Tensor, host_slots: List[int]) -> float:
         if device_locs.numel() == 0:
             return 0.0
@@ -384,6 +509,273 @@ class _LayerKVHostKVStore:
         end.record()
         end.synchronize()
         return float(start.elapsed_time(end))
+
+    def backup_per_layer_async(
+        self,
+        entries: Sequence[_LayerKVResidencyEntry],
+        host_slots: List[int],
+        stream: Optional[torch.cuda.Stream],
+    ) -> Tuple[Optional[Any], Optional[Any]]:
+        if not self.per_layer_mode:
+            raise RuntimeError(
+                "non-per-layer KVC eviction uses backup_to_staging_async"
+            )
+        if not entries or not host_slots or stream is None:
+            return None, None
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        fused_backup_op = _get_fused_span_backup_batched_op()
+
+        def issue_copy() -> None:
+            start.record(stream)
+            by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
+            offset = 0
+            for entry in entries:
+                layer_offset = int(entry.layer_id) - self.start_layer
+                if layer_offset < 0 or layer_offset >= self.layer_num:
+                    raise RuntimeError(
+                        f"invalid per-layer KVC layer_id={entry.layer_id}"
+                    )
+                count = entry.token_count
+                slots = host_slots[offset : offset + count]
+                offset += count
+                layer_device_locs, layer_host_slots = by_layer.setdefault(
+                    layer_offset, ([], [])
+                )
+                layer_device_locs.extend(entry.device_loc_list())
+                layer_host_slots.extend(int(slot) for slot in slots)
+            if fused_backup_op is not None:
+                src_ks: List[torch.Tensor] = []
+                src_vs: List[torch.Tensor] = []
+                dst_ks: List[torch.Tensor] = []
+                dst_vs: List[torch.Tensor] = []
+                span_rows: List[Tuple[int, int, int]] = []
+                span_batch_ids: List[int] = []
+                for layer_offset, (
+                    device_loc_list,
+                    host_slot_list,
+                ) in by_layer.items():
+                    if not device_loc_list or not host_slot_list:
+                        continue
+                    if len(device_loc_list) != len(host_slot_list):
+                        span_rows = []
+                        break
+                    layer_id = self.start_layer + int(layer_offset)
+                    batch_id = len(src_ks)
+                    src_ks.append(self.kv_pool._get_key_buffer(layer_id))
+                    src_vs.append(self.kv_pool._get_value_buffer(layer_id))
+                    dst_ks.append(self.k_buffers[int(layer_offset)])
+                    dst_vs.append(self.v_buffers[int(layer_offset)])
+                    spans = self._paired_contiguous_spans(
+                        device_loc_list, host_slot_list
+                    )
+                    if not spans:
+                        span_rows = []
+                        break
+                    span_rows.extend(spans)
+                    span_batch_ids.extend([batch_id] * len(spans))
+                if span_rows and src_ks:
+                    spans_tensor, span_batch_tensor = (
+                        self._cpu_spans_and_batch_tensors(span_rows, span_batch_ids)
+                    )
+                    item_size = int(src_ks[0][0].numel() * src_ks[0].element_size())
+                    fused_backup_op(
+                        src_ks,
+                        src_vs,
+                        dst_ks,
+                        dst_vs,
+                        spans_tensor,
+                        span_batch_tensor,
+                        item_size,
+                    )
+                    end.record(stream)
+                    return
+            for layer_offset, (device_loc_list, host_slot_list) in by_layer.items():
+                if not device_loc_list or not host_slot_list:
+                    continue
+                layer_id = self.start_layer + layer_offset
+                device_locs = torch.tensor(
+                    device_loc_list, dtype=torch.int64, device=self.device
+                )
+                k_src = self.kv_pool._get_key_buffer(layer_id)[device_locs].detach()
+                v_src = self.kv_pool._get_value_buffer(layer_id)[device_locs].detach()
+                host_start = self._unit_stride_start(host_slot_list)
+                if host_start is not None:
+                    host_end = int(host_start) + len(host_slot_list)
+                    self.k_buffers[layer_offset][host_start:host_end].copy_(
+                        k_src, non_blocking=True
+                    )
+                    self.v_buffers[layer_offset][host_start:host_end].copy_(
+                        v_src, non_blocking=True
+                    )
+                else:
+                    host_index = torch.tensor(
+                        host_slot_list, dtype=torch.int64, device="cpu"
+                    )
+                    self.k_buffers[layer_offset].index_copy_(
+                        0, host_index, k_src.to("cpu", non_blocking=True)
+                    )
+                    self.v_buffers[layer_offset].index_copy_(
+                        0, host_index, v_src.to("cpu", non_blocking=True)
+                    )
+            end.record(stream)
+
+        with torch.cuda.stream(stream):
+            issue_copy()
+        return start, end
+
+    def reload_layers_to_locs_batched(
+        self,
+        requests: Sequence[
+            Tuple[
+                int, Tuple[int, int], Tuple[Tuple[int, int, int], ...], Tuple[int, int]
+            ]
+        ],
+        stream: Optional[torch.cuda.Stream],
+    ) -> Tuple[Optional[Any], Optional[Any], int]:
+        fused_op = _get_fused_span_scatter_batched_op()
+        if fused_op is None or stream is None or not requests:
+            return None, None, 0
+        src_ks: List[torch.Tensor] = []
+        src_vs: List[torch.Tensor] = []
+        dst_ks: List[torch.Tensor] = []
+        dst_vs: List[torch.Tensor] = []
+        span_rows: List[Tuple[int, int, int]] = []
+        span_batch_ids: List[int] = []
+        src_base_slots: List[int] = []
+        dst_base_slots: List[int] = []
+        total_tokens = 0
+        span_token_count = 0
+        span_request_count = 0
+        slice_token_count = 0
+        slice_request_count = 0
+        span_segment_count = 0
+        for batch_id, (layer_id, host_slice, host_spans, device_slice) in enumerate(
+            requests
+        ):
+            layer_id = int(layer_id)
+            layer_offset = layer_id - self.start_layer
+            if layer_offset < 0 or layer_offset >= self.layer_num:
+                return None, None, 0
+            if int(device_slice[0]) < 0 or int(device_slice[1]) <= 0:
+                return None, None, 0
+            token_count = int(device_slice[1])
+            if int(host_slice[0]) >= 0:
+                host_first = int(host_slice[0])
+                host_last = host_first + int(host_slice[1])
+                if int(host_slice[1]) != token_count:
+                    return None, None, 0
+                spans = ((host_first, 0, token_count),)
+                slice_token_count += token_count
+                slice_request_count += 1
+            elif host_spans:
+                span_tokens = sum(
+                    max(0, int(length)) for _start, _offset, length in host_spans
+                )
+                if span_tokens != token_count:
+                    return None, None, 0
+                host_first = min(int(start) for start, _offset, _length in host_spans)
+                host_last = max(
+                    int(start) + int(length) for start, _offset, length in host_spans
+                )
+                copied_tokens = max(0, host_last - host_first)
+                if copied_tokens > max(token_count * 2, token_count + 256):
+                    return None, None, 0
+                spans = tuple(
+                    (int(start), int(offset), int(length))
+                    for start, offset, length in host_spans
+                    if int(length) > 0
+                )
+                span_token_count += token_count
+                span_request_count += 1
+                span_segment_count += len(spans)
+            else:
+                return None, None, 0
+            if host_last <= host_first:
+                return None, None, 0
+            src_ks.append(self.k_buffers[layer_offset][host_first:host_last])
+            src_vs.append(self.v_buffers[layer_offset][host_first:host_last])
+            dst_ks.append(self.kv_pool._get_key_buffer(layer_id))
+            dst_vs.append(self.kv_pool._get_value_buffer(layer_id))
+            src_base_slots.append(host_first)
+            dst_base_slots.append(int(device_slice[0]))
+            total_tokens += token_count
+            for span in spans:
+                span_rows.append(span)
+                span_batch_ids.append(batch_id)
+        if not span_rows or total_tokens <= 0:
+            return None, None, 0
+        device_module = torch.get_device_module(self.device)
+        start = device_module.Event(enable_timing=True)
+        end = device_module.Event(enable_timing=True)
+        spans_tensor = torch.tensor(span_rows, dtype=torch.int64, device="cpu")
+        span_batch_tensor = torch.tensor(
+            span_batch_ids, dtype=torch.int64, device="cpu"
+        )
+        src_base_tensor = torch.tensor(src_base_slots, dtype=torch.int64, device="cpu")
+        dst_base_tensor = torch.tensor(dst_base_slots, dtype=torch.int64, device="cpu")
+        item_size = int(dst_ks[0][0].numel() * dst_ks[0].element_size())
+        with torch.cuda.stream(stream):
+            issue_t0 = time.perf_counter()
+            event_t0 = time.perf_counter()
+            start.record(stream)
+            self._add_profile(
+                "profile_virtual_reload_event_record_ms",
+                (time.perf_counter() - event_t0) * 1000.0,
+            )
+            path_t0 = time.perf_counter()
+            fused_op(
+                src_ks,
+                src_vs,
+                dst_ks,
+                dst_vs,
+                spans_tensor,
+                span_batch_tensor,
+                src_base_tensor,
+                dst_base_tensor,
+                item_size,
+                8,
+            )
+            path_ms = (time.perf_counter() - path_t0) * 1000.0
+            self._add_profile("profile_virtual_reload_span_path_ms", path_ms)
+            self._add_profile("profile_virtual_reload_tensor_h2d_ms", path_ms)
+            self._add_profile("profile_virtual_reload_span_bulk_copy_ms", path_ms)
+            event_t0 = time.perf_counter()
+            end.record(stream)
+            self._add_profile(
+                "profile_virtual_reload_event_record_ms",
+                (time.perf_counter() - event_t0) * 1000.0,
+            )
+            self._add_profile(
+                "profile_virtual_reload_issue_wall_ms",
+                (time.perf_counter() - issue_t0) * 1000.0,
+            )
+        request_count = len(requests)
+        self._add_stat("virtual_kvc_reload_async_count", request_count)
+        self._add_stat("virtual_kvc_reload_direct_count", request_count)
+        self._add_stat("virtual_kvc_reload_direct_token_count", total_tokens)
+        if slice_token_count:
+            self._add_stat("virtual_kvc_reload_slice_count", slice_request_count)
+            self._add_stat("virtual_kvc_reload_slice_token_count", slice_token_count)
+        if span_token_count:
+            self._add_stat("virtual_kvc_reload_span_count", span_request_count)
+            self._add_stat("virtual_kvc_reload_span_segment_count", span_segment_count)
+            self._add_stat("virtual_kvc_reload_span_token_count", span_token_count)
+            self._add_stat("virtual_kvc_reload_span_coalesce_count", span_request_count)
+            self._add_stat(
+                "virtual_kvc_reload_span_coalesce_token_count", span_token_count
+            )
+            self._add_stat(
+                "virtual_kvc_reload_span_coalesce_copied_token_count", span_token_count
+            )
+            self._add_stat(
+                "virtual_kvc_reload_span_direct_copy_count", span_request_count
+            )
+            self._add_stat(
+                "virtual_kvc_reload_span_direct_copy_token_count", span_token_count
+            )
+        return start, end, request_count
 
     def reload(
         self,
@@ -616,19 +1008,33 @@ class _LayerKVHostKVStore:
             self._add_stat("virtual_kvc_reload_sync_count")
 
         def issue_copy() -> None:
+            event_t0 = time.perf_counter()
             if active_stream is not None:
                 start.record(active_stream)
             else:
                 start.record()
+            self._add_profile(
+                "profile_virtual_reload_event_record_ms",
+                (time.perf_counter() - event_t0) * 1000.0,
+            )
             if host_slice_obj is not None:
+                path_t0 = time.perf_counter()
+                copy_t0 = time.perf_counter()
                 k_src = self.k_buffers[layer_offset][host_slice_obj].to(
                     self.device, non_blocking=True
                 )
                 v_src = self.v_buffers[layer_offset][host_slice_obj].to(
                     self.device, non_blocking=True
                 )
+                self._add_profile(
+                    "profile_virtual_reload_tensor_h2d_ms",
+                    (time.perf_counter() - copy_t0) * 1000.0,
+                )
+                write_t0 = time.perf_counter()
                 if device_slice_obj is not None:
-                    self.kv_pool._get_key_buffer(layer_id)[device_slice_obj].copy_(k_src)
+                    self.kv_pool._get_key_buffer(layer_id)[device_slice_obj].copy_(
+                        k_src
+                    )
                     self.kv_pool._get_value_buffer(layer_id)[device_slice_obj].copy_(
                         v_src
                     )
@@ -639,35 +1045,223 @@ class _LayerKVHostKVStore:
                     self.kv_pool._get_value_buffer(layer_id).index_copy_(
                         0, device_locs, v_src
                     )
+                self._add_profile(
+                    "profile_virtual_reload_device_write_ms",
+                    (time.perf_counter() - write_t0) * 1000.0,
+                )
+                self._add_profile(
+                    "profile_virtual_reload_slice_path_ms",
+                    (time.perf_counter() - path_t0) * 1000.0,
+                )
             elif host_spans:
+                path_t0 = time.perf_counter()
                 k_buffer = self.kv_pool._get_key_buffer(layer_id)
                 v_buffer = self.kv_pool._get_value_buffer(layer_id)
-                for host_start, scratch_offset, length in host_spans:
-                    host_start = int(host_start)
-                    scratch_offset = int(scratch_offset)
-                    length = int(length)
-                    if length <= 0:
-                        continue
-                    span_host_slice = slice(host_start, host_start + length)
-                    scratch_slice = slice(scratch_offset, scratch_offset + length)
-                    span_device_locs = device_locs[scratch_slice]
-                    k_src = self.k_buffers[layer_offset][span_host_slice].to(
-                        self.device, non_blocking=True
+                coalesced = False
+                if device_slice_obj is not None and len(host_spans) > 1:
+                    check_t0 = time.perf_counter()
+                    host_first = min(
+                        int(start) for start, _offset, _length in host_spans
                     )
-                    v_src = self.v_buffers[layer_offset][span_host_slice].to(
-                        self.device, non_blocking=True
+                    host_last = max(
+                        int(start) + int(length)
+                        for start, _offset, length in host_spans
                     )
-                    if device_slice_obj is not None:
-                        direct_slice = slice(
-                            int(device_slice_obj.start) + scratch_offset,
-                            int(device_slice_obj.start) + scratch_offset + length,
+                    copied_tokens = max(0, int(host_last) - int(host_first))
+                    direct_span_copy = copied_tokens == token_count
+                    expected_host = int(host_first)
+                    expected_offset = 0
+                    if direct_span_copy:
+                        for host_start, scratch_offset, length in sorted(
+                            host_spans, key=lambda span: int(span[1])
+                        ):
+                            host_start = int(host_start)
+                            scratch_offset = int(scratch_offset)
+                            length = int(length)
+                            if length <= 0:
+                                continue
+                            if (
+                                scratch_offset != expected_offset
+                                or host_start != expected_host
+                            ):
+                                direct_span_copy = False
+                                break
+                            expected_host += length
+                            expected_offset += length
+                        if expected_offset != token_count or expected_host != int(
+                            host_last
+                        ):
+                            direct_span_copy = False
+                    self._add_profile(
+                        "profile_virtual_reload_span_coalesce_check_ms",
+                        (time.perf_counter() - check_t0) * 1000.0,
+                    )
+                    if direct_span_copy:
+                        host_slice = slice(host_first, host_last)
+                        bulk_t0 = time.perf_counter()
+                        k_buffer[device_slice_obj].copy_(
+                            self.k_buffers[layer_offset][host_slice],
+                            non_blocking=True,
                         )
-                        k_buffer[direct_slice].copy_(k_src)
-                        v_buffer[direct_slice].copy_(v_src)
-                    else:
-                        k_buffer.index_copy_(0, span_device_locs, k_src)
-                        v_buffer.index_copy_(0, span_device_locs, v_src)
+                        v_buffer[device_slice_obj].copy_(
+                            self.v_buffers[layer_offset][host_slice],
+                            non_blocking=True,
+                        )
+                        self._add_profile(
+                            "profile_virtual_reload_span_bulk_copy_ms",
+                            (time.perf_counter() - bulk_t0) * 1000.0,
+                        )
+                        self._add_stat("virtual_kvc_reload_span_coalesce_count")
+                        self._add_stat(
+                            "virtual_kvc_reload_span_coalesce_token_count",
+                            token_count,
+                        )
+                        self._add_stat(
+                            "virtual_kvc_reload_span_coalesce_copied_token_count",
+                            copied_tokens,
+                        )
+                        self._add_stat("virtual_kvc_reload_span_direct_copy_count")
+                        self._add_stat(
+                            "virtual_kvc_reload_span_direct_copy_token_count",
+                            token_count,
+                        )
+                        coalesced = True
+                    elif copied_tokens <= max(token_count * 2, token_count + 256):
+                        bulk_t0 = time.perf_counter()
+                        k_src = self.k_buffers[layer_offset][host_first:host_last].to(
+                            self.device, non_blocking=True
+                        )
+                        v_src = self.v_buffers[layer_offset][host_first:host_last].to(
+                            self.device, non_blocking=True
+                        )
+                        self._add_profile(
+                            "profile_virtual_reload_tensor_h2d_ms",
+                            (time.perf_counter() - bulk_t0) * 1000.0,
+                        )
+                        device_start = int(device_slice_obj.start)
+                        fused_op = _get_fused_span_scatter_op()
+                        use_fused = (
+                            fused_op is not None
+                            and k_src.is_contiguous()
+                            and v_src.is_contiguous()
+                            and k_buffer.is_contiguous()
+                            and v_buffer.is_contiguous()
+                        )
+                        if use_fused:
+                            spans_tensor = self._host_spans_tensor(host_spans)
+                            item_size = int(k_src[0].numel() * k_src.element_size())
+                            fused_t0 = time.perf_counter()
+                            fused_op(
+                                k_src,
+                                v_src,
+                                k_buffer,
+                                v_buffer,
+                                spans_tensor,
+                                int(host_first),
+                                int(device_start),
+                                item_size,
+                                8,
+                            )
+                            fused_ms = (time.perf_counter() - fused_t0) * 1000.0
+                            self._add_profile(
+                                "profile_virtual_reload_span_fused_ms", fused_ms
+                            )
+                            self._add_profile(
+                                "profile_virtual_reload_span_scatter_ms", fused_ms
+                            )
+                            self._add_profile(
+                                "profile_virtual_reload_device_write_ms", fused_ms
+                            )
+                            self._add_stat("virtual_kvc_reload_span_fused_count")
+                            self._add_stat(
+                                "virtual_kvc_reload_span_fused_token_count",
+                                token_count,
+                            )
+                        else:
+                            self._add_stat(
+                                "virtual_kvc_reload_span_fused_fallback_count"
+                            )
+                            scatter_t0 = time.perf_counter()
+                            for host_start, scratch_offset, length in host_spans:
+                                host_start = int(host_start)
+                                scratch_offset = int(scratch_offset)
+                                length = int(length)
+                                if length <= 0:
+                                    continue
+                                src_offset = host_start - host_first
+                                src_slice = slice(src_offset, src_offset + length)
+                                dst_slice = slice(
+                                    device_start + scratch_offset,
+                                    device_start + scratch_offset + length,
+                                )
+                                k_buffer[dst_slice].copy_(k_src[src_slice])
+                                v_buffer[dst_slice].copy_(v_src[src_slice])
+                            self._add_profile(
+                                "profile_virtual_reload_span_scatter_ms",
+                                (time.perf_counter() - scatter_t0) * 1000.0,
+                            )
+                            self._add_profile(
+                                "profile_virtual_reload_device_write_ms",
+                                (time.perf_counter() - scatter_t0) * 1000.0,
+                            )
+                        self._add_stat("virtual_kvc_reload_span_coalesce_count")
+                        self._add_stat(
+                            "virtual_kvc_reload_span_coalesce_token_count",
+                            token_count,
+                        )
+                        self._add_stat(
+                            "virtual_kvc_reload_span_coalesce_copied_token_count",
+                            copied_tokens,
+                        )
+                        coalesced = True
+                if not coalesced:
+                    scatter_t0 = time.perf_counter()
+                    for host_start, scratch_offset, length in host_spans:
+                        host_start = int(host_start)
+                        scratch_offset = int(scratch_offset)
+                        length = int(length)
+                        if length <= 0:
+                            continue
+                        span_host_slice = slice(host_start, host_start + length)
+                        scratch_slice = slice(scratch_offset, scratch_offset + length)
+                        span_device_locs = device_locs[scratch_slice]
+                        copy_t0 = time.perf_counter()
+                        k_src = self.k_buffers[layer_offset][span_host_slice].to(
+                            self.device, non_blocking=True
+                        )
+                        v_src = self.v_buffers[layer_offset][span_host_slice].to(
+                            self.device, non_blocking=True
+                        )
+                        self._add_profile(
+                            "profile_virtual_reload_tensor_h2d_ms",
+                            (time.perf_counter() - copy_t0) * 1000.0,
+                        )
+                        write_t0 = time.perf_counter()
+                        if device_slice_obj is not None:
+                            direct_slice = slice(
+                                int(device_slice_obj.start) + scratch_offset,
+                                int(device_slice_obj.start) + scratch_offset + length,
+                            )
+                            k_buffer[direct_slice].copy_(k_src)
+                            v_buffer[direct_slice].copy_(v_src)
+                        else:
+                            k_buffer.index_copy_(0, span_device_locs, k_src)
+                            v_buffer.index_copy_(0, span_device_locs, v_src)
+                        self._add_profile(
+                            "profile_virtual_reload_device_write_ms",
+                            (time.perf_counter() - write_t0) * 1000.0,
+                        )
+                    self._add_profile(
+                        "profile_virtual_reload_span_scatter_ms",
+                        (time.perf_counter() - scatter_t0) * 1000.0,
+                    )
+                self._add_profile(
+                    "profile_virtual_reload_span_path_ms",
+                    (time.perf_counter() - path_t0) * 1000.0,
+                )
             else:
+                path_t0 = time.perf_counter()
+                copy_t0 = time.perf_counter()
                 k_src = (
                     self.k_buffers[layer_offset]
                     .index_select(0, host_index)
@@ -678,8 +1272,15 @@ class _LayerKVHostKVStore:
                     .index_select(0, host_index)
                     .to(self.device, non_blocking=True)
                 )
+                self._add_profile(
+                    "profile_virtual_reload_tensor_h2d_ms",
+                    (time.perf_counter() - copy_t0) * 1000.0,
+                )
+                write_t0 = time.perf_counter()
                 if device_slice_obj is not None:
-                    self.kv_pool._get_key_buffer(layer_id)[device_slice_obj].copy_(k_src)
+                    self.kv_pool._get_key_buffer(layer_id)[device_slice_obj].copy_(
+                        k_src
+                    )
                     self.kv_pool._get_value_buffer(layer_id)[device_slice_obj].copy_(
                         v_src
                     )
@@ -690,10 +1291,23 @@ class _LayerKVHostKVStore:
                     self.kv_pool._get_value_buffer(layer_id).index_copy_(
                         0, device_locs, v_src
                     )
+                self._add_profile(
+                    "profile_virtual_reload_device_write_ms",
+                    (time.perf_counter() - write_t0) * 1000.0,
+                )
+                self._add_profile(
+                    "profile_virtual_reload_index_path_ms",
+                    (time.perf_counter() - path_t0) * 1000.0,
+                )
+            event_t0 = time.perf_counter()
             if active_stream is not None:
                 end.record(active_stream)
             else:
                 end.record()
+            self._add_profile(
+                "profile_virtual_reload_event_record_ms",
+                (time.perf_counter() - event_t0) * 1000.0,
+            )
 
         if active_stream is not None:
             with torch.cuda.stream(active_stream):

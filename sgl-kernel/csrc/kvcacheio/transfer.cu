@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -672,6 +673,479 @@ void transfer_kv_all_layer_mla_lf_pf(
       empty,
       block_quota,
       num_warps_per_block);
+}
+
+__global__ void layerkv_copy_kv_span_scatter_kernel(
+    const void* __restrict__ src_k,
+    const void* __restrict__ src_v,
+    void* __restrict__ dst_k,
+    void* __restrict__ dst_v,
+    const int64_t* __restrict__ spans,
+    int64_t num_spans,
+    int64_t src_base_slot,
+    int64_t dst_base_slot,
+    int64_t item_size_bytes,
+    int64_t warps_per_block) {
+  const int64_t span_id = blockIdx.x;
+  if (span_id >= num_spans) {
+    return;
+  }
+  const int32_t lane_id = threadIdx.x % WARP_SIZE;
+  const int32_t warp_id = threadIdx.x / WARP_SIZE;
+  const int64_t host_start = spans[span_id * 3 + 0];
+  const int64_t scratch_offset = spans[span_id * 3 + 1];
+  const int64_t length = spans[span_id * 3 + 2];
+  if (length <= 0) {
+    return;
+  }
+
+  const char* src_k_base = static_cast<const char*>(src_k);
+  const char* src_v_base = static_cast<const char*>(src_v);
+  char* dst_k_base = static_cast<char*>(dst_k);
+  char* dst_v_base = static_cast<char*>(dst_v);
+
+  for (int64_t token_offset = warp_id; token_offset < length; token_offset += warps_per_block) {
+    const int64_t src_token = host_start - src_base_slot + token_offset;
+    const int64_t dst_token = dst_base_slot + scratch_offset + token_offset;
+    const char* src_k_ptr = src_k_base + src_token * item_size_bytes;
+    const char* src_v_ptr = src_v_base + src_token * item_size_bytes;
+    char* dst_k_ptr = dst_k_base + dst_token * item_size_bytes;
+    char* dst_v_ptr = dst_v_base + dst_token * item_size_bytes;
+    transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, item_size_bytes);
+    transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+  }
+}
+
+void layerkv_copy_kv_span_scatter(
+    const at::Tensor& src_k,
+    const at::Tensor& src_v,
+    at::Tensor dst_k,
+    at::Tensor dst_v,
+    const at::Tensor& spans,
+    int64_t src_base_slot,
+    int64_t dst_base_slot,
+    int64_t item_size,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(src_k.is_cuda(), "src_k must be a CUDA tensor");
+  TORCH_CHECK(src_v.is_cuda(), "src_v must be a CUDA tensor");
+  TORCH_CHECK(dst_k.is_cuda(), "dst_k must be a CUDA tensor");
+  TORCH_CHECK(dst_v.is_cuda(), "dst_v must be a CUDA tensor");
+  TORCH_CHECK(spans.is_cuda(), "spans must be a CUDA tensor");
+  TORCH_CHECK(spans.scalar_type() == at::kLong, "spans must be of type long");
+  TORCH_CHECK(spans.dim() == 2 && spans.size(1) == 3, "spans must have shape [num_spans, 3]");
+  TORCH_CHECK(src_k.is_contiguous(), "src_k must be contiguous");
+  TORCH_CHECK(src_v.is_contiguous(), "src_v must be contiguous");
+  TORCH_CHECK(dst_k.is_contiguous(), "dst_k must be contiguous");
+  TORCH_CHECK(dst_v.is_contiguous(), "dst_v must be contiguous");
+  TORCH_CHECK(item_size > 0 && item_size % 8 == 0, "item_size must be a positive multiple of 8");
+  TORCH_CHECK(src_k.scalar_type() == src_v.scalar_type(), "src_k/src_v dtype mismatch");
+  TORCH_CHECK(src_k.scalar_type() == dst_k.scalar_type(), "src_k/dst_k dtype mismatch");
+  TORCH_CHECK(src_v.scalar_type() == dst_v.scalar_type(), "src_v/dst_v dtype mismatch");
+
+  const int64_t num_spans = spans.size(0);
+  if (num_spans <= 0) {
+    return;
+  }
+  const int64_t warps = std::max<int64_t>(1, std::min<int64_t>(num_warps_per_block, 32));
+  const int32_t threads_per_block = static_cast<int32_t>(warps * WARP_SIZE);
+  const dim3 grid_dim(static_cast<uint32_t>(num_spans), 1, 1);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  layerkv_copy_kv_span_scatter_kernel<<<grid_dim, threads_per_block, 0, stream>>>(
+      src_k.data_ptr(),
+      src_v.data_ptr(),
+      dst_k.data_ptr(),
+      dst_v.data_ptr(),
+      spans.data_ptr<int64_t>(),
+      num_spans,
+      src_base_slot,
+      dst_base_slot,
+      item_size,
+      warps);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+__global__ void layerkv_copy_kv_span_scatter_batched_kernel(
+    const void* __restrict__ src_k,
+    const void* __restrict__ src_v,
+    const uintptr_t* __restrict__ dst_k_ptrs,
+    const uintptr_t* __restrict__ dst_v_ptrs,
+    const int64_t* __restrict__ spans,
+    const int64_t* __restrict__ span_batch_ids,
+    const int64_t* __restrict__ src_offsets,
+    const int64_t* __restrict__ src_base_slots,
+    const int64_t* __restrict__ dst_base_slots,
+    int64_t num_spans,
+    int64_t item_size_bytes,
+    int64_t warps_per_block) {
+  const int64_t span_id = blockIdx.x;
+  if (span_id >= num_spans) {
+    return;
+  }
+  const int32_t lane_id = threadIdx.x % WARP_SIZE;
+  const int32_t warp_id = threadIdx.x / WARP_SIZE;
+  const int64_t batch_id = span_batch_ids[span_id];
+  const int64_t host_start = spans[span_id * 3 + 0];
+  const int64_t scratch_offset = spans[span_id * 3 + 1];
+  const int64_t length = spans[span_id * 3 + 2];
+  if (batch_id < 0 || length <= 0) {
+    return;
+  }
+
+  const char* src_k_base = static_cast<const char*>(src_k);
+  const char* src_v_base = static_cast<const char*>(src_v);
+  char* dst_k_base = reinterpret_cast<char*>(dst_k_ptrs[batch_id]);
+  char* dst_v_base = reinterpret_cast<char*>(dst_v_ptrs[batch_id]);
+  const int64_t src_offset = src_offsets[batch_id];
+  const int64_t src_base_slot = src_base_slots[batch_id];
+  const int64_t dst_base_slot = dst_base_slots[batch_id];
+
+  for (int64_t token_offset = warp_id; token_offset < length; token_offset += warps_per_block) {
+    const int64_t src_token = src_offset + host_start - src_base_slot + token_offset;
+    const int64_t dst_token = dst_base_slot + scratch_offset + token_offset;
+    const char* src_k_ptr = src_k_base + src_token * item_size_bytes;
+    const char* src_v_ptr = src_v_base + src_token * item_size_bytes;
+    char* dst_k_ptr = dst_k_base + dst_token * item_size_bytes;
+    char* dst_v_ptr = dst_v_base + dst_token * item_size_bytes;
+    transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, item_size_bytes);
+    transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+  }
+}
+
+void layerkv_copy_kv_span_scatter_batched(
+    const std::vector<at::Tensor>& src_ks,
+    const std::vector<at::Tensor>& src_vs,
+    std::vector<at::Tensor> dst_ks,
+    std::vector<at::Tensor> dst_vs,
+    const at::Tensor& spans,
+    const at::Tensor& span_batch_ids,
+    const at::Tensor& src_base_slots,
+    const at::Tensor& dst_base_slots,
+    int64_t item_size,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(!src_ks.empty(), "src_ks must not be empty");
+  TORCH_CHECK(src_ks.size() == src_vs.size(), "src_ks/src_vs size mismatch");
+  TORCH_CHECK(src_ks.size() == dst_ks.size(), "src_ks/dst_ks size mismatch");
+  TORCH_CHECK(src_ks.size() == dst_vs.size(), "src_ks/dst_vs size mismatch");
+  TORCH_CHECK(!spans.is_cuda(), "spans must be a CPU tensor");
+  TORCH_CHECK(!span_batch_ids.is_cuda(), "span_batch_ids must be a CPU tensor");
+  TORCH_CHECK(!src_base_slots.is_cuda(), "src_base_slots must be a CPU tensor");
+  TORCH_CHECK(!dst_base_slots.is_cuda(), "dst_base_slots must be a CPU tensor");
+  TORCH_CHECK(spans.scalar_type() == at::kLong, "spans must be of type long");
+  TORCH_CHECK(span_batch_ids.scalar_type() == at::kLong, "span_batch_ids must be of type long");
+  TORCH_CHECK(src_base_slots.scalar_type() == at::kLong, "src_base_slots must be of type long");
+  TORCH_CHECK(dst_base_slots.scalar_type() == at::kLong, "dst_base_slots must be of type long");
+  TORCH_CHECK(spans.dim() == 2 && spans.size(1) == 3, "spans must have shape [num_spans, 3]");
+  TORCH_CHECK(span_batch_ids.numel() == spans.size(0), "span_batch_ids must have num_spans entries");
+  TORCH_CHECK(src_base_slots.numel() == static_cast<int64_t>(src_ks.size()), "src_base_slots size mismatch");
+  TORCH_CHECK(dst_base_slots.numel() == static_cast<int64_t>(src_ks.size()), "dst_base_slots size mismatch");
+  TORCH_CHECK(item_size > 0 && item_size % 8 == 0, "item_size must be a positive multiple of 8");
+
+  const int64_t batch_count = static_cast<int64_t>(src_ks.size());
+  const int64_t num_spans = spans.size(0);
+  if (num_spans <= 0) {
+    return;
+  }
+  const auto dtype = src_ks[0].scalar_type();
+  for (int64_t i = 0; i < batch_count; ++i) {
+    TORCH_CHECK(src_ks[i].scalar_type() == dtype, "src_k dtype mismatch");
+    TORCH_CHECK(src_vs[i].scalar_type() == dtype, "src_v dtype mismatch");
+    TORCH_CHECK(dst_ks[i].scalar_type() == dtype, "dst_k dtype mismatch");
+    TORCH_CHECK(dst_vs[i].scalar_type() == dtype, "dst_v dtype mismatch");
+    TORCH_CHECK(!src_ks[i].is_cuda() && !src_vs[i].is_cuda(), "src tensors must be CPU tensors");
+    TORCH_CHECK(dst_ks[i].is_cuda() && dst_vs[i].is_cuda(), "dst tensors must be CUDA tensors");
+    TORCH_CHECK(src_ks[i].is_contiguous() && src_vs[i].is_contiguous(), "src tensors must be contiguous");
+    TORCH_CHECK(dst_ks[i].is_contiguous() && dst_vs[i].is_contiguous(), "dst tensors must be contiguous");
+    TORCH_CHECK(src_ks[i].size(0) == src_vs[i].size(0), "src_k/src_v token count mismatch");
+  }
+
+  const int64_t* spans_ptr = spans.data_ptr<int64_t>();
+  const int64_t* batch_ids_ptr = span_batch_ids.data_ptr<int64_t>();
+  const int64_t* src_bases_ptr = src_base_slots.data_ptr<int64_t>();
+  const int64_t* dst_bases_ptr = dst_base_slots.data_ptr<int64_t>();
+  std::vector<void*> dsts;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  dsts.reserve(static_cast<size_t>(num_spans) * 2);
+  srcs.reserve(static_cast<size_t>(num_spans) * 2);
+  sizes.reserve(static_cast<size_t>(num_spans) * 2);
+  for (int64_t span_id = 0; span_id < num_spans; ++span_id) {
+    const int64_t batch_id = batch_ids_ptr[span_id];
+    const int64_t host_start = spans_ptr[span_id * 3 + 0];
+    const int64_t scratch_offset = spans_ptr[span_id * 3 + 1];
+    const int64_t length = spans_ptr[span_id * 3 + 2];
+    if (length <= 0) {
+      continue;
+    }
+    TORCH_CHECK(batch_id >= 0 && batch_id < batch_count, "invalid span batch id");
+    const int64_t src_token = host_start - src_bases_ptr[batch_id];
+    const int64_t dst_token = dst_bases_ptr[batch_id] + scratch_offset;
+    TORCH_CHECK(src_token >= 0 && src_token + length <= src_ks[batch_id].size(0), "source span out of range");
+    TORCH_CHECK(dst_token >= 0 && dst_token + length <= dst_ks[batch_id].size(0), "destination span out of range");
+    const size_t bytes = static_cast<size_t>(length * item_size);
+    srcs.push_back(static_cast<const char*>(src_ks[batch_id].data_ptr()) + src_token * item_size);
+    srcs.push_back(static_cast<const char*>(src_vs[batch_id].data_ptr()) + src_token * item_size);
+    dsts.push_back(static_cast<char*>(dst_ks[batch_id].data_ptr()) + dst_token * item_size);
+    dsts.push_back(static_cast<char*>(dst_vs[batch_id].data_ptr()) + dst_token * item_size);
+    sizes.push_back(bytes);
+    sizes.push_back(bytes);
+  }
+  if (dsts.empty()) {
+    return;
+  }
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto fallback_to_async_copies = [&]() {
+    for (size_t i = 0; i < dsts.size(); ++i) {
+      C10_CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyHostToDevice, stream));
+    }
+  };
+  if (stream == nullptr) {
+    fallback_to_async_copies();
+    return;
+  }
+#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  fallback_to_async_copies();
+  return;
+#else
+  cudaMemcpyAttributes attr{};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attr.srcLocHint.type = cudaMemLocationTypeHost;
+  attr.srcLocHint.id = 0;
+  attr.dstLocHint.type = cudaMemLocationTypeDevice;
+  attr.dstLocHint.id = at::cuda::current_device();
+  attr.flags = 0;
+  size_t attr_idx = 0;
+  C10_CUDA_CHECK(cudaMemcpyBatchAsync(
+      dsts.data(),
+      srcs.data(),
+      sizes.data(),
+      dsts.size(),
+      &attr,
+      &attr_idx,
+      1,
+      stream));
+#endif
+}
+
+void layerkv_copy_kv_contiguous_batched(
+    const std::vector<at::Tensor>& src_ks,
+    const std::vector<at::Tensor>& src_vs,
+    std::vector<at::Tensor> dst_ks,
+    std::vector<at::Tensor> dst_vs,
+    const at::Tensor& src_base_slots,
+    const at::Tensor& dst_base_slots,
+    const at::Tensor& token_counts,
+    int64_t item_size) {
+  TORCH_CHECK(!src_ks.empty(), "src_ks must not be empty");
+  TORCH_CHECK(src_ks.size() == src_vs.size(), "src_ks/src_vs size mismatch");
+  TORCH_CHECK(src_ks.size() == dst_ks.size(), "src_ks/dst_ks size mismatch");
+  TORCH_CHECK(src_ks.size() == dst_vs.size(), "src_ks/dst_vs size mismatch");
+  TORCH_CHECK(!src_base_slots.is_cuda(), "src_base_slots must be a CPU tensor");
+  TORCH_CHECK(!dst_base_slots.is_cuda(), "dst_base_slots must be a CPU tensor");
+  TORCH_CHECK(!token_counts.is_cuda(), "token_counts must be a CPU tensor");
+  TORCH_CHECK(src_base_slots.scalar_type() == at::kLong, "src_base_slots must be of type long");
+  TORCH_CHECK(dst_base_slots.scalar_type() == at::kLong, "dst_base_slots must be of type long");
+  TORCH_CHECK(token_counts.scalar_type() == at::kLong, "token_counts must be of type long");
+  TORCH_CHECK(src_base_slots.numel() == static_cast<int64_t>(src_ks.size()), "src_base_slots size mismatch");
+  TORCH_CHECK(dst_base_slots.numel() == static_cast<int64_t>(src_ks.size()), "dst_base_slots size mismatch");
+  TORCH_CHECK(token_counts.numel() == static_cast<int64_t>(src_ks.size()), "token_counts size mismatch");
+  TORCH_CHECK(item_size > 0 && item_size % 8 == 0, "item_size must be a positive multiple of 8");
+
+  const int64_t batch_count = static_cast<int64_t>(src_ks.size());
+  const auto dtype = src_ks[0].scalar_type();
+  const bool src_is_cuda = src_ks[0].is_cuda();
+  const bool dst_is_cuda = dst_ks[0].is_cuda();
+  TORCH_CHECK(src_is_cuda != dst_is_cuda, "exactly one side must be CUDA");
+  for (int64_t i = 0; i < batch_count; ++i) {
+    TORCH_CHECK(src_ks[i].scalar_type() == dtype, "src_k dtype mismatch");
+    TORCH_CHECK(src_vs[i].scalar_type() == dtype, "src_v dtype mismatch");
+    TORCH_CHECK(dst_ks[i].scalar_type() == dtype, "dst_k dtype mismatch");
+    TORCH_CHECK(dst_vs[i].scalar_type() == dtype, "dst_v dtype mismatch");
+    TORCH_CHECK(src_ks[i].is_cuda() == src_is_cuda && src_vs[i].is_cuda() == src_is_cuda, "src device mismatch");
+    TORCH_CHECK(dst_ks[i].is_cuda() == dst_is_cuda && dst_vs[i].is_cuda() == dst_is_cuda, "dst device mismatch");
+    TORCH_CHECK(src_ks[i].is_contiguous() && src_vs[i].is_contiguous(), "src tensors must be contiguous");
+    TORCH_CHECK(dst_ks[i].is_contiguous() && dst_vs[i].is_contiguous(), "dst tensors must be contiguous");
+  }
+
+  const int64_t* src_bases_ptr = src_base_slots.data_ptr<int64_t>();
+  const int64_t* dst_bases_ptr = dst_base_slots.data_ptr<int64_t>();
+  const int64_t* counts_ptr = token_counts.data_ptr<int64_t>();
+  std::vector<void*> dsts;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  dsts.reserve(static_cast<size_t>(batch_count) * 2);
+  srcs.reserve(static_cast<size_t>(batch_count) * 2);
+  sizes.reserve(static_cast<size_t>(batch_count) * 2);
+  for (int64_t i = 0; i < batch_count; ++i) {
+    const int64_t src_token = src_bases_ptr[i];
+    const int64_t dst_token = dst_bases_ptr[i];
+    const int64_t count = counts_ptr[i];
+    if (count <= 0) {
+      continue;
+    }
+    TORCH_CHECK(src_token >= 0 && src_token + count <= src_ks[i].size(0), "source slice out of range");
+    TORCH_CHECK(dst_token >= 0 && dst_token + count <= dst_ks[i].size(0), "destination slice out of range");
+    const size_t bytes = static_cast<size_t>(count * item_size);
+    srcs.push_back(static_cast<const char*>(src_ks[i].data_ptr()) + src_token * item_size);
+    srcs.push_back(static_cast<const char*>(src_vs[i].data_ptr()) + src_token * item_size);
+    dsts.push_back(static_cast<char*>(dst_ks[i].data_ptr()) + dst_token * item_size);
+    dsts.push_back(static_cast<char*>(dst_vs[i].data_ptr()) + dst_token * item_size);
+    sizes.push_back(bytes);
+    sizes.push_back(bytes);
+  }
+  if (dsts.empty()) {
+    return;
+  }
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const cudaMemcpyKind kind = src_is_cuda ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+  auto fallback_to_async_copies = [&]() {
+    for (size_t i = 0; i < dsts.size(); ++i) {
+      C10_CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], kind, stream));
+    }
+  };
+  if (stream == nullptr) {
+    fallback_to_async_copies();
+    return;
+  }
+#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  fallback_to_async_copies();
+  return;
+#else
+  cudaMemcpyAttributes attr{};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  if (src_is_cuda) {
+    attr.srcLocHint.type = cudaMemLocationTypeDevice;
+    attr.srcLocHint.id = at::cuda::current_device();
+    attr.dstLocHint.type = cudaMemLocationTypeHost;
+    attr.dstLocHint.id = 0;
+  } else {
+    attr.srcLocHint.type = cudaMemLocationTypeHost;
+    attr.srcLocHint.id = 0;
+    attr.dstLocHint.type = cudaMemLocationTypeDevice;
+    attr.dstLocHint.id = at::cuda::current_device();
+  }
+  attr.flags = 0;
+  size_t attr_idx = 0;
+  cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(),
+      srcs.data(),
+      sizes.data(),
+      dsts.size(),
+      &attr,
+      &attr_idx,
+      1,
+      stream);
+  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    fallback_to_async_copies();
+    return;
+  }
+  C10_CUDA_CHECK(err);
+#endif
+}
+
+void layerkv_copy_kv_span_backup_batched(
+    const std::vector<at::Tensor>& src_ks,
+    const std::vector<at::Tensor>& src_vs,
+    std::vector<at::Tensor> dst_ks,
+    std::vector<at::Tensor> dst_vs,
+    const at::Tensor& spans,
+    const at::Tensor& span_batch_ids,
+    int64_t item_size) {
+  TORCH_CHECK(!src_ks.empty(), "src_ks must not be empty");
+  TORCH_CHECK(src_ks.size() == src_vs.size(), "src_ks/src_vs size mismatch");
+  TORCH_CHECK(src_ks.size() == dst_ks.size(), "src_ks/dst_ks size mismatch");
+  TORCH_CHECK(src_ks.size() == dst_vs.size(), "src_ks/dst_vs size mismatch");
+  TORCH_CHECK(!spans.is_cuda(), "spans must be a CPU tensor");
+  TORCH_CHECK(!span_batch_ids.is_cuda(), "span_batch_ids must be a CPU tensor");
+  TORCH_CHECK(spans.scalar_type() == at::kLong, "spans must be of type long");
+  TORCH_CHECK(span_batch_ids.scalar_type() == at::kLong, "span_batch_ids must be of type long");
+  TORCH_CHECK(spans.dim() == 2 && spans.size(1) == 3, "spans must have shape [num_spans, 3]");
+  TORCH_CHECK(span_batch_ids.numel() == spans.size(0), "span_batch_ids must have num_spans entries");
+  TORCH_CHECK(item_size > 0 && item_size % 8 == 0, "item_size must be a positive multiple of 8");
+
+  const int64_t batch_count = static_cast<int64_t>(src_ks.size());
+  const int64_t num_spans = spans.size(0);
+  if (num_spans <= 0) {
+    return;
+  }
+  const auto dtype = src_ks[0].scalar_type();
+  for (int64_t i = 0; i < batch_count; ++i) {
+    TORCH_CHECK(src_ks[i].scalar_type() == dtype, "src_k dtype mismatch");
+    TORCH_CHECK(src_vs[i].scalar_type() == dtype, "src_v dtype mismatch");
+    TORCH_CHECK(dst_ks[i].scalar_type() == dtype, "dst_k dtype mismatch");
+    TORCH_CHECK(dst_vs[i].scalar_type() == dtype, "dst_v dtype mismatch");
+    TORCH_CHECK(src_ks[i].is_cuda() && src_vs[i].is_cuda(), "src tensors must be CUDA tensors");
+    TORCH_CHECK(!dst_ks[i].is_cuda() && !dst_vs[i].is_cuda(), "dst tensors must be CPU tensors");
+    TORCH_CHECK(src_ks[i].is_contiguous() && src_vs[i].is_contiguous(), "src tensors must be contiguous");
+    TORCH_CHECK(dst_ks[i].is_contiguous() && dst_vs[i].is_contiguous(), "dst tensors must be contiguous");
+  }
+
+  const int64_t* spans_ptr = spans.data_ptr<int64_t>();
+  const int64_t* batch_ids_ptr = span_batch_ids.data_ptr<int64_t>();
+  std::vector<void*> dsts;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  dsts.reserve(static_cast<size_t>(num_spans) * 2);
+  srcs.reserve(static_cast<size_t>(num_spans) * 2);
+  sizes.reserve(static_cast<size_t>(num_spans) * 2);
+  for (int64_t span_id = 0; span_id < num_spans; ++span_id) {
+    const int64_t batch_id = batch_ids_ptr[span_id];
+    const int64_t src_token = spans_ptr[span_id * 3 + 0];
+    const int64_t dst_token = spans_ptr[span_id * 3 + 1];
+    const int64_t length = spans_ptr[span_id * 3 + 2];
+    if (length <= 0) {
+      continue;
+    }
+    TORCH_CHECK(batch_id >= 0 && batch_id < batch_count, "invalid span batch id");
+    TORCH_CHECK(src_token >= 0 && src_token + length <= src_ks[batch_id].size(0), "source span out of range");
+    TORCH_CHECK(dst_token >= 0 && dst_token + length <= dst_ks[batch_id].size(0), "destination span out of range");
+    const size_t bytes = static_cast<size_t>(length * item_size);
+    srcs.push_back(static_cast<const char*>(src_ks[batch_id].data_ptr()) + src_token * item_size);
+    srcs.push_back(static_cast<const char*>(src_vs[batch_id].data_ptr()) + src_token * item_size);
+    dsts.push_back(static_cast<char*>(dst_ks[batch_id].data_ptr()) + dst_token * item_size);
+    dsts.push_back(static_cast<char*>(dst_vs[batch_id].data_ptr()) + dst_token * item_size);
+    sizes.push_back(bytes);
+    sizes.push_back(bytes);
+  }
+  if (dsts.empty()) {
+    return;
+  }
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto fallback_to_async_copies = [&]() {
+    for (size_t i = 0; i < dsts.size(); ++i) {
+      C10_CUDA_CHECK(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDeviceToHost, stream));
+    }
+  };
+  if (stream == nullptr) {
+    fallback_to_async_copies();
+    return;
+  }
+#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+  fallback_to_async_copies();
+  return;
+#else
+  cudaMemcpyAttributes attr{};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attr.srcLocHint.type = cudaMemLocationTypeDevice;
+  attr.srcLocHint.id = at::cuda::current_device();
+  attr.dstLocHint.type = cudaMemLocationTypeHost;
+  attr.dstLocHint.id = 0;
+  attr.flags = 0;
+  size_t attr_idx = 0;
+  cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(),
+      srcs.data(),
+      sizes.data(),
+      dsts.size(),
+      &attr,
+      &attr_idx,
+      1,
+      stream);
+  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    fallback_to_async_copies();
+    return;
+  }
+  C10_CUDA_CHECK(err);
+#endif
 }
 
 inline void transfer_page_direct(

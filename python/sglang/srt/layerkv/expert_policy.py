@@ -386,6 +386,8 @@ class LayerKVExpertPolicyMixin:
             layer_ids=layer_ids,
             max_tokens_per_layer=max_tokens_per_layer,
             block_tokens=block_tokens,
+            avg_prefix=self._avg_prefix_len(forward_batch),
+            batch_size=max(1, len(self._batch_req_indices_and_lens(forward_batch))),
         )
         self._planned_kvc_token_target = int(sum(plan.values()))
         self._planned_kvc_tokens_by_layer = plan
@@ -496,10 +498,15 @@ class LayerKVExpertPolicyMixin:
             expert_prefix_candidates = coresid_expert_plan_inputs[3]
         else:
             expert_prefix_candidates = expert_candidates
-        expert_prefix_table = self._build_expert_prefix_table(expert_prefix_candidates)
+        expert_prefix_table = (
+            {}
+            if self.config.policy == "coresid"
+            else self._build_expert_prefix_table(expert_prefix_candidates)
+        )
         expert_layerwise_table = (
             self._build_coresid_expert_layerwise_plan_table(
-                coresid_expert_plan_inputs
+                coresid_expert_plan_inputs,
+                max_reclaim_mb=target_mb,
             )
             if self.config.policy == "coresid"
             and coresid_expert_plan_inputs is not None
@@ -551,6 +558,8 @@ class LayerKVExpertPolicyMixin:
                 layer_ids=kvc_layer_ids,
                 max_tokens_per_layer=kvc_max_tokens_per_layer,
                 block_tokens=kvc_block_tokens_for_plan,
+                avg_prefix=kvc_avg_prefix,
+                batch_size=kvc_batch_size,
             )
             value = self._estimate_arena_kvc_reclaim_cost_from_plan(
                 plan,
@@ -559,7 +568,7 @@ class LayerKVExpertPolicyMixin:
                 batch_size=kvc_batch_size,
                 recovery_steps=kvc_recovery_steps,
             )
-            cached = (value, tokens)
+            cached = (value, int(sum(plan.values())))
             kvc_cost_cache[key] = cached
             self.stats.planner_dp_lookup_ms += (
                 time.perf_counter() - lookup_t0
@@ -651,6 +660,7 @@ class LayerKVExpertPolicyMixin:
             expert_only_materialize_cost,
         )
         best_kvc_tokens = 0
+        best_kvc_controller_cost = 0.0
         infeasible_expert = 0
         if expert_only_cost >= 1.0e29:
             infeasible_expert += 1
@@ -658,11 +668,20 @@ class LayerKVExpertPolicyMixin:
             for kvc_mb in sorted(kvc_points):
                 if kvc_mb <= 0.0:
                     continue
-                expert_mb = max(0.0, target_mb - kvc_mb)
-                kvc_fraction = kvc_mb / target_mb
-                expert_fraction = expert_mb / target_mb
                 with self._profile("profile_planner_dp_candidate_eval_ms"):
                     kvc_cost, kvc_tokens = cached_kvc_cost(kvc_mb)
+                    actual_kvc_mb = (
+                        float(kvc_tokens)
+                        * float(kvc_token_bytes)
+                        / float(1024 * 1024)
+                    )
+                    actual_kvc_mb = min(float(target_mb), max(0.0, actual_kvc_mb))
+                    if actual_kvc_mb <= 0.0:
+                        infeasible_kvc += 1
+                        continue
+                    expert_mb = max(0.0, target_mb - actual_kvc_mb)
+                    kvc_fraction = actual_kvc_mb / target_mb
+                    expert_fraction = expert_mb / target_mb
                     if kvc_cost >= best[0]:
                         continue
                     (
@@ -694,6 +713,9 @@ class LayerKVExpertPolicyMixin:
                         materialize_cost,
                     )
                     best_kvc_tokens = int(kvc_tokens)
+                    best_kvc_controller_cost = float(
+                        kvc_controller_cost_cache.get(round(kvc_mb, 6), 0.0)
+                    )
         assert best is not None
         _total_cost, kvc_fraction, expert_fraction, kvc_cost, expert_cost = best
         self.stats.planner_dp_candidate_count = len(kvc_points)
@@ -706,12 +728,7 @@ class LayerKVExpertPolicyMixin:
         self.stats.planner_dp_selected_total_cost = float(_total_cost)
         self.stats.planner_dp_selected_kvc_cost = float(kvc_cost)
         self.stats.planner_dp_selected_expert_cost = float(expert_cost)
-        self.stats.planner_estimated_kvc_controller_cost = float(
-            kvc_controller_cost_cache.get(
-                round(target_mb * kvc_fraction, 6),
-                self.stats.planner_estimated_kvc_controller_cost,
-            )
-        )
+        self.stats.planner_estimated_kvc_controller_cost = best_kvc_controller_cost
         self.stats.planner_estimated_expert_churn_count = float(best_expert_stats[0])
         self.stats.planner_estimated_expert_churn_mb = float(best_expert_stats[1])
         self.stats.planner_estimated_expert_install_mb = float(best_expert_stats[2])
@@ -781,13 +798,23 @@ class LayerKVExpertPolicyMixin:
                         layer_ids=kvc_layer_ids,
                         max_tokens_per_layer=kvc_max_tokens_per_layer,
                         block_tokens=kvc_block_tokens_for_plan,
+                        avg_prefix=self._avg_prefix_len(forward_batch),
+                        batch_size=max(
+                            1, len(self._batch_req_indices_and_lens(forward_batch))
+                        ),
                     )
+                )
+                self._planned_kvc_token_target = int(
+                    sum(self._planned_kvc_tokens_by_layer.values())
                 )
             else:
                 self._planned_kvc_tokens_by_layer = (
                     self._build_layer_aware_kvc_token_plan(
                         self._planned_kvc_token_target, forward_batch
                     )
+                )
+                self._planned_kvc_token_target = int(
+                    sum(self._planned_kvc_tokens_by_layer.values())
                 )
             self.stats.selected_kvc_tokens_by_layer = self._kvc_tokens_by_layer_json(
                 self._planned_kvc_tokens_by_layer
@@ -1025,6 +1052,8 @@ class LayerKVExpertPolicyMixin:
         layer_ids: List[int],
         max_tokens_per_layer: int,
         block_tokens: int,
+        avg_prefix: Optional[float] = None,
+        batch_size: Optional[int] = None,
     ) -> Dict[int, int]:
         if not layer_ids or total_tokens <= 0 or max_tokens_per_layer <= 0:
             return {}
@@ -1033,6 +1062,15 @@ class LayerKVExpertPolicyMixin:
         total_tokens = min(total_tokens, total_capacity)
         if total_tokens <= 0:
             return {}
+        if avg_prefix is not None and batch_size is not None:
+            return self._build_overlap_capacity_kvc_token_plan_from_context(
+                total_tokens,
+                layer_ids=layer_ids,
+                max_tokens_per_layer=max_tokens_per_layer,
+                block_tokens=block_tokens,
+                avg_prefix=float(avg_prefix),
+                batch_size=int(batch_size),
+            )
         weight_sum = float(len(layer_ids) * (len(layer_ids) + 1)) / 2.0 or 1.0
         remaining = total_tokens
         plan: Dict[int, int] = {}
@@ -1053,6 +1091,61 @@ class LayerKVExpertPolicyMixin:
                     continue
                 plan[int(layer_id)] = plan.get(int(layer_id), 0) + add
                 remaining -= add
+        return {layer: tokens for layer, tokens in plan.items() if tokens > 0}
+
+    def _build_overlap_capacity_kvc_token_plan_from_context(
+        self,
+        total_tokens: int,
+        *,
+        layer_ids: List[int],
+        max_tokens_per_layer: int,
+        block_tokens: int,
+        avg_prefix: float,
+        batch_size: int,
+    ) -> Dict[int, int]:
+        overlap_windows = self._estimate_kvc_overlap_windows_ms(
+            layer_ids,
+            avg_prefix=max(1.0, float(avg_prefix)),
+            batch_size=max(1, int(batch_size)),
+        )
+        bytes_per_token = max(1, self._bytes_per_kvc_token_per_layer())
+        fallback_per_token_ms = (2.0 * float(bytes_per_token)) / 1.0e9 * 1000.0
+        capacities: Dict[int, int] = {}
+        for layer_id in layer_ids:
+            layer_id = int(layer_id)
+            overlap_ms = max(0.0, float(overlap_windows.get(layer_id, 0.0)))
+            reload_ewma = self._kvc_reload_ms_per_mb_ewma_by_layer.get(layer_id)
+            evict_ewma = self._kvc_evict_ms_per_mb_ewma_by_layer.get(layer_id)
+            if reload_ewma is not None or evict_ewma is not None:
+                per_token_ms = (
+                    (float(reload_ewma or 0.0) + float(evict_ewma or 0.0))
+                    * float(bytes_per_token)
+                    / float(1024 * 1024)
+                )
+            else:
+                per_token_ms = fallback_per_token_ms
+            if per_token_ms <= 0.0:
+                per_token_ms = fallback_per_token_ms
+            usable_ms = max(0.0, overlap_ms - 0.03)
+            tokens = int(usable_ms / per_token_ms)
+            tokens = min(int(max_tokens_per_layer), self._align_tokens_down(tokens))
+            tokens = tokens - (tokens % max(1, int(block_tokens)))
+            if tokens > 0:
+                capacities[layer_id] = tokens
+        remaining = self._align_tokens_down(int(total_tokens))
+        plan: Dict[int, int] = {}
+        for layer_id in sorted(layer_ids, reverse=True):
+            if remaining <= 0:
+                break
+            capacity = int(capacities.get(int(layer_id), 0))
+            if capacity <= 0:
+                continue
+            tokens = min(capacity, remaining)
+            tokens = tokens - (tokens % max(1, int(block_tokens)))
+            if tokens <= 0:
+                continue
+            plan[int(layer_id)] = tokens
+            remaining -= tokens
         return {layer: tokens for layer, tokens in plan.items() if tokens > 0}
 
     def _estimate_arena_kvc_candidate_costs_vectorized(
@@ -1078,29 +1171,6 @@ class LayerKVExpertPolicyMixin:
             device="cpu",
         )
         layer_count = len(layer_ids)
-        weights = torch.arange(1, layer_count + 1, dtype=torch.float64, device="cpu")
-        weight_sum = float(layer_count * (layer_count + 1)) / 2.0 or 1.0
-        raw = torch.round(
-            token_counts[:, None].to(torch.float64) * weights[None, :] / weight_sum
-        )
-        plan = raw.to(torch.int64)
-        plan = torch.minimum(
-            plan,
-            torch.tensor(int(max_tokens_per_layer), dtype=torch.int64, device="cpu"),
-        )
-        plan = (plan // int(block_tokens)) * int(block_tokens)
-        remaining = token_counts - plan.sum(axis=1)
-        for idx in range(layer_count - 1, -1, -1):
-            positive = remaining > 0
-            if not bool(torch.any(positive).item()):
-                break
-            capacity = int(max_tokens_per_layer) - plan[:, idx]
-            add = torch.minimum(capacity, remaining)
-            add = (add // int(block_tokens)) * int(block_tokens)
-            add = torch.where(positive & (add > 0), add, torch.zeros_like(add))
-            plan[:, idx] += add
-            remaining -= add
-
         bytes_per_token = max(1, self._bytes_per_kvc_token_per_layer())
         ms_per_token: List[float] = []
         fallback_per_token = (2.0 * float(bytes_per_token)) / 1.0e9 * 1000.0
@@ -1110,16 +1180,13 @@ class LayerKVExpertPolicyMixin:
             evict_ewma = self._kvc_evict_ms_per_mb_ewma_by_layer.get(layer_id)
             if reload_ewma is not None or evict_ewma is not None:
                 ms_per_mb = float(reload_ewma or 0.0) + float(evict_ewma or 0.0)
-                ms_per_token.append(
-                    ms_per_mb * float(bytes_per_token) / float(1024 * 1024)
-                )
+                value = ms_per_mb * float(bytes_per_token) / float(1024 * 1024)
             else:
-                ms_per_token.append(fallback_per_token)
+                value = fallback_per_token
+            ms_per_token.append(value if value > 0.0 else fallback_per_token)
         ms_per_token_tensor = torch.tensor(
             ms_per_token, dtype=torch.float64, device="cpu"
         )
-        raw_copy = 0.03 + plan.to(torch.float64) * ms_per_token_tensor[None, :]
-        raw_copy = torch.where(plan > 0, raw_copy, torch.zeros_like(raw_copy))
         overlap_values = self._estimate_kvc_overlap_windows_ms(
             layer_ids, avg_prefix=avg_prefix, batch_size=batch_size
         )
@@ -1128,6 +1195,30 @@ class LayerKVExpertPolicyMixin:
             dtype=torch.float64,
             device="cpu",
         )
+        usable = torch.clamp(overlap - 0.03, min=0.0)
+        capacities = torch.floor(usable / ms_per_token_tensor).to(torch.int64)
+        capacities = torch.minimum(
+            capacities,
+            torch.tensor(int(max_tokens_per_layer), dtype=torch.int64, device="cpu"),
+        )
+        capacities = (capacities // int(block_tokens)) * int(block_tokens)
+
+        plan = torch.zeros(
+            (len(points), layer_count), dtype=torch.int64, device="cpu"
+        )
+        remaining = (token_counts // int(block_tokens)) * int(block_tokens)
+        for idx in range(layer_count - 1, -1, -1):
+            positive = remaining > 0
+            if not bool(torch.any(positive).item()):
+                break
+            add = torch.minimum(capacities[idx], remaining)
+            add = (add // int(block_tokens)) * int(block_tokens)
+            add = torch.where(positive & (add > 0), add, torch.zeros_like(add))
+            plan[:, idx] = add
+            remaining -= add
+
+        raw_copy = 0.03 + plan.to(torch.float64) * ms_per_token_tensor[None, :]
+        raw_copy = torch.where(plan > 0, raw_copy, torch.zeros_like(raw_copy))
         queued = torch.cumsum(raw_copy, dim=1) - raw_copy
         exposed = torch.clamp(raw_copy + queued - overlap[None, :], min=0.0)
         blocks = torch.ceil(plan.to(torch.float64) / float(max(1, block_tokens)))
@@ -1275,5 +1366,3 @@ class LayerKVExpertPolicyMixin:
         )
         blocks = max(1, int(math.ceil(float(tokens) / float(block_tokens))))
         return 0.003 + 0.0002 * float(blocks)
-
-

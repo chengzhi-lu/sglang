@@ -18,6 +18,7 @@ if __package__:
         _LayerKVKvcDemand,
         _LayerKVMetadataPatchCacheEntry,
         _LayerKVNativeKvcRun,
+        _LayerKVPerLayerReqCleanupState,
         _LayerKVPendingEviction,
         _LayerKVPendingReload,
         _LayerKVPendingVirtualMaterialize,
@@ -31,6 +32,7 @@ else:  # pragma: no cover - direct file-loading smoke tests.
         _LayerKVKvcDemand,
         _LayerKVMetadataPatchCacheEntry,
         _LayerKVNativeKvcRun,
+        _LayerKVPerLayerReqCleanupState,
         _LayerKVPendingEviction,
         _LayerKVPendingReload,
         _LayerKVPendingVirtualMaterialize,
@@ -148,8 +150,7 @@ class LayerKVKvcAllocatorMixin:
 
     def uses_per_layer_logical_allocator(self) -> bool:
         return self._per_layer_allocator_enabled() and bool(
-            self._per_layer_arena_reserved_locs
-            or self._per_layer_owned_req_indices
+            self._per_layer_arena_reserved_locs or self._per_layer_owned_req_indices
         )
 
     def requires_unfused_set_kv_buffer(self) -> bool:
@@ -161,6 +162,17 @@ class LayerKVKvcAllocatorMixin:
             self._per_layer_req_to_token_owned
             or self._per_layer_offloaded_keys
             or self._pending_virtual_kvc_materialize
+        )
+
+    def _per_layer_kvc_io_control_active(self) -> bool:
+        if not self._per_layer_allocator_enabled():
+            return False
+        return bool(
+            self._per_layer_req_to_token_owned
+            or self._per_layer_offloaded_keys
+            or self._pending_virtual_kvc_materialize
+            or self._pending_kvc_evict_events
+            or self._pending_kvc_reload_events
         )
 
     def _mark_per_layer_common_free_dirty(self) -> None:
@@ -207,16 +219,18 @@ class LayerKVKvcAllocatorMixin:
                 self._per_layer_owned_req_indices
             )
             return
+        layer_ids = [int(layer_id) for layer_id in self._kvc_layer_ids()]
         free_counts = [
-            len(self._per_layer_arena_free_locs.get(int(layer_id), []))
-            for layer_id in self._kvc_layer_ids()
+            len(self._per_layer_arena_free_locs.get(layer_id, []))
+            + self._per_layer_overwrite_count(layer_id)
+            for layer_id in layer_ids
         ]
         if free_counts:
             self.stats.kvc_per_layer_physical_arena_min_free_tokens = min(free_counts)
         else:
             self.stats.kvc_per_layer_physical_arena_min_free_tokens = 0
         self.stats.kvc_per_layer_physical_arena_common_free_tokens = (
-            len(self._per_layer_arena_common_free_locs)
+            self._per_layer_logical_common_free_count(layer_ids=layer_ids)
         )
         self.stats.kvc_per_layer_physical_arena_token_capacity = len(
             self._per_layer_arena_reserved_locs
@@ -228,6 +242,26 @@ class LayerKVKvcAllocatorMixin:
             self._per_layer_owned_req_indices
         )
 
+    def _per_layer_overwrite_count(self, layer_id: int) -> int:
+        layer_id = int(layer_id)
+        return max(
+            0,
+            int(self._per_layer_arena_overwrite_counts.get(layer_id, 0))
+            + len(self._per_layer_arena_overwrite_pending_locs.get(layer_id, []))
+            + int(self._per_layer_arena_overwrite_pending_bit_counts.get(layer_id, 0)),
+        )
+
+    def _per_layer_logical_common_free_count(
+        self, *, layer_ids: Optional[List[int]] = None
+    ) -> int:
+        if layer_ids is None:
+            layer_ids = [int(layer_id) for layer_id in self._kvc_layer_ids()]
+        physical_common = len(self._per_layer_arena_common_free_locs)
+        if not layer_ids:
+            return physical_common
+        overwrite_counts = [self._per_layer_overwrite_count(int(x)) for x in layer_ids]
+        return int(physical_common) + (min(overwrite_counts) if overwrite_counts else 0)
+
     def _ensure_per_layer_physical_arena(self, min_free_tokens: int = 1) -> bool:
         if not self._per_layer_allocator_enabled():
             return False
@@ -237,9 +271,12 @@ class LayerKVKvcAllocatorMixin:
         min_free_tokens = max(1, int(min_free_tokens or 1))
         self._refresh_per_layer_allocator_stats()
         self._ensure_per_layer_common_free_current()
+        logical_common_free = self._per_layer_logical_common_free_count(
+            layer_ids=[int(x) for x in layer_ids]
+        )
         if len(self._per_layer_arena_common_free_locs) >= min_free_tokens:
-            self.stats.kvc_per_layer_physical_arena_common_free_tokens = len(
-                self._per_layer_arena_common_free_locs
+            self.stats.kvc_per_layer_physical_arena_common_free_tokens = (
+                logical_common_free
             )
             return True
         available = int(self._allocator.available_size())
@@ -269,18 +306,17 @@ class LayerKVKvcAllocatorMixin:
             self._per_layer_canonical_to_physical.setdefault(layer_id, {})
         self.stats.kvc_per_layer_physical_arena_grow_count += 1
         self._refresh_per_layer_allocator_stats()
-        return (
-            self.stats.kvc_per_layer_physical_arena_common_free_tokens
-            >= min_free_tokens
-        )
+        return len(self._per_layer_arena_common_free_locs) >= min_free_tokens
 
-    def _alloc_per_layer_locs(
-        self, layer_id: int, count: int
-    ) -> Optional[List[int]]:
+    def _alloc_per_layer_locs(self, layer_id: int, count: int) -> Optional[List[int]]:
         layer_id = int(layer_id)
         count = max(0, int(count))
         if count <= 0:
             return []
+        overwrite_locs = self._pop_per_layer_overwrite_locs(layer_id, count)
+        if len(overwrite_locs) >= count:
+            return overwrite_locs
+        remaining = count - len(overwrite_locs)
         free = self._per_layer_arena_free_locs.setdefault(layer_id, [])
         allocated = self._per_layer_arena_allocated_locs.setdefault(layer_id, set())
         protected = self._per_layer_arena_protected_locs.setdefault(layer_id, set())
@@ -295,7 +331,7 @@ class LayerKVKvcAllocatorMixin:
         if len(cleaned) != len(free):
             self._per_layer_arena_free_locs[layer_id] = cleaned
             free = cleaned
-        if len(free) < count and (
+        if len(free) < remaining and (
             self._per_layer_arena_common_free_locs
             or self._per_layer_arena_common_free_dirty
         ):
@@ -307,24 +343,28 @@ class LayerKVKvcAllocatorMixin:
                     continue
                 free.append(loc)
                 present.add(loc)
-                if len(free) >= count:
+                if len(free) >= remaining:
                     break
-        if len(free) < count:
-            if not self._ensure_per_layer_physical_arena(count - len(free)):
+        if len(free) < remaining:
+            if not self._ensure_per_layer_physical_arena(remaining - len(free)):
+                if overwrite_locs:
+                    self._push_per_layer_overwrite_locs(layer_id, overwrite_locs)
                 self.stats.kvc_per_layer_physical_arena_alloc_failed_count += 1
                 return None
             free = self._per_layer_arena_free_locs.setdefault(layer_id, [])
-        if len(free) < count:
+        if len(free) < remaining:
+            if overwrite_locs:
+                self._push_per_layer_overwrite_locs(layer_id, overwrite_locs)
             self.stats.kvc_per_layer_physical_arena_alloc_failed_count += 1
             return None
-        locs = free[-count:]
-        del free[-count:]
+        locs = free[-remaining:]
+        del free[-remaining:]
         for loc in locs:
             self._per_layer_arena_common_free_locs.discard(int(loc))
         self._per_layer_arena_allocated_locs.setdefault(layer_id, set()).update(locs)
-        self.stats.kvc_per_layer_physical_arena_alloc_count += count
+        self.stats.kvc_per_layer_physical_arena_alloc_count += remaining
         self._refresh_per_layer_allocator_stats()
-        return [int(x) for x in locs]
+        return [int(x) for x in overwrite_locs] + [int(x) for x in locs]
 
     def _alloc_common_per_layer_locs(self, count: int) -> Optional[List[int]]:
         count = max(0, int(count))
@@ -340,22 +380,27 @@ class LayerKVKvcAllocatorMixin:
             self.stats.kvc_per_layer_physical_arena_alloc_failed_count += 1
             return None
         locs: List[int] = []
+        selected: Set[int] = set()
         while self._per_layer_arena_common_free_order and len(locs) < count:
             loc = int(self._per_layer_arena_common_free_order.pop())
+            if loc in selected:
+                continue
             if loc in common and not any(
                 self._per_layer_loc_is_protected(layer_id, loc)
                 for layer_id in layer_ids
             ):
                 locs.append(loc)
+                selected.add(loc)
         if len(locs) < count:
             for loc in sorted(common):
                 loc = int(loc)
-                if loc in locs or any(
+                if loc in selected or any(
                     self._per_layer_loc_is_protected(layer_id, loc)
                     for layer_id in layer_ids
                 ):
                     continue
                 locs.append(loc)
+                selected.add(loc)
                 if len(locs) >= count:
                     break
         if len(locs) < count:
@@ -493,9 +538,7 @@ class LayerKVKvcAllocatorMixin:
             if not locs:
                 continue
             layer_id = int(layer_id)
-            allocated = self._per_layer_arena_allocated_locs.setdefault(
-                layer_id, set()
-            )
+            allocated = self._per_layer_arena_allocated_locs.setdefault(layer_id, set())
             loc_set = {int(x) for x in locs}
             reusable = loc_set if assume_allocated else loc_set.intersection(allocated)
             if not reusable:
@@ -503,9 +546,7 @@ class LayerKVKvcAllocatorMixin:
             if assume_allocated:
                 self._per_layer_arena_reserved_locs.update(reusable)
             allocated.difference_update(reusable)
-            protected = self._per_layer_arena_protected_locs.setdefault(
-                layer_id, set()
-            )
+            protected = self._per_layer_arena_protected_locs.setdefault(layer_id, set())
             ordinary_reusable = reusable.difference(protected)
 
             free = self._per_layer_arena_free_locs.setdefault(layer_id, [])
@@ -528,6 +569,8 @@ class LayerKVKvcAllocatorMixin:
         locs = [int(loc) for loc in locs if int(loc) > 0]
         if not locs:
             return None
+        if self._consume_per_layer_overwrite_locs(layer_id, locs):
+            return list(locs)
         allocated = self._per_layer_arena_allocated_locs.setdefault(layer_id, set())
         if any(int(loc) in allocated for loc in locs):
             return None
@@ -538,24 +581,631 @@ class LayerKVKvcAllocatorMixin:
                 int(loc) for loc in free if int(loc) not in loc_set
             ]
             self._per_layer_arena_common_free_locs.difference_update(loc_set)
-            self._per_layer_arena_protected_locs.setdefault(layer_id, set()).difference_update(
-                loc_set
-            )
+            self._per_layer_arena_protected_locs.setdefault(
+                layer_id, set()
+            ).difference_update(loc_set)
             allocated.update(loc_set)
             self.stats.kvc_per_layer_physical_arena_alloc_count += len(loc_set)
             self._refresh_per_layer_allocator_stats()
         return list(locs)
+
+    def _push_per_layer_overwrite_locs(
+        self, layer_id: int, locs: List[int], *, assume_new: bool = False
+    ) -> None:
+        if not locs:
+            return
+        layer_id = int(layer_id)
+        if assume_new:
+            pending = self._per_layer_arena_overwrite_pending_locs.setdefault(
+                layer_id, []
+            )
+            pending.extend(locs)
+            return
+        loc_tensor = torch.as_tensor(locs, dtype=torch.int64, device="cpu")
+        if loc_tensor.numel() == 0:
+            return
+        loc_tensor = loc_tensor[loc_tensor > 0]
+        if loc_tensor.numel() == 0:
+            return
+        if not assume_new:
+            loc_tensor = torch.unique(loc_tensor)
+        bitmap = self._ensure_per_layer_overwrite_bitmap(
+            layer_id, int(loc_tensor.max().item()) + 1
+        )
+        if assume_new:
+            newly_set = int(loc_tensor.numel())
+        else:
+            already_set = bitmap.index_select(0, loc_tensor)
+            newly_set = int(loc_tensor.numel()) - int(
+                torch.count_nonzero(already_set).item()
+            )
+        if newly_set > 0:
+            self._per_layer_arena_overwrite_counts[layer_id] = int(
+                self._per_layer_arena_overwrite_counts.get(layer_id, 0)
+            ) + int(newly_set)
+        bitmap.index_fill_(0, loc_tensor, True)
+
+    def _locs_to_bitset(self, locs: List[int], *, min_value: int = 0) -> int:
+        bits = 0
+        min_value = int(min_value)
+        for loc in locs:
+            loc = int(loc)
+            if loc >= min_value:
+                bits |= 1 << loc
+        return bits
+
+    def _bitset_to_locs(self, bits: int, *, limit: int = 0) -> List[int]:
+        bits = int(bits)
+        limit = max(0, int(limit))
+        locs: List[int] = []
+        while bits and (limit <= 0 or len(locs) < limit):
+            lsb = bits & -bits
+            locs.append(int(lsb.bit_length() - 1))
+            bits ^= lsb
+        return locs
+
+    def _push_per_layer_overwrite_bits(
+        self, layer_id: int, bits: int, *, token_count: Optional[int] = None
+    ) -> None:
+        bits = int(bits)
+        if bits <= 0:
+            return
+        layer_id = int(layer_id)
+        if token_count is None:
+            token_count = int(bits).bit_count()
+        self._per_layer_arena_overwrite_pending_bit_chunks.setdefault(
+            layer_id, []
+        ).append(bits)
+        self._per_layer_arena_overwrite_pending_bit_counts[layer_id] = int(
+            self._per_layer_arena_overwrite_pending_bit_counts.get(layer_id, 0)
+        ) + max(0, int(token_count))
+
+    def _per_layer_pending_overwrite_bits_union(self, layer_id: int) -> int:
+        layer_id = int(layer_id)
+        bits = int(self._per_layer_arena_overwrite_pending_bits.get(layer_id, 0))
+        for chunk in self._per_layer_arena_overwrite_pending_bit_chunks.get(
+            layer_id, []
+        ):
+            bits |= int(chunk)
+        return bits
+
+    def _remove_per_layer_pending_overwrite_bits(
+        self, layer_id: int, remove_bits: int, *, token_count: Optional[int] = None
+    ) -> None:
+        layer_id = int(layer_id)
+        remove_bits = int(remove_bits)
+        if remove_bits <= 0:
+            return
+        pending_bits = int(
+            self._per_layer_arena_overwrite_pending_bits.get(layer_id, 0)
+        )
+        if pending_bits:
+            pending_bits &= ~remove_bits
+            if pending_bits:
+                self._per_layer_arena_overwrite_pending_bits[layer_id] = pending_bits
+            else:
+                self._per_layer_arena_overwrite_pending_bits.pop(layer_id, None)
+        chunks = self._per_layer_arena_overwrite_pending_bit_chunks.get(layer_id)
+        if chunks:
+            kept = []
+            for chunk in chunks:
+                chunk = int(chunk) & ~remove_bits
+                if chunk:
+                    kept.append(chunk)
+            if kept:
+                self._per_layer_arena_overwrite_pending_bit_chunks[layer_id] = kept
+            else:
+                self._per_layer_arena_overwrite_pending_bit_chunks.pop(layer_id, None)
+        if token_count is None:
+            token_count = int(remove_bits).bit_count()
+        next_count = max(
+            0,
+            int(self._per_layer_arena_overwrite_pending_bit_counts.get(layer_id, 0))
+            - max(0, int(token_count)),
+        )
+        if next_count:
+            self._per_layer_arena_overwrite_pending_bit_counts[layer_id] = next_count
+        else:
+            self._per_layer_arena_overwrite_pending_bit_counts.pop(layer_id, None)
+
+    def _pop_per_layer_overwrite_locs(self, layer_id: int, count: int) -> List[int]:
+        layer_id = int(layer_id)
+        count = max(0, int(count))
+        if count <= 0:
+            return []
+        locs: List[int] = []
+        bitmap = self._per_layer_arena_overwrite_bitmaps.get(layer_id)
+        if bitmap is not None and bitmap.numel() > 0:
+            loc_tensor = torch.nonzero(bitmap, as_tuple=False).flatten()
+            if loc_tensor.numel() > 0:
+                if int(loc_tensor.numel()) > count:
+                    loc_tensor = loc_tensor[-count:]
+                bitmap.index_fill_(0, loc_tensor, False)
+                bitmap_count = max(
+                    0,
+                    int(self._per_layer_arena_overwrite_counts.get(layer_id, 0))
+                    - int(loc_tensor.numel()),
+                )
+                self._per_layer_arena_overwrite_counts[layer_id] = bitmap_count
+                locs.extend(int(loc) for loc in loc_tensor.tolist())
+        remaining = count - len(locs)
+        if remaining > 0:
+            pending = self._per_layer_arena_overwrite_pending_locs.setdefault(
+                layer_id, []
+            )
+            if pending:
+                seen = set(locs)
+                kept_pending: List[int] = []
+                for loc in reversed(pending):
+                    loc = int(loc)
+                    if loc <= 0 or loc in seen:
+                        continue
+                    if len(locs) < count:
+                        locs.append(loc)
+                        seen.add(loc)
+                    else:
+                        kept_pending.append(loc)
+                kept_pending.reverse()
+                pending[:] = kept_pending
+        remaining = count - len(locs)
+        if remaining > 0:
+            chunks = self._per_layer_arena_overwrite_pending_bit_chunks.get(layer_id)
+            if chunks:
+                seen = set(locs)
+                popped: List[int] = []
+                kept_chunks: List[int] = []
+                for chunk in reversed(chunks):
+                    bits = int(chunk)
+                    while bits and len(popped) < remaining:
+                        loc = int(bits.bit_length() - 1)
+                        bit = 1 << loc
+                        bits ^= bit
+                        if loc <= 0 or loc in seen:
+                            continue
+                        popped.append(loc)
+                        seen.add(loc)
+                    if bits:
+                        kept_chunks.append(bits)
+                kept_chunks.reverse()
+                locs.extend(popped)
+                removed = len(popped)
+                if kept_chunks:
+                    self._per_layer_arena_overwrite_pending_bit_chunks[layer_id] = (
+                        kept_chunks
+                    )
+                else:
+                    self._per_layer_arena_overwrite_pending_bit_chunks.pop(
+                        layer_id, None
+                    )
+                next_count = max(
+                    0,
+                    int(
+                        self._per_layer_arena_overwrite_pending_bit_counts.get(
+                            layer_id, 0
+                        )
+                    )
+                    - int(removed),
+                )
+                if next_count:
+                    self._per_layer_arena_overwrite_pending_bit_counts[layer_id] = (
+                        next_count
+                    )
+                else:
+                    self._per_layer_arena_overwrite_pending_bit_counts.pop(
+                        layer_id, None
+                    )
+        return locs
+
+    def _consume_per_layer_overwrite_locs(self, layer_id: int, locs: List[int]) -> bool:
+        if not locs:
+            return True
+        layer_id = int(layer_id)
+        loc_bits = self._locs_to_bitset(locs, min_value=1)
+        pending_bits = int(
+            self._per_layer_arena_overwrite_pending_bits.get(layer_id, 0)
+        )
+        pending_bits |= self._per_layer_pending_overwrite_bits_union(layer_id)
+        pending_match = pending_bits & loc_bits
+        remaining_bits = loc_bits & ~pending_match
+        if loc_bits > 0 and remaining_bits == 0:
+            self._remove_per_layer_pending_overwrite_bits(
+                layer_id, pending_match, token_count=len(locs)
+            )
+            return True
+        bitmap = self._per_layer_arena_overwrite_bitmaps.get(layer_id)
+        if bitmap is None or bitmap.numel() == 0 or remaining_bits <= 0:
+            return False
+        remaining_locs = self._bitset_to_locs(remaining_bits)
+        loc_tensor = torch.as_tensor(remaining_locs, dtype=torch.int64, device="cpu")
+        if loc_tensor.numel() == 0 or bool(torch.any(loc_tensor <= 0).item()):
+            return False
+        loc_tensor = torch.unique(loc_tensor)
+        if int(loc_tensor.max().item()) >= int(bitmap.numel()):
+            return False
+        if not bool(torch.all(bitmap.index_select(0, loc_tensor)).item()):
+            return False
+        if pending_match:
+            self._remove_per_layer_pending_overwrite_bits(layer_id, pending_match)
+        bitmap.index_fill_(0, loc_tensor, False)
+        self._per_layer_arena_overwrite_counts[layer_id] = max(
+            0,
+            int(self._per_layer_arena_overwrite_counts.get(layer_id, 0))
+            - int(loc_tensor.numel()),
+        )
+        return True
+
+    def _clear_per_layer_physical_mapping(self, layer_id: int, locs: Set[int]) -> None:
+        if not locs:
+            return
+        layer_id = int(layer_id)
+        reverse = self._per_layer_physical_to_canonical.setdefault(layer_id, {})
+        mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
+        for loc in locs:
+            canonical = reverse.pop(int(loc), None)
+            if canonical is not None and int(mapping.get(int(canonical), -1)) == int(
+                loc
+            ):
+                mapping.pop(int(canonical), None)
+        if not any(int(k) != int(v) for k, v in mapping.items()):
+            self._per_layer_non_identity_mapping.discard(layer_id)
+
+    def _pop_common_per_layer_overwrite_locs(self, count: int) -> List[int]:
+        count = max(0, int(count))
+        if count <= 0:
+            return []
+        layer_ids = [int(layer_id) for layer_id in self._kvc_layer_ids()]
+        if not layer_ids:
+            return []
+        common: Optional[Set[int]] = None
+        for layer_id in layer_ids:
+            bitmap = self._per_layer_arena_overwrite_bitmaps.get(layer_id)
+            locs: Set[int] = set()
+            if bitmap is not None and int(bitmap.numel()) > 0:
+                loc_tensor = torch.nonzero(bitmap, as_tuple=False).flatten()
+                if int(loc_tensor.numel()) > 0:
+                    locs.update(int(loc) for loc in loc_tensor.tolist() if int(loc) > 0)
+            pending_bits = self._per_layer_pending_overwrite_bits_union(layer_id)
+            if pending_bits > 0:
+                locs.update(self._bitset_to_locs(pending_bits))
+            if not locs:
+                return []
+            common = locs if common is None else common.intersection(locs)
+            if not common:
+                return []
+        selected = sorted(common or set())[:count]
+        if not selected:
+            return []
+        loc_tensor = torch.as_tensor(selected, dtype=torch.int64, device="cpu")
+        loc_set = set(selected)
+        for layer_id in layer_ids:
+            bitmap = self._per_layer_arena_overwrite_bitmaps.get(layer_id)
+            if bitmap is not None and int(bitmap.numel()) > 0:
+                bitmap.index_fill_(0, loc_tensor, False)
+            self._per_layer_arena_overwrite_counts[layer_id] = max(
+                0,
+                int(self._per_layer_arena_overwrite_counts.get(layer_id, 0))
+                - len(selected),
+            )
+            self._remove_per_layer_pending_overwrite_bits(
+                layer_id,
+                self._locs_to_bitset(selected, min_value=1),
+                token_count=len(selected),
+            )
+            self._per_layer_arena_allocated_locs.setdefault(
+                layer_id, set()
+            ).difference_update(loc_set)
+            self._per_layer_arena_protected_locs.setdefault(
+                layer_id, set()
+            ).difference_update(loc_set)
+            free = self._per_layer_arena_free_locs.setdefault(layer_id, [])
+            self._per_layer_arena_free_locs[layer_id] = [
+                int(loc) for loc in free if int(loc) not in loc_set
+            ]
+            self._clear_per_layer_physical_mapping(layer_id, loc_set)
+        self._per_layer_arena_common_free_locs.difference_update(loc_set)
+        self._per_layer_arena_common_free_order = [
+            int(loc)
+            for loc in self._per_layer_arena_common_free_order
+            if int(loc) not in loc_set
+        ]
+        self._per_layer_arena_reserved_locs.difference_update(loc_set)
+        self._refresh_per_layer_allocator_stats()
+        return selected
+
+    def _release_common_per_layer_locs_to_native(self, count: int) -> int:
+        if self.config.kvc_backend != "per-layer-arena":
+            return 0
+        count = max(0, int(count))
+        if count <= 0 or self._allocator is None:
+            return 0
+        layer_ids = [int(layer_id) for layer_id in self._kvc_layer_ids()]
+        if not layer_ids:
+            return 0
+        selected: List[int] = []
+        self._ensure_per_layer_common_free_current()
+        while self._per_layer_arena_common_free_order and len(selected) < count:
+            loc = int(self._per_layer_arena_common_free_order.pop(0))
+            if loc <= 0 or loc not in self._per_layer_arena_common_free_locs:
+                continue
+            if any(
+                self._per_layer_loc_is_protected(layer_id, loc)
+                for layer_id in layer_ids
+            ):
+                continue
+            if any(
+                loc in self._per_layer_arena_allocated_locs.setdefault(layer_id, set())
+                for layer_id in layer_ids
+            ):
+                continue
+            selected.append(loc)
+        remaining = count - len(selected)
+        if remaining > 0:
+            selected.extend(self._pop_common_per_layer_overwrite_locs(remaining))
+        if not selected:
+            return 0
+        loc_set = {int(loc) for loc in selected}
+        for layer_id in layer_ids:
+            free = self._per_layer_arena_free_locs.setdefault(layer_id, [])
+            self._per_layer_arena_free_locs[layer_id] = [
+                int(loc) for loc in free if int(loc) not in loc_set
+            ]
+            self._per_layer_arena_allocated_locs.setdefault(
+                layer_id, set()
+            ).difference_update(loc_set)
+            self._per_layer_arena_protected_locs.setdefault(
+                layer_id, set()
+            ).difference_update(loc_set)
+            self._clear_per_layer_physical_mapping(layer_id, loc_set)
+        self._per_layer_arena_common_free_locs.difference_update(loc_set)
+        self._per_layer_arena_common_free_order = [
+            int(loc)
+            for loc in self._per_layer_arena_common_free_order
+            if int(loc) not in loc_set
+        ]
+        self._per_layer_arena_reserved_locs.difference_update(loc_set)
+        free_fn = self._wrapped_methods.get("allocator.free") or getattr(
+            self._allocator, "free", None
+        )
+        if free_fn is None:
+            return 0
+        loc_tensor = torch.as_tensor(
+            sorted(loc_set), dtype=torch.int64, device=self._allocator.device
+        )
+        free_fn(loc_tensor)
+        self._refresh_per_layer_allocator_stats()
+        return len(loc_set)
+
+    def _prewarm_per_layer_overwrite_bitmaps(self) -> int:
+        if self.config.kvc_backend != "per-layer-arena":
+            return 0
+        allocator_size = max(0, int(self._allocator_total_size()))
+        if allocator_size <= 0:
+            return 0
+        warmed = 0
+        for layer_id in self._kvc_layer_ids():
+            layer_id = int(layer_id)
+            bitmap = self._per_layer_arena_overwrite_bitmaps.get(layer_id)
+            if bitmap is not None and int(bitmap.numel()) >= allocator_size + 1:
+                continue
+            self._ensure_per_layer_overwrite_bitmap(layer_id, allocator_size + 1)
+            warmed += 1
+        return warmed
+
+    def _ensure_per_layer_overwrite_bitmap(
+        self, layer_id: int, min_size: int
+    ) -> torch.Tensor:
+        layer_id = int(layer_id)
+        min_size = max(1, int(min_size))
+        bitmap = self._per_layer_arena_overwrite_bitmaps.get(layer_id)
+        if bitmap is not None and int(bitmap.numel()) >= min_size:
+            return bitmap
+        allocator_size = max(0, int(self._allocator_total_size()))
+        target_size = max(min_size, allocator_size + 1)
+        if bitmap is not None:
+            target_size = max(target_size, int(bitmap.numel()) * 2)
+        new_bitmap = torch.zeros(int(target_size), dtype=torch.bool, device="cpu")
+        if bitmap is not None and int(bitmap.numel()) > 0:
+            new_bitmap[: int(bitmap.numel())].copy_(bitmap)
+        self._per_layer_arena_overwrite_bitmaps[layer_id] = new_bitmap
+        return new_bitmap
 
     def _mark_req_layerkv_owned(
         self, req_idx: int, keys: List[Tuple[int, int, int]]
     ) -> None:
         req_idx = int(req_idx)
         self._per_layer_owned_req_indices.add(req_idx)
-        by_req = self._per_layer_owned_keys_by_req.setdefault(req_idx, set())
-        by_req.update((int(a), int(b), int(c)) for a, b, c in keys)
+        normalized_keys = [(int(a), int(b), int(c)) for a, b, c in keys]
+        for key in normalized_keys:
+            entry = self._per_layer_residency.get(key)
+            if entry is not None:
+                self._track_per_layer_cleanup_entry(entry, key=key)
+        if (
+            req_idx not in self._per_layer_cleanup_state_by_req
+            and req_idx not in self._per_layer_cleanup_layers_by_req
+        ):
+            self._per_layer_owned_keys_by_req.setdefault(req_idx, set()).update(
+                normalized_keys
+            )
         self.stats.kvc_per_layer_logical_request_count = len(
             self._per_layer_owned_req_indices
         )
+
+    def _track_per_layer_cleanup_entry(
+        self,
+        entry: _LayerKVResidencyEntry,
+        *,
+        key: Optional[Tuple[int, int, int]] = None,
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        if entry is None or not self._per_layer_entry_is_current(entry):
+            return
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        if key is None:
+            key = (layer_id, req_idx, int(entry.pos))
+        else:
+            key = (int(key[0]), int(key[1]), int(key[2]))
+        state = self._per_layer_cleanup_state_by_req.setdefault(
+            req_idx, _LayerKVPerLayerReqCleanupState()
+        )
+        tracked = state.tracked_keys
+        new_key = key not in tracked
+        if key not in tracked:
+            tracked.add(key)
+            state.token_count = int(state.token_count) + int(entry.token_count)
+        state.layers.add(layer_id)
+        if new_key:
+            locs = entry.device_loc_list()
+            if locs:
+                self._add_per_layer_cleanup_locs(entry, locs)
+            host_slots = entry.host_slot_list()
+            if host_slots:
+                self._add_per_layer_cleanup_host_slots(entry, host_slots)
+
+    def _add_per_layer_cleanup_locs(
+        self, entry: _LayerKVResidencyEntry, locs: List[int]
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena" or not locs:
+            return
+        if entry is None or not self._per_layer_entry_is_current(entry):
+            return
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        state = self._per_layer_cleanup_state_by_req.setdefault(
+            req_idx, _LayerKVPerLayerReqCleanupState()
+        )
+        state.layers.add(layer_id)
+        current = int(state.loc_bits_by_layer.get(layer_id, 0))
+        add_bits = self._locs_to_bitset(locs, min_value=1)
+        new_bits = int(add_bits & ~current)
+        state.loc_bits_by_layer[layer_id] = int(current | add_bits)
+        if new_bits:
+            state.loc_counts_by_layer[layer_id] = int(
+                state.loc_counts_by_layer.get(layer_id, 0)
+            ) + int(new_bits.bit_count())
+
+    def _remove_per_layer_cleanup_locs(
+        self, entry: _LayerKVResidencyEntry, locs: List[int]
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena" or not locs:
+            return
+        if entry is None:
+            return
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        state = self._per_layer_cleanup_state_by_req.get(req_idx)
+        if state is None:
+            key = (req_idx, layer_id)
+            loc_bits = int(self._per_layer_cleanup_locs_by_req_layer.get(key, 0))
+        else:
+            loc_bits = int(state.loc_bits_by_layer.get(layer_id, 0))
+        if loc_bits <= 0:
+            return
+        remove_bits = self._locs_to_bitset(locs, min_value=1)
+        removed_bits = int(loc_bits & remove_bits)
+        if removed_bits <= 0:
+            return
+        loc_bits &= ~remove_bits
+        if state is None:
+            key = (req_idx, layer_id)
+            if loc_bits:
+                self._per_layer_cleanup_locs_by_req_layer[key] = loc_bits
+            else:
+                self._per_layer_cleanup_locs_by_req_layer.pop(key, None)
+            current_count = int(
+                self._per_layer_cleanup_loc_count_by_req_layer.get(key, 0)
+            )
+        else:
+            if loc_bits:
+                state.loc_bits_by_layer[layer_id] = loc_bits
+            else:
+                state.loc_bits_by_layer.pop(layer_id, None)
+            current_count = int(state.loc_counts_by_layer.get(layer_id, 0))
+        next_count = max(0, current_count - int(removed_bits.bit_count()))
+        if state is None:
+            key = (req_idx, layer_id)
+            if next_count:
+                self._per_layer_cleanup_loc_count_by_req_layer[key] = next_count
+            else:
+                self._per_layer_cleanup_loc_count_by_req_layer.pop(key, None)
+        else:
+            if next_count:
+                state.loc_counts_by_layer[layer_id] = next_count
+            else:
+                state.loc_counts_by_layer.pop(layer_id, None)
+
+    def _add_per_layer_cleanup_host_slots(
+        self, entry: _LayerKVResidencyEntry, host_slots: List[int]
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena" or not host_slots:
+            return
+        if entry is None or not self._per_layer_entry_is_current(entry):
+            return
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        state = self._per_layer_cleanup_state_by_req.setdefault(
+            req_idx, _LayerKVPerLayerReqCleanupState()
+        )
+        state.layers.add(layer_id)
+        current = int(state.host_slot_bits_by_layer.get(layer_id, 0))
+        add_bits = self._locs_to_bitset(host_slots, min_value=0)
+        new_bits = int(add_bits & ~current)
+        state.host_slot_bits_by_layer[layer_id] = int(current | add_bits)
+        if new_bits:
+            state.host_slot_counts_by_layer[layer_id] = int(
+                state.host_slot_counts_by_layer.get(layer_id, 0)
+            ) + int(new_bits.bit_count())
+
+    def _remove_per_layer_cleanup_host_slots(
+        self, entry: _LayerKVResidencyEntry, host_slots: List[int]
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena" or not host_slots:
+            return
+        if entry is None:
+            return
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        state = self._per_layer_cleanup_state_by_req.get(req_idx)
+        if state is None:
+            key = (req_idx, layer_id)
+            slot_bits = int(self._per_layer_cleanup_host_slots_by_req_layer.get(key, 0))
+        else:
+            slot_bits = int(state.host_slot_bits_by_layer.get(layer_id, 0))
+        if slot_bits <= 0:
+            return
+        remove_bits = self._locs_to_bitset(host_slots, min_value=0)
+        removed_bits = int(slot_bits & remove_bits)
+        if removed_bits <= 0:
+            return
+        slot_bits &= ~remove_bits
+        if state is None:
+            key = (req_idx, layer_id)
+            if slot_bits:
+                self._per_layer_cleanup_host_slots_by_req_layer[key] = slot_bits
+            else:
+                self._per_layer_cleanup_host_slots_by_req_layer.pop(key, None)
+            current_count = int(
+                self._per_layer_cleanup_host_slot_count_by_req_layer.get(key, 0)
+            )
+        else:
+            if slot_bits:
+                state.host_slot_bits_by_layer[layer_id] = slot_bits
+            else:
+                state.host_slot_bits_by_layer.pop(layer_id, None)
+            current_count = int(state.host_slot_counts_by_layer.get(layer_id, 0))
+        next_count = max(0, current_count - int(removed_bits.bit_count()))
+        if state is None:
+            key = (req_idx, layer_id)
+            if next_count:
+                self._per_layer_cleanup_host_slot_count_by_req_layer[key] = next_count
+            else:
+                self._per_layer_cleanup_host_slot_count_by_req_layer.pop(key, None)
+        else:
+            if next_count:
+                state.host_slot_counts_by_layer[layer_id] = next_count
+            else:
+                state.host_slot_counts_by_layer.pop(layer_id, None)
 
     def _record_per_layer_mapping(
         self, layer_id: int, canonical: int, physical: int
@@ -563,15 +1213,21 @@ class LayerKVKvcAllocatorMixin:
         layer_id = int(layer_id)
         canonical = int(canonical)
         physical = int(physical)
-        self._per_layer_canonical_to_physical.setdefault(layer_id, {})[
-            canonical
-        ] = physical
+        mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
+        reverse = self._per_layer_physical_to_canonical.setdefault(layer_id, {})
+        previous_physical = mapping.get(canonical)
+        if previous_physical is not None and int(previous_physical) != physical:
+            if int(reverse.get(int(previous_physical), -1)) == canonical:
+                reverse.pop(int(previous_physical), None)
+        previous_canonical = reverse.get(physical)
+        if previous_canonical is not None and int(previous_canonical) != canonical:
+            mapping.pop(int(previous_canonical), None)
+        mapping[canonical] = physical
+        reverse[physical] = canonical
         if canonical != physical:
             self._per_layer_non_identity_mapping.add(layer_id)
 
-    def _translate_per_layer_locs(
-        self, layer_id: int, loc: Any
-    ) -> Any:
+    def _translate_per_layer_locs(self, layer_id: int, loc: Any) -> Any:
         if self.config.kvc_backend != "per-layer-arena":
             return loc
         if int(layer_id) not in self._per_layer_non_identity_mapping:
@@ -585,6 +1241,23 @@ class LayerKVKvcAllocatorMixin:
             loc_list = [int(x) for x in loc.detach().cpu().tolist()]
         except Exception:
             return loc
+        loc_set = set(loc_list)
+        reverse = self._per_layer_physical_to_canonical.setdefault(int(layer_id), {})
+        stale_canonicals: List[int] = []
+        for physical in loc_set:
+            canonical = reverse.get(int(physical))
+            if (
+                canonical is not None
+                and int(canonical) != int(physical)
+                and int(canonical) in loc_set
+            ):
+                stale_canonicals.append(int(canonical))
+        for canonical in stale_canonicals:
+            physical = mapping.pop(int(canonical), None)
+            if physical is not None and int(reverse.get(int(physical), -1)) == int(
+                canonical
+            ):
+                reverse.pop(int(physical), None)
         translated = [int(mapping.get(int(x), int(x))) for x in loc_list]
         size = int(getattr(self._kv_pool, "size", 0) or 0)
         if size > 0 and any(x <= 0 or x > size for x in translated):
@@ -593,9 +1266,19 @@ class LayerKVKvcAllocatorMixin:
                 f"size={size} locs={translated[:8]}"
             )
         if len(set(translated)) != len(translated):
+            duplicate_details: Dict[int, List[int]] = {}
+            for original, physical in zip(loc_list, translated):
+                bucket = duplicate_details.setdefault(int(physical), [])
+                if len(bucket) < 8:
+                    bucket.append(int(original))
+            duplicate_details = {
+                physical: originals
+                for physical, originals in duplicate_details.items()
+                if len(originals) > 1
+            }
             raise RuntimeError(
                 f"LayerKV translated KV locs contain duplicates for layer {layer_id}: "
-                f"locs={translated[:16]}"
+                f"locs={translated[:16]} duplicate_details={duplicate_details}"
             )
         if translated == loc_list:
             return loc
@@ -604,6 +1287,18 @@ class LayerKVKvcAllocatorMixin:
     def _wrap_set_kv_buffer(self, orig: Callable) -> Callable:
         @functools.wraps(orig)
         def wrapped(layer: Any, loc: Any, cache_k: Any, cache_v: Any, *args, **kwargs):
+            if not self._per_layer_kvc_io_control_active():
+                ret = orig(layer, loc, cache_k, cache_v, *args, **kwargs)
+                self.stats.kvc_set_kv_count += 1
+                try:
+                    self.stats.kvc_tokens_written += int(loc.numel())
+                except Exception:
+                    pass
+                try:
+                    self.stats.kvc_bytes_written += int(cache_k.nbytes + cache_v.nbytes)
+                except Exception:
+                    pass
+                return ret
             t0 = time.perf_counter()
             try:
                 layer_id = int(getattr(layer, "layer_id"))
@@ -633,6 +1328,8 @@ class LayerKVKvcAllocatorMixin:
         @functools.wraps(orig)
         def wrapped(layer_id: int, *args, **kwargs):
             self.stats.kvc_get_key_count += 1
+            if not self._per_layer_kvc_io_control_active():
+                return orig(layer_id, *args, **kwargs)
             self._prepare_per_layer_kvc_attention(layer_id)
             self._wait_for_kvc_layer_ready(layer_id)
             return orig(layer_id, *args, **kwargs)
@@ -643,6 +1340,8 @@ class LayerKVKvcAllocatorMixin:
         @functools.wraps(orig)
         def wrapped(layer_id: int, *args, **kwargs):
             self.stats.kvc_get_value_count += 1
+            if not self._per_layer_kvc_io_control_active():
+                return orig(layer_id, *args, **kwargs)
             self._prepare_per_layer_kvc_attention(layer_id)
             self._wait_for_kvc_layer_ready(layer_id)
             return orig(layer_id, *args, **kwargs)
@@ -653,6 +1352,8 @@ class LayerKVKvcAllocatorMixin:
         @functools.wraps(orig)
         def wrapped(layer_id: int, *args, **kwargs):
             self.stats.kvc_get_kv_count += 1
+            if not self._per_layer_kvc_io_control_active():
+                return orig(layer_id, *args, **kwargs)
             self._prepare_per_layer_kvc_attention(layer_id)
             self._wait_for_kvc_layer_ready(layer_id)
             return orig(layer_id, *args, **kwargs)

@@ -583,6 +583,48 @@ void transfer_kv_all_layer_direct_lf_pf(
     const at::Tensor& dst_indices,
     int64_t page_size);
 
+void layerkv_copy_kv_span_scatter(
+    const at::Tensor& src_k,
+    const at::Tensor& src_v,
+    at::Tensor dst_k,
+    at::Tensor dst_v,
+    const at::Tensor& spans,
+    int64_t src_base_slot,
+    int64_t dst_base_slot,
+    int64_t item_size,
+    int64_t num_warps_per_block);
+
+void layerkv_copy_kv_span_scatter_batched(
+    const std::vector<at::Tensor>& src_ks,
+    const std::vector<at::Tensor>& src_vs,
+    std::vector<at::Tensor> dst_ks,
+    std::vector<at::Tensor> dst_vs,
+    const at::Tensor& spans,
+    const at::Tensor& span_batch_ids,
+    const at::Tensor& src_base_slots,
+    const at::Tensor& dst_base_slots,
+    int64_t item_size,
+    int64_t num_warps_per_block);
+
+void layerkv_copy_kv_contiguous_batched(
+    const std::vector<at::Tensor>& src_ks,
+    const std::vector<at::Tensor>& src_vs,
+    std::vector<at::Tensor> dst_ks,
+    std::vector<at::Tensor> dst_vs,
+    const at::Tensor& src_base_slots,
+    const at::Tensor& dst_base_slots,
+    const at::Tensor& token_counts,
+    int64_t item_size);
+
+void layerkv_copy_kv_span_backup_batched(
+    const std::vector<at::Tensor>& src_ks,
+    const std::vector<at::Tensor>& src_vs,
+    std::vector<at::Tensor> dst_ks,
+    std::vector<at::Tensor> dst_vs,
+    const at::Tensor& spans,
+    const at::Tensor& span_batch_ids,
+    int64_t item_size);
+
 /*
  * From csrc/memory
  */

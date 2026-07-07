@@ -24,6 +24,7 @@ class _LayerKVResidencyEntry:
     ready_event: Optional[Any] = None
     ready_waited: bool = False
     last_access_step: int = 0
+    generation: int = 0
 
     @property
     def token_count(self) -> int:
@@ -45,6 +46,17 @@ class _LayerKVResidencyEntry:
         if self.host_slot is None:
             return []
         return [int(self.host_slot)]
+
+
+@dataclasses.dataclass
+class _LayerKVPerLayerReqCleanupState:
+    layers: Set[int] = dataclasses.field(default_factory=set)
+    loc_bits_by_layer: Dict[int, int] = dataclasses.field(default_factory=dict)
+    loc_counts_by_layer: Dict[int, int] = dataclasses.field(default_factory=dict)
+    host_slot_bits_by_layer: Dict[int, int] = dataclasses.field(default_factory=dict)
+    host_slot_counts_by_layer: Dict[int, int] = dataclasses.field(default_factory=dict)
+    tracked_keys: Set[Tuple[int, int, int]] = dataclasses.field(default_factory=set)
+    token_count: int = 0
 
 
 @dataclasses.dataclass
@@ -166,6 +178,7 @@ class _LayerKVVirtualScratchCacheEntry:
     scratch_locs: torch.Tensor
     buffer_idx: int
     last_step: int
+    buffer_generation: int = 0
 
 
 @dataclasses.dataclass
@@ -179,6 +192,8 @@ class _LayerKVPendingVirtualMaterialize:
     positions: Tuple[int, ...]
     token_count: int
     buffer_idx: int
+    buffer_generation: int = 0
+    event_group_id: int = 0
     waited_on_main_stream: bool = False
 
 

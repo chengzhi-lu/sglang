@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -46,6 +47,16 @@ class LayerKVKvcVirtualMixin:
     def _prepare_per_layer_kvc_attention(self, layer_id: int) -> None:
         if not self._uses_per_layer_attention_override():
             return
+        layer_id = int(layer_id)
+        if (
+            self.config.kvc_backend == "per-layer-arena"
+            and self._pending_kvc_evict_events
+        ):
+            finalize_key = (int(self._decode_step), layer_id)
+            if finalize_key not in self._per_layer_kvc_evict_finalized_before_layers:
+                self._per_layer_kvc_evict_finalized_before_layers.add(finalize_key)
+                with self._profile("profile_kvc_layer_evict_finalize_ms"):
+                    self._finalize_kvc_evictions_before_layer(layer_id, block=False)
         if self.config.kvc_backend == "virtual-arena":
             self._prepare_virtual_kvc_attention(layer_id)
             return
@@ -59,7 +70,6 @@ class LayerKVKvcVirtualMixin:
             return
         if self._last_forward_batch is None or self._runner is None:
             return
-        layer_id = int(layer_id)
         key = (int(self._decode_step), layer_id)
         if key in self._per_layer_kvc_prepared_layers:
             self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
@@ -146,7 +156,9 @@ class LayerKVKvcVirtualMixin:
                         self._last_forward_batch, selected_entries=selected
                     )
 
-    def _prepare_virtual_kvc_attention(self, layer_id: int, *, guard: bool = True) -> None:
+    def _prepare_virtual_kvc_attention(
+        self, layer_id: int, *, guard: bool = True
+    ) -> None:
         if not self._residency and not (
             self.config.kvc_backend == "per-layer-arena" and self._per_layer_residency
         ):
@@ -208,7 +220,12 @@ class LayerKVKvcVirtualMixin:
                 if scratch_locs is None:
                     return
                 buffer_idx = int(pending.buffer_idx)
-                self._store_virtual_scratch_cache(demand, scratch_locs, buffer_idx)
+                self._store_virtual_scratch_cache(
+                    demand,
+                    scratch_locs,
+                    buffer_idx,
+                    buffer_generation=int(pending.buffer_generation),
+                )
             else:
                 buffer_idx = self._choose_virtual_scratch_buffer(
                     demand.token_count, exclude_buffer_idx=None
@@ -242,29 +259,32 @@ class LayerKVKvcVirtualMixin:
         self, demand: _LayerKVKvcDemand, *, record_stats: bool = True
     ) -> Optional[_LayerKVVirtualScratchCacheEntry]:
         entry = self._virtual_scratch_cache_by_layer.get(int(demand.layer_id))
+        generation_mismatch = False
+        if entry is not None:
+            generation_mismatch = int(entry.buffer_generation) != int(
+                self._virtual_scratch_generation(
+                    int(entry.buffer_idx), layer_id=int(demand.layer_id)
+                )
+            )
         if (
             entry is None
-            or (
-                self.config.kvc_backend == "per-layer-arena"
-                and int(entry.last_step) != int(self._decode_step)
-            )
+            or generation_mismatch
             or int(entry.token_count) != int(demand.token_count)
             or (
                 entry.host_signature != demand.host_signature
                 if demand.host_signature != (0, 0, 0, 0)
                 else entry.host_slots != demand.host_slots
             )
-            or (
-                demand.host_slice[0] >= 0
-                and entry.host_slice != demand.host_slice
-            )
+            or (demand.host_slice[0] >= 0 and entry.host_slice != demand.host_slice)
             or (
                 demand.host_slots == ()
                 and demand.host_slice[0] < 0
                 and demand.host_index_cpu is not None
                 and (
                     entry.host_index_cpu is None
-                    or not bool(torch.equal(entry.host_index_cpu, demand.host_index_cpu))
+                    or not bool(
+                        torch.equal(entry.host_index_cpu, demand.host_index_cpu)
+                    )
                 )
             )
             or entry.scratch_locs is None
@@ -272,6 +292,8 @@ class LayerKVKvcVirtualMixin:
         ):
             if record_stats:
                 self.stats.virtual_kvc_persistent_cache_miss_count += 1
+                if generation_mismatch:
+                    self.stats.virtual_kvc_scratch_generation_miss_count += 1
             return None
         if record_stats:
             self.stats.virtual_kvc_persistent_cache_hit_count += 1
@@ -283,6 +305,7 @@ class LayerKVKvcVirtualMixin:
         demand: _LayerKVKvcDemand,
         scratch_locs: torch.Tensor,
         buffer_idx: int,
+        buffer_generation: Optional[int] = None,
     ) -> None:
         previous = self._virtual_scratch_cache_by_layer.get(int(demand.layer_id))
         previous_same = False
@@ -292,10 +315,7 @@ class LayerKVKvcVirtualMixin:
                 if demand.host_signature != (0, 0, 0, 0)
                 else previous.host_slots == demand.host_slots
             )
-            if (
-                previous_same
-                and demand.host_slice[0] >= 0
-            ):
+            if previous_same and demand.host_slice[0] >= 0:
                 previous_same = previous.host_slice == demand.host_slice
             if (
                 previous_same
@@ -319,6 +339,13 @@ class LayerKVKvcVirtualMixin:
                 scratch_locs=scratch_locs,
                 buffer_idx=int(buffer_idx),
                 last_step=int(self._decode_step),
+                buffer_generation=(
+                    int(buffer_generation)
+                    if buffer_generation is not None
+                    else self._virtual_scratch_generation(
+                        int(buffer_idx), layer_id=int(demand.layer_id)
+                    )
+                ),
             )
         )
         self.stats.virtual_kvc_persistent_cache_store_count += 1
@@ -334,8 +361,11 @@ class LayerKVKvcVirtualMixin:
                 self._virtual_scratch_cache_by_layer
             )
             self._virtual_scratch_cache_by_layer.clear()
+        self._virtual_scratch_buffer_generations_by_layer.clear()
+        self._virtual_materialize_recorded_event_groups.clear()
         self._virtual_materialize_plan = None
         self._virtual_materialize_plans_by_layer.clear()
+        self._virtual_materialize_plan_reuse_cache.clear()
         self._virtual_kvc_demands.clear()
         self._metadata_patch_cache.clear()
         self._metadata_patch_tensor_cache.clear()
@@ -349,7 +379,13 @@ class LayerKVKvcVirtualMixin:
             return
         for layer_id in {int(layer_id) for layer_id in layer_ids}:
             self._invalidate_virtual_layer_cache(layer_id)
+            for key in list(self._virtual_scratch_buffer_generations_by_layer):
+                if int(key[0]) == layer_id:
+                    self._virtual_scratch_buffer_generations_by_layer.pop(key, None)
             self._virtual_materialize_plans_by_layer.pop(layer_id, None)
+            for key in list(self._virtual_materialize_plan_reuse_cache):
+                if key and int(key[0]) == layer_id:
+                    self._virtual_materialize_plan_reuse_cache.pop(key, None)
             for key in list(self._virtual_kvc_demands):
                 if int(key[1]) == layer_id:
                     self._virtual_kvc_demands.pop(key, None)
@@ -515,6 +551,7 @@ class LayerKVKvcVirtualMixin:
             return None
         target_layer = None if layer_id is None else int(layer_id)
         direct_kv_indices_only = target_layer is not None
+        metadata_kind = self._virtual_metadata_kind() if direct_kv_indices_only else ""
         with self._profile("profile_virtual_select_ms"):
             (
                 batch_req_lens,
@@ -522,7 +559,10 @@ class LayerKVKvcVirtualMixin:
                 row_by_req,
                 flat_base_by_req,
             ) = self._virtual_batch_index_context()
-            if self.config.kvc_backend == "per-layer-arena" and target_layer is not None:
+            if (
+                self.config.kvc_backend == "per-layer-arena"
+                and target_layer is not None
+            ):
                 selected = self._select_offloaded_run_entries_for_virtual_layer(
                     int(target_layer), active_lens
                 )
@@ -569,9 +609,72 @@ class LayerKVKvcVirtualMixin:
                 max_flat_index=-1,
                 token_count=0,
             )
-        with self._profile("profile_virtual_index_build_ms"):
+        token_count = sum(int(entry.token_count) for entry in selected)
+        host_ordered_plan = False
+        plan_cache_key = None
+        if direct_kv_indices_only:
+            with self._profile("profile_virtual_plan_cache_lookup_ms"):
+                t0 = time.perf_counter()
+                selected.sort(key=lambda entry: (entry.req_idx, entry.pos))
+                self._add_profile(
+                    "profile_virtual_plan_sort_ms",
+                    (time.perf_counter() - t0) * 1000.0,
+                )
+                t0 = time.perf_counter()
+                host_ordered = self._host_ordered_virtual_entries(
+                    selected, token_count=token_count
+                )
+                self._add_profile(
+                    "profile_virtual_host_order_ms",
+                    (time.perf_counter() - t0) * 1000.0,
+                )
+                if host_ordered is not None:
+                    selected = host_ordered
+                    host_ordered_plan = True
+                t0 = time.perf_counter()
+                plan_cache_key = self._virtual_materialize_plan_cache_key(
+                    int(target_layer),
+                    selected,
+                    row_by_req,
+                    flat_base_by_req,
+                    metadata_kind,
+                    token_count=token_count,
+                )
+                self._add_profile(
+                    "profile_virtual_plan_key_ms",
+                    (time.perf_counter() - t0) * 1000.0,
+                )
+                t0 = time.perf_counter()
+                cached_plan = self._virtual_materialize_plan_reuse_cache.get(
+                    plan_cache_key
+                )
+                self._add_profile(
+                    "profile_virtual_plan_lookup_only_ms",
+                    (time.perf_counter() - t0) * 1000.0,
+                )
+            if cached_plan is not None:
+                self.stats.virtual_kvc_plan_cache_hit_count += 1
+                self.stats.virtual_kvc_plan_cache_reuse_token_count += int(
+                    cached_plan.token_count
+                )
+                return dataclasses.replace(
+                    cached_plan,
+                    step=int(self._decode_step),
+                    selected=selected,
+                )
+            self.stats.virtual_kvc_plan_cache_miss_count += 1
+        else:
             selected.sort(key=lambda entry: (entry.req_idx, entry.pos))
-            token_count = sum(entry.token_count for entry in selected)
+        with self._profile("profile_virtual_index_build_ms"):
+            if host_ordered_plan:
+                self.stats.virtual_kvc_host_order_plan_count += 1
+                self.stats.virtual_kvc_host_order_plan_token_count += int(token_count)
+            build_flat_layout = (
+                not direct_kv_indices_only or metadata_kind != "page_table"
+            )
+            build_row_layout = (
+                not direct_kv_indices_only or metadata_kind != "kv_indices"
+            )
             req_indices: List[int] = []
             positions: List[int] = []
             row_indices: List[int] = []
@@ -594,24 +697,26 @@ class LayerKVKvcVirtualMixin:
                 row = int(row_by_req[req_idx])
                 if direct_kv_indices_only:
                     run_len = int(token_count_for_entry)
-                    flat_start = base + pos_start
-                    if span_len > 0 and flat_start == span_start + span_len:
-                        span_len += run_len
-                    else:
-                        if span_len > 0:
-                            flat_spans.append(
-                                (span_start, span_scratch_start, span_len)
-                            )
-                        span_start = int(flat_start)
-                        span_scratch_start = int(scratch_offset)
-                        span_len = int(run_len)
+                    if build_flat_layout:
+                        flat_start = base + pos_start
+                        if span_len > 0 and flat_start == span_start + span_len:
+                            span_len += run_len
+                        else:
+                            if span_len > 0:
+                                flat_spans.append(
+                                    (span_start, span_scratch_start, span_len)
+                                )
+                            span_start = int(flat_start)
+                            span_scratch_start = int(scratch_offset)
+                            span_len = int(run_len)
                     if (
-                        row_span_len > 0
+                        build_row_layout
+                        and row_span_len > 0
                         and row == row_span_row
                         and pos_start == row_span_start + row_span_len
                     ):
                         row_span_len += run_len
-                    else:
+                    elif build_row_layout:
                         if row_span_len > 0:
                             row_spans.append(
                                 (
@@ -632,7 +737,9 @@ class LayerKVKvcVirtualMixin:
                     flat_indices.append(flat_index)
                 if not direct_kv_indices_only:
                     req_indices.extend([req_idx] * token_count_for_entry)
-                    positions.extend(range(pos_start, pos_start + token_count_for_entry))
+                    positions.extend(
+                        range(pos_start, pos_start + token_count_for_entry)
+                    )
                     row_indices.extend([row] * token_count_for_entry)
             if direct_kv_indices_only and span_len > 0:
                 flat_spans.append((span_start, span_scratch_start, span_len))
@@ -645,43 +752,62 @@ class LayerKVKvcVirtualMixin:
                         row_span_len,
                     )
                 )
-            host_slots: List[int] = []
-            for entry in selected:
-                if entry.host_slots is not None:
-                    host_slots.extend(entry.host_slots)
-                elif entry.host_slot is not None:
-                    host_slots.append(int(entry.host_slot))
-            host_signature = self._host_slot_signature(host_slots)
-            host_slice = self._contiguous_host_slice(host_slots)
-            host_spans = (
-                ()
-                if host_slice[0] >= 0
-                else self._contiguous_host_spans(host_slots)
-            )
-            # Very fragmented spans create many small H2D/index_copy operations;
-            # keep the original gather path in that case.
-            if len(host_spans) > 64:
-                host_spans = ()
-            host_index_cpu = (
-                None
-                if host_slice[0] >= 0 or host_spans
-                else torch.tensor(host_slots, dtype=torch.int64, device="cpu")
-            )
+            if direct_kv_indices_only:
+                host_slots: List[int] = []
+                (
+                    host_signature,
+                    host_slice,
+                    host_spans,
+                    host_index_cpu,
+                ) = self._direct_host_layout_for_entries(
+                    selected,
+                    token_count=int(token_count),
+                )
+            else:
+                host_slots = []
+                for entry in selected:
+                    if entry.host_slots is not None:
+                        host_slots.extend(entry.host_slots)
+                    elif entry.host_slot is not None:
+                        host_slots.append(int(entry.host_slot))
+                host_signature = self._host_slot_signature(host_slots)
+                host_slice = self._contiguous_host_slice(host_slots)
+                host_spans = (
+                    ()
+                    if host_slice[0] >= 0
+                    else self._contiguous_host_spans(host_slots)
+                )
+                # Very fragmented spans create many small H2D/index_copy operations;
+                # keep the original gather path in that case.
+                if len(host_spans) > 64:
+                    host_spans = ()
+                host_index_cpu = (
+                    None
+                    if host_slice[0] >= 0 or host_spans
+                    else torch.tensor(host_slots, dtype=torch.int64, device="cpu")
+                )
             max_row_index = max(row_indices) if row_indices else -1
             max_position = max(positions) if positions else -1
             if row_spans:
-                max_row_index = max(max_row_index, max(row for row, _start, _offset, _length in row_spans))
+                max_row_index = max(
+                    max_row_index,
+                    max(row for row, _start, _offset, _length in row_spans),
+                )
                 max_position = max(
                     max_position,
-                    max(start + length - 1 for _row, start, _offset, length in row_spans),
+                    max(
+                        start + length - 1 for _row, start, _offset, length in row_spans
+                    ),
                 )
             if flat_indices:
                 max_flat_index = max(flat_indices)
             elif flat_spans:
-                max_flat_index = max(start + length - 1 for start, _offset, length in flat_spans)
+                max_flat_index = max(
+                    start + length - 1 for start, _offset, length in flat_spans
+                )
             else:
                 max_flat_index = -1
-        return _LayerKVVirtualMaterializePlan(
+        plan = _LayerKVVirtualMaterializePlan(
             step=int(self._decode_step),
             selected=selected,
             req_indices=tuple(int(x) for x in req_indices),
@@ -700,7 +826,9 @@ class LayerKVKvcVirtualMixin:
             pos_tensor=None,
             row_tensor=None,
             flat_tensor=None,
-            host_slots=() if direct_kv_indices_only else tuple(int(x) for x in host_slots),
+            host_slots=(
+                () if direct_kv_indices_only else tuple(int(x) for x in host_slots)
+            ),
             host_signature=host_signature,
             host_slice=host_slice,
             host_spans=host_spans,
@@ -709,6 +837,72 @@ class LayerKVKvcVirtualMixin:
             max_position=int(max_position),
             max_flat_index=int(max_flat_index),
             token_count=int(token_count),
+        )
+        if plan_cache_key is not None:
+            self._virtual_materialize_plan_reuse_cache[plan_cache_key] = plan
+        return plan
+
+    def _virtual_metadata_kind(self) -> str:
+        forward_batch = self._last_forward_batch
+        attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
+            self._runner, "attn_backend", None
+        )
+        metadata = getattr(attn_backend, "forward_metadata", None)
+        if metadata is None:
+            return "unknown"
+        if getattr(metadata, "kv_indices", None) is not None:
+            return "kv_indices"
+        if getattr(metadata, "page_table", None) is not None:
+            return "page_table"
+        return "unknown"
+
+    def _virtual_materialize_plan_cache_key(
+        self,
+        layer_id: int,
+        selected: List[_LayerKVResidencyEntry],
+        row_by_req: Dict[int, int],
+        flat_base_by_req: Dict[int, int],
+        metadata_kind: str,
+        *,
+        token_count: Optional[int] = None,
+    ) -> Tuple[Any, ...]:
+        first = selected[0]
+        last = selected[-1]
+        token_count = (
+            int(token_count)
+            if token_count is not None
+            else sum(int(entry.token_count) for entry in selected)
+        )
+        reqs = tuple(sorted({int(entry.req_idx) for entry in selected}))
+        row_sig = tuple((req_idx, int(row_by_req.get(req_idx, -1))) for req_idx in reqs)
+        if metadata_kind == "page_table":
+            flat_sig: Tuple[Tuple[int, int], ...] = ()
+        else:
+            flat_sig = tuple(
+                (req_idx, int(flat_base_by_req.get(req_idx, -1))) for req_idx in reqs
+            )
+        return (
+            int(layer_id),
+            str(metadata_kind),
+            int(
+                getattr(self, "_per_layer_offloaded_version_by_layer", {}).get(
+                    int(layer_id), 0
+                )
+            ),
+            len(selected),
+            int(token_count),
+            (
+                int(first.req_idx),
+                int(first.pos),
+                int(first.token_count),
+            ),
+            (
+                int(last.req_idx),
+                int(last.pos),
+                int(last.token_count),
+            ),
+            row_sig,
+            flat_sig,
         )
 
     def _virtual_metadata_uses_kv_indices(self) -> bool:
@@ -733,6 +927,125 @@ class LayerKVKvcVirtualMixin:
             int(checksum),
         )
 
+    @classmethod
+    def _direct_host_layout_for_entries(
+        cls,
+        entries: List[_LayerKVResidencyEntry],
+        *,
+        token_count: int,
+    ) -> Tuple[
+        Tuple[int, int, int, int],
+        Tuple[int, int],
+        Tuple[Tuple[int, int, int], ...],
+        Optional[torch.Tensor],
+    ]:
+        if not entries or int(token_count) <= 0:
+            return (0, 0, 0, 0), (-1, 0), (), None
+        spans: List[Tuple[int, int, int]] = []
+        host_slots_fallback: Optional[List[int]] = None
+        expected_host: Optional[int] = None
+        first_host: Optional[int] = None
+        last_host: Optional[int] = None
+        scratch_offset = 0
+        checksum = 0
+        globally_contiguous = True
+        for entry in entries:
+            count = int(entry.token_count)
+            if count <= 0:
+                continue
+            if entry.host_slots is not None:
+                slots = entry.host_slots
+                if (
+                    len(slots) != count
+                    or not slots
+                    or int(slots[-1]) - int(slots[0]) + 1 != count
+                ):
+                    if host_slots_fallback is None:
+                        host_slots_fallback = []
+                        for prev_start, _prev_offset, prev_len in spans:
+                            host_slots_fallback.extend(
+                                range(int(prev_start), int(prev_start) + int(prev_len))
+                            )
+                    host_slots_fallback.extend(int(slot) for slot in slots)
+                    scratch_offset += count
+                    globally_contiguous = False
+                    continue
+                start = int(slots[0])
+            elif entry.host_slot is not None and count == 1:
+                start = int(entry.host_slot)
+            else:
+                if host_slots_fallback is None:
+                    host_slots_fallback = []
+                    for prev_start, _prev_offset, prev_len in spans:
+                        host_slots_fallback.extend(
+                            range(int(prev_start), int(prev_start) + int(prev_len))
+                        )
+                host_slots_fallback.extend(entry.host_slot_list())
+                scratch_offset += count
+                globally_contiguous = False
+                continue
+            if first_host is None:
+                first_host = start
+            last_host = start + count - 1
+            checksum += (start + last_host) * count // 2
+            if expected_host is not None and start != expected_host:
+                globally_contiguous = False
+            expected_host = start + count
+            if spans and start == spans[-1][0] + spans[-1][2]:
+                prev_start, prev_offset, prev_len = spans[-1]
+                spans[-1] = (prev_start, prev_offset, prev_len + count)
+            else:
+                spans.append((start, scratch_offset, count))
+            if host_slots_fallback is not None:
+                host_slots_fallback.extend(range(start, start + count))
+            scratch_offset += count
+        if scratch_offset != int(token_count):
+            return (0, 0, 0, 0), (-1, 0), (), None
+        if host_slots_fallback is not None:
+            if len(host_slots_fallback) != int(token_count):
+                return (0, 0, 0, 0), (-1, 0), (), None
+            signature = cls._host_slot_signature(host_slots_fallback)
+            host_slice = cls._contiguous_host_slice(host_slots_fallback)
+            host_spans = (
+                ()
+                if host_slice[0] >= 0
+                else cls._contiguous_host_spans(host_slots_fallback)
+            )
+            if len(host_spans) > 64:
+                return (
+                    signature,
+                    (-1, 0),
+                    (),
+                    torch.tensor(host_slots_fallback, dtype=torch.int64, device="cpu"),
+                )
+            return signature, host_slice, host_spans, None
+        if first_host is None or last_host is None:
+            return (0, 0, 0, 0), (-1, 0), (), None
+        signature = (
+            int(token_count),
+            int(first_host),
+            int(last_host),
+            int(checksum) & 0x7FFFFFFF,
+        )
+        if globally_contiguous and first_host + int(token_count) - 1 == last_host:
+            return signature, (int(first_host), int(token_count)), (), None
+        host_spans = tuple(
+            (int(start), int(offset), int(length))
+            for start, offset, length in spans
+            if int(length) > 0
+        )
+        if len(host_spans) > 64:
+            host_slots = []
+            for start, _offset, length in host_spans:
+                host_slots.extend(range(int(start), int(start) + int(length)))
+            return (
+                signature,
+                (-1, 0),
+                (),
+                torch.tensor(host_slots, dtype=torch.int64, device="cpu"),
+            )
+        return signature, (-1, 0), host_spans, None
+
     @staticmethod
     def _contiguous_host_slice(host_slots: List[int]) -> Tuple[int, int]:
         if not host_slots:
@@ -745,6 +1058,99 @@ class LayerKVKvcVirtualMixin:
             if int(slot) != first + int(offset):
                 return (-1, 0)
         return (first, len(host_slots))
+
+    @staticmethod
+    def _entry_first_host_slot(entry: _LayerKVResidencyEntry) -> int:
+        if entry.host_slots is not None:
+            if not entry.host_slots:
+                return 1 << 60
+            return int(entry.host_slots[0])
+        if entry.host_slot is None:
+            return 1 << 60
+        return int(entry.host_slot)
+
+    @staticmethod
+    def _entry_host_slots(entries: List[_LayerKVResidencyEntry]) -> List[int]:
+        host_slots: List[int] = []
+        for entry in entries:
+            if entry.host_slots is not None:
+                host_slots.extend(int(slot) for slot in entry.host_slots)
+            elif entry.host_slot is not None:
+                host_slots.append(int(entry.host_slot))
+        return host_slots
+
+    @classmethod
+    def _contiguous_host_slice_for_entries(
+        cls,
+        entries: List[_LayerKVResidencyEntry],
+        *,
+        expected_tokens: int,
+    ) -> Tuple[int, int]:
+        if not entries or int(expected_tokens) <= 0:
+            return (-1, 0)
+        first_slot: Optional[int] = None
+        expected_slot: Optional[int] = None
+        seen = 0
+        for entry in entries:
+            if entry.host_slots is not None:
+                slots = entry.host_slots
+                if not slots:
+                    return (-1, 0)
+                slice_start, slice_len = cls._contiguous_host_slice(slots)
+                if slice_start < 0:
+                    return (-1, 0)
+                current_first = int(slice_start)
+                current_len = int(slice_len)
+            elif entry.host_slot is not None:
+                current_first = int(entry.host_slot)
+                current_len = 1
+            else:
+                return (-1, 0)
+            if first_slot is None:
+                first_slot = current_first
+                expected_slot = current_first
+            if expected_slot is None or current_first != expected_slot:
+                return (-1, 0)
+            seen += current_len
+            expected_slot = current_first + current_len
+        if seen != int(expected_tokens) or first_slot is None:
+            return (-1, 0)
+        return (int(first_slot), int(seen))
+
+    def _host_ordered_virtual_entries(
+        self,
+        selected: List[_LayerKVResidencyEntry],
+        *,
+        token_count: Optional[int] = None,
+    ) -> Optional[List[_LayerKVResidencyEntry]]:
+        if len(selected) <= 1:
+            return None
+        expected_tokens = (
+            int(token_count)
+            if token_count is not None
+            else sum(int(entry.token_count) for entry in selected)
+        )
+        if (
+            self._contiguous_host_slice_for_entries(
+                selected, expected_tokens=expected_tokens
+            )[0]
+            >= 0
+        ):
+            return None
+        host_ordered = sorted(
+            selected,
+            key=lambda entry: (
+                self._entry_first_host_slot(entry),
+                int(entry.req_idx),
+                int(entry.pos),
+            ),
+        )
+        host_slice = self._contiguous_host_slice_for_entries(
+            host_ordered, expected_tokens=expected_tokens
+        )
+        if host_slice[0] < 0:
+            return None
+        return host_ordered
 
     @staticmethod
     def _contiguous_host_spans(
@@ -802,6 +1208,55 @@ class LayerKVKvcVirtualMixin:
                 return idx
         return -1
 
+    def _virtual_scratch_generation(
+        self, buffer_idx: int, *, layer_id: Optional[int] = None
+    ) -> int:
+        buffer_idx = int(buffer_idx)
+        if (
+            layer_id is not None
+            and self.config.kvc_backend == "per-layer-arena"
+            and buffer_idx >= 0
+        ):
+            return int(
+                self._virtual_scratch_buffer_generations_by_layer.get(
+                    (int(layer_id), buffer_idx), 0
+                )
+            )
+        if buffer_idx >= 0 and buffer_idx < len(
+            self._virtual_scratch_buffer_generations
+        ):
+            return int(self._virtual_scratch_buffer_generations[buffer_idx])
+        return int(self._virtual_scratch_single_generation)
+
+    def _bump_virtual_scratch_generation(
+        self, buffer_idx: int, *, layer_id: Optional[int] = None
+    ) -> int:
+        buffer_idx = int(buffer_idx)
+        if (
+            layer_id is not None
+            and self.config.kvc_backend == "per-layer-arena"
+            and buffer_idx >= 0
+        ):
+            key = (int(layer_id), buffer_idx)
+            generation = (
+                int(self._virtual_scratch_buffer_generations_by_layer.get(key, 0)) + 1
+            )
+            self._virtual_scratch_buffer_generations_by_layer[key] = generation
+            return generation
+        if buffer_idx >= 0 and buffer_idx < len(
+            self._virtual_scratch_buffer_generations
+        ):
+            self._virtual_scratch_buffer_generations[buffer_idx] = (
+                int(self._virtual_scratch_buffer_generations[buffer_idx]) + 1
+            )
+            return int(self._virtual_scratch_buffer_generations[buffer_idx])
+        self._virtual_scratch_single_generation += 1
+        for idx in range(len(self._virtual_scratch_buffer_generations)):
+            self._virtual_scratch_buffer_generations[idx] = (
+                int(self._virtual_scratch_buffer_generations[idx]) + 1
+            )
+        return int(self._virtual_scratch_single_generation)
+
     def _materialize_virtual_kvc_sync(
         self,
         demand: _LayerKVKvcDemand,
@@ -818,22 +1273,27 @@ class LayerKVKvcVirtualMixin:
             return None
         if buffer_idx is None:
             scratch_locs = self._virtual_scratch_locs[:token_count]
+            self._bump_virtual_scratch_generation(-1, layer_id=int(demand.layer_id))
             device_slice = (
                 self._virtual_scratch_buffer_slices[0]
                 if self._virtual_scratch_buffer_slices
                 else (-1, 0)
             )
         else:
-            scratch_locs = self._virtual_scratch_buffers[int(buffer_idx)][:token_count]
+            buffer_idx = int(buffer_idx)
+            scratch_locs = self._virtual_scratch_buffers[buffer_idx][:token_count]
+            self._bump_virtual_scratch_generation(
+                buffer_idx, layer_id=int(demand.layer_id)
+            )
             device_slice = (
-                self._virtual_scratch_buffer_slices[int(buffer_idx)]
-                if int(buffer_idx) < len(self._virtual_scratch_buffer_slices)
+                self._virtual_scratch_buffer_slices[buffer_idx]
+                if buffer_idx < len(self._virtual_scratch_buffer_slices)
                 else (-1, 0)
             )
         self._ensure_host_store()
         elapsed_ms, _start_event, _ready_event = self._host_store.reload_layer_to_locs(
             int(demand.layer_id),
-            list(demand.entries),
+            demand.entries,
             scratch_locs,
             host_index=demand.host_index_cpu,
             host_slice=demand.host_slice,
@@ -903,9 +1363,7 @@ class LayerKVKvcVirtualMixin:
         req_indices = demand.req_indices
         positions = demand.positions
         if not req_indices or not positions:
-            req_indices, positions = self._build_virtual_scatter_indices(
-                demand.entries
-            )
+            req_indices, positions = self._build_virtual_scatter_indices(demand.entries)
             if not req_indices or not positions:
                 self.stats.kvc_per_layer_metadata_rewrite_unsupported_count += 1
                 return
@@ -913,9 +1371,7 @@ class LayerKVKvcVirtualMixin:
             req_tensor = torch.tensor(
                 req_indices, dtype=torch.int64, device=table.device
             )
-            pos_tensor = torch.tensor(
-                positions, dtype=torch.int64, device=table.device
-            )
+            pos_tensor = torch.tensor(positions, dtype=torch.int64, device=table.device)
             table[req_tensor, pos_tensor] = scratch_locs.to(
                 dtype=table.dtype, device=table.device
             )
@@ -1116,8 +1572,7 @@ class LayerKVKvcVirtualMixin:
                         return True
                     if len(demand.row_spans) > 16:
                         if cache_entry.row_span_row_tensor is None or (
-                            cache_entry.row_span_row_tensor.device
-                            != page_table.device
+                            cache_entry.row_span_row_tensor.device != page_table.device
                         ):
                             (
                                 cache_entry.row_span_row_tensor,
@@ -1253,10 +1708,15 @@ class LayerKVKvcVirtualMixin:
             torch.arange(int(lengths.numel()), dtype=torch.int64, device=device),
             lengths,
         )
-        span_bases = torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
+        span_bases = torch.repeat_interleave(
+            torch.cumsum(lengths, dim=0) - lengths, lengths
+        )
         offsets = torch.arange(int(token_count), dtype=torch.int64, device=device)
         local_offsets = offsets - span_bases
-        return starts[span_ids] + local_offsets, scratch_starts[span_ids] + local_offsets
+        return (
+            starts[span_ids] + local_offsets,
+            scratch_starts[span_ids] + local_offsets,
+        )
 
     @staticmethod
     def _metadata_row_span_scatter_tensors(
@@ -1288,7 +1748,9 @@ class LayerKVKvcVirtualMixin:
             torch.arange(int(lengths.numel()), dtype=torch.int64, device=device),
             lengths,
         )
-        span_bases = torch.repeat_interleave(torch.cumsum(lengths, dim=0) - lengths, lengths)
+        span_bases = torch.repeat_interleave(
+            torch.cumsum(lengths, dim=0) - lengths, lengths
+        )
         offsets = torch.arange(int(token_count), dtype=torch.int64, device=device)
         local_offsets = offsets - span_bases
         return (
@@ -1409,17 +1871,173 @@ class LayerKVKvcVirtualMixin:
             or self._copy_stream is None
         ):
             return
+        t0 = time.perf_counter()
         next_layer = self._next_kvc_layer_id(layer_id)
+        self._add_profile(
+            "profile_virtual_prefetch_next_layer_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
         if next_layer is None:
             return
+        t0 = time.perf_counter()
         next_demand = self._get_virtual_kvc_demand(int(next_layer))
+        self._add_profile(
+            "profile_virtual_prefetch_demand_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
         if next_demand is None or not next_demand.entries:
             return
+        t0 = time.perf_counter()
         if self._lookup_virtual_scratch_cache(next_demand) is not None:
+            self._add_profile(
+                "profile_virtual_prefetch_cache_lookup_ms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
+            return
+        self._add_profile(
+            "profile_virtual_prefetch_cache_lookup_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        if self._issue_all_virtual_kvc_prefetch_after_layer(
+            int(layer_id), exclude_buffer_idx=current_buffer_idx
+        ):
             return
         self._issue_virtual_kvc_prefetch(
             next_demand, exclude_buffer_idx=current_buffer_idx
         )
+
+    def _issue_all_virtual_kvc_prefetch_after_layer(
+        self,
+        layer_id: int,
+        *,
+        exclude_buffer_idx: Optional[int],
+    ) -> bool:
+        if (
+            self.config.kvc_scheduler != "async-deadline"
+            or not self._optimized_profile_enabled()
+            or self._copy_stream is None
+            or self._host_store is None
+        ):
+            return False
+        if getattr(self, "_virtual_batched_prefetch_step", None) == int(
+            self._decode_step
+        ):
+            return False
+        layer_ids = [int(candidate) for candidate in self._kvc_layer_ids()]
+        try:
+            start_idx = layer_ids.index(int(layer_id)) + 1
+        except ValueError:
+            return False
+        candidate_layers = layer_ids[start_idx:]
+        if not candidate_layers:
+            return False
+        buffer_idx = 0
+        if len(self._virtual_scratch_buffers) > 1:
+            buffer_idx = 1 if int(exclude_buffer_idx or 0) == 0 else 0
+        if buffer_idx >= len(self._virtual_scratch_buffers):
+            return False
+        buffer_locs = self._virtual_scratch_buffers[int(buffer_idx)]
+        device_slice_base = (
+            self._virtual_scratch_buffer_slices[int(buffer_idx)]
+            if int(buffer_idx) < len(self._virtual_scratch_buffer_slices)
+            else (-1, 0)
+        )
+        if int(device_slice_base[0]) < 0:
+            return False
+        batch: List[Tuple[_LayerKVKvcDemand, torch.Tensor, Tuple[int, int], int]] = []
+        requests: List[
+            Tuple[
+                int, Tuple[int, int], Tuple[Tuple[int, int, int], ...], Tuple[int, int]
+            ]
+        ] = []
+        t0 = time.perf_counter()
+        for candidate in candidate_layers:
+            demand = self._get_virtual_kvc_demand(int(candidate))
+            if demand is None or not demand.entries:
+                continue
+            if int(demand.token_count) <= 0 or int(demand.token_count) > int(
+                buffer_locs.numel()
+            ):
+                continue
+            if self._lookup_virtual_scratch_cache(demand, record_stats=False):
+                continue
+            key = (int(self._decode_step), int(candidate), demand.signature)
+            if key in self._pending_virtual_kvc_materialize:
+                continue
+            if demand.host_index_cpu is not None:
+                continue
+            if int(demand.host_slice[0]) < 0 and not demand.host_spans:
+                continue
+            scratch_locs = buffer_locs[: int(demand.token_count)]
+            device_slice = (int(device_slice_base[0]), int(demand.token_count))
+            generation = self._bump_virtual_scratch_generation(
+                int(buffer_idx), layer_id=int(candidate)
+            )
+            batch.append((demand, scratch_locs, device_slice, generation))
+            requests.append(
+                (
+                    int(candidate),
+                    demand.host_slice,
+                    demand.host_spans,
+                    device_slice,
+                )
+            )
+        self._add_profile(
+            "profile_virtual_prefetch_demand_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        if len(requests) <= 1:
+            return False
+        with self._profile("profile_virtual_prefetch_issue_ms"):
+            t0 = time.perf_counter()
+            start_event, ready_event, issued_count = (
+                self._host_store.reload_layers_to_locs_batched(
+                    requests,
+                    stream=self._copy_stream,
+                )
+            )
+            self._add_profile(
+                "profile_virtual_prefetch_reload_call_ms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
+        if start_event is None or ready_event is None or int(issued_count) <= 0:
+            return False
+        self._virtual_batched_prefetch_step = int(self._decode_step)
+        event_group_id = int(id(ready_event))
+        t0 = time.perf_counter()
+        for demand, scratch_locs, _device_slice, generation in batch:
+            key = (
+                int(self._decode_step),
+                int(demand.layer_id),
+                demand.signature,
+            )
+            self.stats.virtual_kvc_prefetch_count += 1
+            self.stats.virtual_kvc_materialize_count += 1
+            self.stats.virtual_kvc_materialize_layer_count += 1
+            self.stats.virtual_kvc_materialize_token_count += int(demand.token_count)
+            self.stats.virtual_scratch_used_tokens = max(
+                self.stats.virtual_scratch_used_tokens, int(demand.token_count)
+            )
+            self._pending_virtual_kvc_materialize[key] = (
+                _LayerKVPendingVirtualMaterialize(
+                    start_event=start_event,
+                    ready_event=ready_event,
+                    layer_id=int(demand.layer_id),
+                    entries=list(demand.entries),
+                    scratch_locs=scratch_locs,
+                    req_indices=demand.req_indices,
+                    positions=demand.positions,
+                    token_count=int(demand.token_count),
+                    buffer_idx=int(buffer_idx),
+                    buffer_generation=int(generation),
+                    event_group_id=event_group_id,
+                )
+            )
+        self._add_profile(
+            "profile_virtual_prefetch_record_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return True
 
     def _issue_virtual_kvc_prefetch(
         self,
@@ -1438,11 +2056,20 @@ class LayerKVKvcVirtualMixin:
         key = (int(self._decode_step), int(demand.layer_id), demand.signature)
         if key in self._pending_virtual_kvc_materialize:
             return False
+        t0 = time.perf_counter()
         buffer_idx = self._choose_virtual_scratch_buffer(
             demand.token_count, exclude_buffer_idx=exclude_buffer_idx
         )
+        self._add_profile(
+            "profile_virtual_prefetch_buffer_select_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
         if buffer_idx < 0:
             return False
+        t0 = time.perf_counter()
+        buffer_generation = self._bump_virtual_scratch_generation(
+            buffer_idx, layer_id=int(demand.layer_id)
+        )
         scratch_locs = self._virtual_scratch_buffers[buffer_idx][: demand.token_count]
         device_slice = (
             self._virtual_scratch_buffer_slices[int(buffer_idx)]
@@ -1450,11 +2077,16 @@ class LayerKVKvcVirtualMixin:
             else (-1, 0)
         )
         self._ensure_host_store()
+        self._add_profile(
+            "profile_virtual_prefetch_setup_ms",
+            (time.perf_counter() - t0) * 1000.0,
+        )
         with self._profile("profile_virtual_prefetch_issue_ms"):
+            t0 = time.perf_counter()
             elapsed_ms, start_event, ready_event = (
                 self._host_store.reload_layer_to_locs(
                     int(demand.layer_id),
-                    list(demand.entries),
+                    demand.entries,
                     scratch_locs,
                     stream=self._copy_stream,
                     async_copy=True,
@@ -1464,9 +2096,14 @@ class LayerKVKvcVirtualMixin:
                     device_slice=device_slice,
                 )
             )
+            self._add_profile(
+                "profile_virtual_prefetch_reload_call_ms",
+                (time.perf_counter() - t0) * 1000.0,
+            )
         if ready_event is None or start_event is None:
             self._record_virtual_materialize(demand.token_count, elapsed_ms)
             return True
+        t0 = time.perf_counter()
         self.stats.virtual_kvc_prefetch_count += 1
         self.stats.virtual_kvc_materialize_count += 1
         self.stats.virtual_kvc_materialize_layer_count += 1
@@ -1484,6 +2121,12 @@ class LayerKVKvcVirtualMixin:
             positions=demand.positions,
             token_count=int(demand.token_count),
             buffer_idx=int(buffer_idx),
+            buffer_generation=int(buffer_generation),
+            event_group_id=int(id(ready_event)),
+        )
+        self._add_profile(
+            "profile_virtual_prefetch_record_ms",
+            (time.perf_counter() - t0) * 1000.0,
         )
         return True
 
@@ -1531,11 +2174,18 @@ class LayerKVKvcVirtualMixin:
             except Exception:
                 pass
         try:
-            elapsed_ms = float(pending.start_event.elapsed_time(pending.ready_event))
-            self.stats.virtual_kvc_materialize_ms += elapsed_ms
-            self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
+            event_group_id = int(getattr(pending, "event_group_id", 0))
+            if event_group_id <= 0 or (
+                event_group_id not in self._virtual_materialize_recorded_event_groups
+            ):
+                elapsed_ms = float(
+                    pending.start_event.elapsed_time(pending.ready_event)
+                )
+                self.stats.virtual_kvc_materialize_ms += elapsed_ms
+                self.stats.layerkv_copy_stream_busy_ms += elapsed_ms
+                if event_group_id > 0:
+                    self._virtual_materialize_recorded_event_groups.add(event_group_id)
         except Exception:
             pass
         self._refresh_ready_before_use_ratio()
         return pending.scratch_locs
-

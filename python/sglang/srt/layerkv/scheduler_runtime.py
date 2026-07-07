@@ -45,20 +45,36 @@ logger = logging.getLogger(__name__)
 class LayerKVSchedulerMixin:
     def on_forward_begin(self, *, mode: str, forward_batch: Any) -> None:
         t0 = time.perf_counter()
+        phase_t0 = time.perf_counter()
         self._current_forward_mode = mode
         self._last_forward_batch = forward_batch
+        if mode == "decode" and int(self._decode_step) == 0:
+            self._reset_decode_step_profile_baseline()
+        if mode == "decode":
+            self._kvc_evict_finalized_this_step_tokens = 0
         self._per_layer_kvc_prepared_layers.clear()
         self._virtual_materialize_plan = None
         self._virtual_materialize_plans_by_layer.clear()
+        self._per_layer_kvc_evict_finalized_before_layers.clear()
         self._virtual_batch_index_step = -1
         self._virtual_batch_index_cache = None
         self._virtual_kvc_demands.clear()
+        self._virtual_batched_prefetch_step = -1
         self._kvc_demand_signature_eval_step = None
         self._per_layer_kvc_current_metadata_key = None
         self._refresh_per_layer_kvc_overrides()
+        self._add_profile(
+            "profile_forward_begin_bookkeeping_ms",
+            (time.perf_counter() - phase_t0) * 1000.0,
+        )
         with self._profile("profile_workload_stats_ms"):
             self._refresh_workload_stats(forward_batch)
+        phase_t0 = time.perf_counter()
         self._mark_canonical_per_layer_metadata_current()
+        self._add_profile(
+            "profile_forward_begin_metadata_current_ms",
+            (time.perf_counter() - phase_t0) * 1000.0,
+        )
         if (
             self._expert_hotness_pending_snapshots
             or self._expert_candidate_pending_snapshots
@@ -80,7 +96,13 @@ class LayerKVSchedulerMixin:
                 self._finalize_reloaded_entries(block=False)
                 self._finalize_virtual_materialize_events(block=False)
         if mode == "decode":
+            phase_t0 = time.perf_counter()
             fast_path = self._no_pressure_fast_path_active(forward_batch)
+            self._add_profile(
+                "profile_forward_begin_fastpath_check_ms",
+                (time.perf_counter() - phase_t0) * 1000.0,
+            )
+            phase_t0 = time.perf_counter()
             if fast_path:
                 self.stats.layerkv_no_pressure_expert_skip_count += 1
             else:
@@ -90,17 +112,39 @@ class LayerKVSchedulerMixin:
                 self._force_drain_expert_install_d2h_and_slots()
                 if self._expert_plan_applied and not self._expert_install_queue:
                     self._check_current_coresid_plan_match(context="post_install")
+            self._add_profile(
+                "profile_forward_begin_expert_control_ms",
+                (time.perf_counter() - phase_t0) * 1000.0,
+            )
             self.stats.forward_decode_count += 1
             self._decode_step += 1
             self.stats.decode_steps = self._decode_step
+            phase_t0 = time.perf_counter()
             self._prepare_expert_hotness_sampling_for_step()
+            self._add_profile(
+                "profile_forward_begin_hotness_prepare_ms",
+                (time.perf_counter() - phase_t0) * 1000.0,
+            )
+            phase_t0 = time.perf_counter()
             if fast_path:
                 self.stats.layerkv_no_pressure_scheduler_skip_count += 1
             else:
                 self._run_deadline_scheduler(forward_batch)
+                need_tokens = self._planned_kvc_evict_need_tokens(forward_batch)
+                if need_tokens > 0:
+                    self._prepare_kvc_evict_selection(forward_batch, need_tokens)
+            self._add_profile(
+                "profile_forward_begin_scheduler_control_ms",
+                (time.perf_counter() - phase_t0) * 1000.0,
+            )
         else:
             self.stats.forward_extend_count += 1
+            phase_t0 = time.perf_counter()
             self._drop_entries_for_reqs(forward_batch)
+            self._add_profile(
+                "profile_forward_begin_extend_cleanup_ms",
+                (time.perf_counter() - phase_t0) * 1000.0,
+            )
         self.stats.scheduler_invocation_count += 1
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self.stats.layerkv_python_overhead_ms += elapsed_ms
@@ -219,7 +263,9 @@ class LayerKVSchedulerMixin:
         self.stats.pre_retract_reclaim_allocator_available_before = int(
             visible_available
         )
-        self.stats.pre_retract_reclaim_allocator_available_after = int(visible_available)
+        self.stats.pre_retract_reclaim_allocator_available_after = int(
+            visible_available
+        )
         if shortage_tokens <= 0:
             return False
         if self.config.mode not in ("kvc-only", "kvc-expert"):
@@ -296,6 +342,49 @@ class LayerKVSchedulerMixin:
             return True
         return after_available > visible_available
 
+    def reclaim_decode_slots_before_retract(
+        self,
+        *,
+        schedule_batch: Any,
+        required_tokens: int,
+        available_tokens: int,
+    ) -> bool:
+        """Make enough native decode slots visible before request retraction."""
+        required_tokens = max(0, int(required_tokens))
+        available_tokens = max(0, int(available_tokens))
+        if required_tokens <= 0 or available_tokens >= required_tokens:
+            return True
+        if self.config.kvc_backend != "per-layer-arena":
+            ok = self.try_reclaim_kvc_before_retract(
+                schedule_batch=schedule_batch,
+                required_tokens=required_tokens,
+                available_tokens=available_tokens,
+                reason="pre_retract_decode_mem",
+            )
+            self._finalize_kvc_evictions(block=True)
+            return bool(ok) or self._allocator_available_size() >= required_tokens
+
+        deficit = max(0, required_tokens - self._allocator_available_size())
+        if deficit <= 0:
+            return True
+        release_fn = getattr(self, "_release_common_per_layer_locs_to_native", None)
+        if release_fn is not None:
+            release_fn(deficit)
+        if self._allocator_available_size() >= required_tokens:
+            return True
+
+        self.try_reclaim_kvc_before_retract(
+            schedule_batch=schedule_batch,
+            required_tokens=required_tokens,
+            available_tokens=self._allocator_available_size(),
+            reason="decode_prealloc_admission",
+        )
+        self._finalize_kvc_evictions(block=True)
+        deficit = max(0, required_tokens - self._allocator_available_size())
+        if deficit > 0 and release_fn is not None:
+            release_fn(deficit)
+        return self._allocator_available_size() >= required_tokens
+
     def on_requests_retracted(self, req_pool_indices: List[int]) -> None:
         if not req_pool_indices:
             return
@@ -343,25 +432,63 @@ class LayerKVSchedulerMixin:
             if req_pool_idx is None:
                 return False
             req_idx = int(req_pool_idx)
+            total_t0 = time.perf_counter() if self.config.profile_detail else 0.0
             cleaned = bool(getattr(req, "layerkv_per_layer_cleaned", False))
+            indexed_cleanup = req_idx in self._per_layer_cleanup_layers_by_req
             keys = []
             if not cleaned:
-                keys = list(self._per_layer_owned_keys_by_req.pop(req_idx, set()))
+                if indexed_cleanup:
+                    keys = []
+                else:
+                    keys = list(self._per_layer_owned_keys_by_req.pop(req_idx, set()))
             else:
                 self._per_layer_owned_keys_by_req.pop(req_idx, None)
-            if not keys and not cleaned:
+            if not keys and not cleaned and not indexed_cleanup:
                 keys = [key for key in self._per_layer_residency if key[1] == req_idx]
-            token_count = 0
-            for key in keys:
-                entry = self._per_layer_residency.get(key)
-                if entry is not None:
-                    token_count += int(entry.token_count)
-            self._drop_per_layer_residency_keys(keys)
+            token_count = self._drop_per_layer_residency_for_finished_req(req_idx, keys)
             self._per_layer_owned_req_indices.discard(req_idx)
+            native_free_end = 0
             if not getattr(req, "kv_committed_freed", False):
-                req.pop_committed_kv_cache()
+                native_free_end = max(
+                    native_free_end, int(req.pop_committed_kv_cache())
+                )
             if not getattr(req, "kv_overallocated_freed", False):
-                req.pop_overallocated_kv_cache()
+                _start_p, end_p = req.pop_overallocated_kv_cache()
+                native_free_end = max(native_free_end, int(end_p))
+            if (
+                native_free_end > 0
+                and self._req_to_token_pool is not None
+                and self._allocator is not None
+            ):
+                free_start = 0
+                if not bool(getattr(tree_cache, "disable", False)):
+                    free_start = max(0, int(getattr(req, "cache_protected_len", 0)))
+                native_locs = self._req_to_token_pool.req_to_token[
+                    req_idx, free_start:native_free_end
+                ]
+                if int(native_locs.numel()) > 0:
+                    native_locs_cpu = native_locs.detach().cpu().to(torch.int64)
+                    native_loc_list = [
+                        int(loc)
+                        for loc in native_locs_cpu.tolist()
+                        if int(loc) > 0
+                        and int(loc) not in self._per_layer_arena_reserved_locs
+                    ]
+                    if native_loc_list:
+                        filtered_locs = torch.unique(
+                            torch.tensor(
+                                native_loc_list,
+                                dtype=torch.int64,
+                                device=self._allocator.device,
+                            )
+                        )
+                        if int(filtered_locs.numel()) > 0:
+                            self._allocator.free(filtered_locs)
+            if getattr(req, "last_node", None) is not None:
+                try:
+                    tree_cache.dec_lock_ref(req.last_node)
+                except Exception:
+                    pass
             if getattr(req, "req_pool_idx", None) is not None:
                 if self._req_to_token_pool is not None:
                     self._req_to_token_pool.free(req)
@@ -376,6 +503,14 @@ class LayerKVSchedulerMixin:
             self.stats.kvc_finished_req_cleanup_token_count += int(token_count)
             self._refresh_per_layer_allocator_stats()
             self._refresh_kvc_residency_stats()
+            if self.config.profile_detail:
+                self.stats.profile_cleanup_release_call_count += 1
+                self.stats.profile_cleanup_release_key_count += int(len(keys))
+                self.stats.profile_cleanup_release_token_count += int(token_count)
+                self._add_profile(
+                    "profile_cleanup_release_ms",
+                    (time.perf_counter() - total_t0) * 1000.0,
+                )
             return True
         if self.config.kvc_backend != "virtual-arena":
             return False
@@ -383,6 +518,7 @@ class LayerKVSchedulerMixin:
         if req_pool_idx is None:
             return False
         req_idx = int(req_pool_idx)
+        total_t0 = time.perf_counter() if self.config.profile_detail else 0.0
         self._finalize_kvc_evictions(block=True)
         keys = [key for key in self._residency if key[0] == req_idx]
         if not keys and not getattr(req, "layerkv_virtualized_kvc", False):
@@ -430,6 +566,16 @@ class LayerKVSchedulerMixin:
         self.stats.virtual_kvc_release_count += 1
         self.stats.virtual_kvc_release_token_count += len(virtual_positions)
         self._refresh_kvc_residency_stats()
+        if self.config.profile_detail:
+            self.stats.profile_cleanup_release_call_count += 1
+            self.stats.profile_cleanup_release_key_count += int(len(keys))
+            self.stats.profile_cleanup_release_token_count += int(
+                len(virtual_positions)
+            )
+            self._add_profile(
+                "profile_cleanup_release_ms",
+                (time.perf_counter() - total_t0) * 1000.0,
+            )
         return True
 
     def backup_retracted_request_for_native_resume(
@@ -458,9 +604,9 @@ class LayerKVSchedulerMixin:
         if chunk_size <= 0:
             chunk_size = token_count
         device = getattr(kv_pool, "device", self._allocator.device)
-        native_indices = req_to_token_pool.req_to_token[
-            req_idx, :token_count
-        ].to(device=device, dtype=torch.long)
+        native_indices = req_to_token_pool.req_to_token[req_idx, :token_count].to(
+            device=device, dtype=torch.long
+        )
         kv_cache_cpu = []
         torch.cuda.synchronize()
         for layer_offset in range(int(kv_pool.layer_num)):
@@ -578,9 +724,7 @@ class LayerKVSchedulerMixin:
         if self.config.kvc_backend == "per-layer-arena":
             by_layer: Dict[int, List[_LayerKVResidencyEntry]] = {}
             skipped_layers: Set[int] = set()
-            max_layer_tasks = (
-                max(1, int(max_tasks)) if max_tasks is not None else None
-            )
+            max_layer_tasks = max(1, int(max_tasks)) if max_tasks is not None else None
             for entry in selected:
                 layer_id = int(entry.layer_id)
                 if (
@@ -601,9 +745,7 @@ class LayerKVSchedulerMixin:
                 for _layer_id, entries in sorted(by_layer.items()):
                     merged.extend(entries)
                 if merged:
-                    self.stats.kvc_task_coalesced_count += max(
-                        0, len(by_layer) - 1
-                    )
+                    self.stats.kvc_task_coalesced_count += max(0, len(by_layer) - 1)
                     first_layer = min(int(entry.layer_id) for entry in merged)
                     return [self._make_kvc_recovery_task(first_layer, merged)]
                 return []
@@ -656,9 +798,7 @@ class LayerKVSchedulerMixin:
         self.stats.kvc_avg_task_tokens = self.stats.kvc_task_token_sum / float(
             task_count
         )
-        self.stats.kvc_avg_task_bytes = self.stats.kvc_task_byte_sum / float(
-            task_count
-        )
+        self.stats.kvc_avg_task_bytes = self.stats.kvc_task_byte_sum / float(task_count)
         return _LayerKVRecoveryTask(
             kind="kvc",
             layer_id=int(demand_layer),
@@ -1035,5 +1175,3 @@ class LayerKVSchedulerMixin:
             logical_count = len(task.logical_ids)
             return 0.02 * float(max(1, logical_count))
         return 0.0
-
-

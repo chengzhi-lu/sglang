@@ -1490,7 +1490,17 @@ class Scheduler(
         if available_tokens >= required_tokens:
             return True
         try:
-            if hasattr(layerkv_runtime, "prepare_reclaim_for_scheduler"):
+            reclaim_decode_slots = getattr(
+                layerkv_runtime, "reclaim_decode_slots_before_retract", None
+            )
+            if reclaim_decode_slots is not None:
+                if reclaim_decode_slots(
+                    schedule_batch=batch,
+                    required_tokens=required_tokens,
+                    available_tokens=available_tokens,
+                ):
+                    return True
+            elif hasattr(layerkv_runtime, "prepare_reclaim_for_scheduler"):
                 layerkv_runtime.prepare_reclaim_for_scheduler(
                     schedule_batch=batch,
                     required_tokens=required_tokens,
@@ -1510,7 +1520,43 @@ class Scheduler(
                 exc_info=True,
             )
             return False
+        allocatable_fn = getattr(
+            layerkv_runtime, "get_scheduler_allocatable_tokens", None
+        )
+        if allocatable_fn is not None:
+            return (
+                int(
+                    allocatable_fn(
+                        required_tokens=required_tokens,
+                        available_tokens=int(token_allocator.available_size()),
+                        reason="decode_allocatable",
+                    )
+                    or 0
+                )
+                >= required_tokens
+            )
         return batch.check_decode_mem()
+
+    def _prepare_layerkv_first_decode_eviction_decision(
+        self, batch: Optional[ScheduleBatch]
+    ) -> None:
+        if batch is None or batch.is_empty():
+            return
+        layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None:
+            return
+        prepare_fn = getattr(
+            layerkv_runtime, "prepare_first_decode_kvc_eviction_decision", None
+        )
+        if prepare_fn is None:
+            return
+        try:
+            prepare_fn(batch)
+        except Exception:
+            logger.warning(
+                "LayerKV first decode KVC eviction decision preparation failed.",
+                exc_info=True,
+            )
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2665,11 +2711,49 @@ class Scheduler(
             self.running_batch.filter_batch()
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
+        elif not self.running_batch.is_empty():
+            running_bs = self.running_batch.batch_size()
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            if self.running_batch.batch_size() < running_bs:
+                self.running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
+
+        if new_batch is None and len(self.waiting_queue) > 0:
+            now = time.monotonic()
+            last_log = float(getattr(self, "_layerkv_no_prefill_log_time", 0.0) or 0.0)
+            if now - last_log >= 5.0:
+                self._layerkv_no_prefill_log_time = now
+                layerkv_runtime = self._get_layerkv_runtime()
+                stats = getattr(layerkv_runtime, "stats", None)
+                finished_reqs = sum(
+                    1 for req in self.running_batch.reqs if req.finished()
+                )
+                pending_kvc = (
+                    int(getattr(stats, "kvc_evict_pending_token_count", 0) or 0)
+                    if stats is not None
+                    else -1
+                )
+                finalized_kvc = (
+                    int(getattr(stats, "kvc_evict_async_finalize_count", 0) or 0)
+                    if stats is not None
+                    else -1
+                )
+                logger.warning(
+                    "LayerKV no-prefill progress: waiting=%s running=%s "
+                    "finished_running=%s batch_is_full=%s kv_available=%s "
+                    "pending_kvc_evict=%s finalized_kvc_evict=%s",
+                    len(self.waiting_queue),
+                    self.running_batch.batch_size(),
+                    finished_reqs,
+                    self.running_batch.batch_is_full,
+                    self.token_to_kv_pool_allocator.available_size(),
+                    pending_kvc,
+                    finalized_kvc,
+                )
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2694,6 +2778,9 @@ class Scheduler(
                 and not self.running_batch.is_prefill_only
             ):
                 self.running_batch = self.update_running_batch(self.running_batch)
+                self._prepare_layerkv_first_decode_eviction_decision(
+                    self.running_batch
+                )
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
@@ -2748,6 +2835,9 @@ class Scheduler(
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
+            self.running_batch.batch_is_full = False
+
+        if self.running_batch.is_empty():
             self.running_batch.batch_is_full = False
 
         if (
@@ -3133,6 +3223,7 @@ class Scheduler(
         self._notify_layerkv_schedule_batch(batch)
         layerkv_decode_profile = self._layerkv_decode_profile_enabled(batch)
         layerkv_decode_t0 = time.perf_counter() if layerkv_decode_profile is not None else 0.0
+        layerkv_model_ms = 0.0
         if layerkv_decode_profile is not None:
             stats = getattr(layerkv_decode_profile, "stats", None)
             if stats is not None:
@@ -3182,10 +3273,13 @@ class Scheduler(
                         # here pp is not compatible with overlap
                     )
                     if layerkv_decode_profile is not None:
+                        layerkv_model_ms = (
+                            time.perf_counter() - layerkv_model_t0
+                        ) * 1000.0
                         self._layerkv_add_profile_ms(
                             layerkv_decode_profile,
                             "profile_decode_model_forward_ms",
-                            (time.perf_counter() - layerkv_model_t0) * 1000.0,
+                            layerkv_model_ms,
                         )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
@@ -3227,10 +3321,13 @@ class Scheduler(
                     worker_batch_or_batch, **kwargs
                 )
                 if layerkv_decode_profile is not None:
+                    layerkv_model_ms = (
+                        time.perf_counter() - layerkv_model_t0
+                    ) * 1000.0
                     self._layerkv_add_profile_ms(
                         layerkv_decode_profile,
                         "profile_decode_model_forward_ms",
-                        (time.perf_counter() - layerkv_model_t0) * 1000.0,
+                        layerkv_model_ms,
                     )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -3294,10 +3391,22 @@ class Scheduler(
             )
 
         if layerkv_decode_profile is not None:
+            layerkv_scheduler_ms = (time.perf_counter() - layerkv_decode_t0) * 1000.0
             self._layerkv_add_profile_ms(
                 layerkv_decode_profile,
                 "profile_decode_scheduler_wall_ms",
-                (time.perf_counter() - layerkv_decode_t0) * 1000.0,
+                layerkv_scheduler_ms,
+            )
+            stats = getattr(layerkv_decode_profile, "stats", None)
+            logger.info(
+                "LayerKV scheduler decode step profile: %s",
+                {
+                    "step": int(getattr(stats, "decode_steps", 0) or 0),
+                    "model_forward_ms": layerkv_model_ms,
+                    "scheduler_wall_ms": layerkv_scheduler_ms,
+                    "batch_size": len(getattr(batch, "reqs", []) or []),
+                    "forward_iter": int(getattr(batch, "forward_iter", 0) or 0),
+                },
             )
         return ret
 
@@ -3362,10 +3471,21 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.update_device_timer()
         if layerkv_decode_profile is not None:
+            layerkv_process_ms = (time.perf_counter() - layerkv_process_t0) * 1000.0
             self._layerkv_add_profile_ms(
                 layerkv_decode_profile,
                 "profile_decode_process_result_ms",
-                (time.perf_counter() - layerkv_process_t0) * 1000.0,
+                layerkv_process_ms,
+            )
+            stats = getattr(layerkv_decode_profile, "stats", None)
+            logger.info(
+                "LayerKV scheduler process-result step profile: %s",
+                {
+                    "step": int(getattr(stats, "decode_steps", 0) or 0),
+                    "process_result_ms": layerkv_process_ms,
+                    "batch_size": len(getattr(batch, "reqs", []) or []),
+                    "forward_iter": int(getattr(batch, "forward_iter", 0) or 0),
+                },
             )
 
     def maybe_send_health_check_signal(self):
