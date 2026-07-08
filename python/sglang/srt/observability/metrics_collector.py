@@ -638,6 +638,93 @@ class SchedulerMetricsCollector:
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )
+        self.decode_prealloc_wait_seconds = Histogram(
+            name="sglang:decode_prealloc_wait_seconds",
+            documentation="Time spent waiting in the decode prealloc queue.",
+            buckets=exponential_buckets(start=0.001, width=1.62, length=30),
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_attempts_total = Counter(
+            name="sglang:decode_prealloc_reclaim_attempts_total",
+            documentation="PD decode prealloc reclaim attempts.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_successes_total = Counter(
+            name="sglang:decode_prealloc_reclaim_successes_total",
+            documentation="Successful PD decode prealloc reclaim attempts.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_failures_total = Counter(
+            name="sglang:decode_prealloc_reclaim_failures_total",
+            documentation="Failed PD decode prealloc reclaim attempts.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_kv_tokens_total = Counter(
+            name="sglang:decode_prealloc_reclaim_kv_tokens_total",
+            documentation="KV tokens reclaimed for PD decode prealloc admission.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_kv_bytes_total = Counter(
+            name="sglang:decode_prealloc_reclaim_kv_bytes_total",
+            documentation="Approximate KV bytes reclaimed for PD decode prealloc admission.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_expert_bytes_total = Counter(
+            name="sglang:decode_prealloc_reclaim_expert_bytes_total",
+            documentation="Approximate expert bytes reclaimed for PD decode prealloc admission.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_num_kv_victims_total = Counter(
+            name="sglang:decode_prealloc_reclaim_num_kv_victims_total",
+            documentation="KV victims reclaimed for PD decode prealloc admission.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_num_expert_victims_total = Counter(
+            name="sglang:decode_prealloc_reclaim_num_expert_victims_total",
+            documentation="Expert victims reclaimed for PD decode prealloc admission.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_retry_successes_total = Counter(
+            name="sglang:decode_prealloc_retry_successes_total",
+            documentation="PD decode prealloc requests admitted after reclaim retry.",
+            labelnames=labels.keys(),
+        )
+        self.decode_prealloc_reclaim_elapsed_ms = Histogram(
+            name="sglang:decode_prealloc_reclaim_elapsed_ms",
+            documentation="PD decode prealloc reclaim elapsed time in ms.",
+            labelnames=labels.keys(),
+            buckets=(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500),
+        )
+        self.prealloc_fail_due_to_full_token_pool_total = Counter(
+            name="sglang:prealloc_fail_due_to_full_token_pool_total",
+            documentation="PD decode prealloc admission failures due to full token/KV pool capacity.",
+            labelnames=labels.keys(),
+        )
+        self.prealloc_fail_due_to_swa_token_pool_total = Counter(
+            name="sglang:prealloc_fail_due_to_swa_token_pool_total",
+            documentation="PD decode prealloc admission failures due to SWA token/KV pool capacity.",
+            labelnames=labels.keys(),
+        )
+        self.prealloc_fail_due_to_req_pool_total = Counter(
+            name="sglang:prealloc_fail_due_to_req_pool_total",
+            documentation="PD decode prealloc admission failures due to request-to-token pool slots.",
+            labelnames=labels.keys(),
+        )
+        self.prealloc_fail_due_to_metadata_total = Counter(
+            name="sglang:prealloc_fail_due_to_metadata_total",
+            documentation="PD decode prealloc admission failures due to metadata buffer slots.",
+            labelnames=labels.keys(),
+        )
+        self.prealloc_fail_due_to_mamba_total = Counter(
+            name="sglang:prealloc_fail_due_to_mamba_total",
+            documentation="PD decode prealloc admission failures due to mamba/runtime-state slots.",
+            labelnames=labels.keys(),
+        )
+        self.prealloc_fail_due_to_other_total = Counter(
+            name="sglang:prealloc_fail_due_to_other_total",
+            documentation="PD decode prealloc admission failures due to other limits.",
+            labelnames=labels.keys(),
+        )
 
         # =================================================================
         # Grammar
@@ -990,6 +1077,65 @@ class SchedulerMetricsCollector:
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
+
+    def observe_decode_prealloc_wait(self, latency: float) -> None:
+        self._log_histogram(self.decode_prealloc_wait_seconds, latency)
+
+    def observe_decode_prealloc_reclaim(
+        self,
+        *,
+        success: bool,
+        reclaimed_kv_tokens: int,
+        reclaimed_kv_bytes: int,
+        reclaimed_expert_bytes: int,
+        num_kv_victims: int,
+        num_expert_victims: int,
+        elapsed_ms: float,
+    ) -> None:
+        self.decode_prealloc_reclaim_attempts_total.labels(**self.labels).inc(1)
+        counter = (
+            self.decode_prealloc_reclaim_successes_total
+            if success
+            else self.decode_prealloc_reclaim_failures_total
+        )
+        counter.labels(**self.labels).inc(1)
+        if reclaimed_kv_tokens > 0:
+            self.decode_prealloc_reclaim_kv_tokens_total.labels(**self.labels).inc(
+                reclaimed_kv_tokens
+            )
+        if reclaimed_kv_bytes > 0:
+            self.decode_prealloc_reclaim_kv_bytes_total.labels(**self.labels).inc(
+                reclaimed_kv_bytes
+            )
+        if reclaimed_expert_bytes > 0:
+            self.decode_prealloc_reclaim_expert_bytes_total.labels(**self.labels).inc(
+                reclaimed_expert_bytes
+            )
+        if num_kv_victims > 0:
+            self.decode_prealloc_reclaim_num_kv_victims_total.labels(**self.labels).inc(
+                num_kv_victims
+            )
+        if num_expert_victims > 0:
+            self.decode_prealloc_reclaim_num_expert_victims_total.labels(
+                **self.labels
+            ).inc(num_expert_victims)
+        self._log_histogram(self.decode_prealloc_reclaim_elapsed_ms, elapsed_ms)
+
+    def increment_decode_prealloc_retry_success(self) -> None:
+        self.decode_prealloc_retry_successes_total.labels(**self.labels).inc(1)
+
+    def increment_decode_prealloc_failure(self, reason: str) -> None:
+        counters = {
+            "full_token_pool": self.prealloc_fail_due_to_full_token_pool_total,
+            "swa_token_pool": self.prealloc_fail_due_to_swa_token_pool_total,
+            "req_pool": self.prealloc_fail_due_to_req_pool_total,
+            "metadata": self.prealloc_fail_due_to_metadata_total,
+            "mamba": self.prealloc_fail_due_to_mamba_total,
+            "other": self.prealloc_fail_due_to_other_total,
+        }
+        counters.get(reason, self.prealloc_fail_due_to_other_total).labels(
+            **self.labels
+        ).inc(1)
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)

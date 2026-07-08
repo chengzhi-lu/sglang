@@ -1049,19 +1049,14 @@ class LayerKVKvcAllocatorMixin:
         state = self._per_layer_cleanup_state_by_req.setdefault(
             req_idx, _LayerKVPerLayerReqCleanupState()
         )
-        tracked = state.tracked_keys
-        new_key = key not in tracked
-        if key not in tracked:
-            tracked.add(key)
-            state.token_count = int(state.token_count) + int(entry.token_count)
+        state.token_count = int(state.token_count) + int(entry.token_count)
         state.layers.add(layer_id)
-        if new_key:
-            locs = entry.device_loc_list()
-            if locs:
-                self._add_per_layer_cleanup_locs(entry, locs)
-            host_slots = entry.host_slot_list()
-            if host_slots:
-                self._add_per_layer_cleanup_host_slots(entry, host_slots)
+        locs = entry.device_loc_list()
+        if locs:
+            self._add_per_layer_cleanup_locs(entry, locs)
+        host_slots = entry.host_slot_list()
+        if host_slots:
+            self._add_per_layer_cleanup_host_slots(entry, host_slots)
 
     def _add_per_layer_cleanup_locs(
         self, entry: _LayerKVResidencyEntry, locs: List[int]
@@ -1092,8 +1087,21 @@ class LayerKVKvcAllocatorMixin:
             return
         if entry is None:
             return
-        req_idx = int(entry.req_idx)
-        layer_id = int(entry.layer_id)
+        remove_bits = self._locs_to_bitset(locs, min_value=1)
+        self._remove_per_layer_cleanup_loc_bits(
+            int(entry.req_idx), int(entry.layer_id), int(remove_bits)
+        )
+
+    def _remove_per_layer_cleanup_loc_bits(
+        self, req_idx: int, layer_id: int, remove_bits: int
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        remove_bits = int(remove_bits)
+        if remove_bits <= 0:
+            return
+        req_idx = int(req_idx)
+        layer_id = int(layer_id)
         state = self._per_layer_cleanup_state_by_req.get(req_idx)
         if state is None:
             key = (req_idx, layer_id)
@@ -1102,7 +1110,6 @@ class LayerKVKvcAllocatorMixin:
             loc_bits = int(state.loc_bits_by_layer.get(layer_id, 0))
         if loc_bits <= 0:
             return
-        remove_bits = self._locs_to_bitset(locs, min_value=1)
         removed_bits = int(loc_bits & remove_bits)
         if removed_bits <= 0:
             return

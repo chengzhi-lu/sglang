@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -21,6 +23,27 @@ _FUSED_SPAN_SCATTER_BATCHED_OP: Optional[Any] = None
 _FUSED_SPAN_SCATTER_BATCHED_CHECKED = False
 _FUSED_SPAN_BACKUP_BATCHED_OP: Optional[Any] = None
 _FUSED_SPAN_BACKUP_BATCHED_CHECKED = False
+_LAYERKV_SPAN_OPS_LIBRARY_CHECKED = False
+
+
+def _load_layerkv_span_ops_library() -> None:
+    global _LAYERKV_SPAN_OPS_LIBRARY_CHECKED
+    if _LAYERKV_SPAN_OPS_LIBRARY_CHECKED:
+        return
+    _LAYERKV_SPAN_OPS_LIBRARY_CHECKED = True
+    candidates = []
+    env_path = os.environ.get("LAYERKV_SPAN_OPS_LIB")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.append(Path("/tmp/layerkv_span_ext/layerkv_span_ops_ext.so"))
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            torch.ops.load_library(str(path))
+            return
+        except Exception:
+            continue
 
 
 def _get_fused_span_scatter_op() -> Optional[Any]:
@@ -32,6 +55,9 @@ def _get_fused_span_scatter_op() -> Optional[Any]:
         import sgl_kernel  # noqa: F401
 
         op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_scatter", None)
+        if op is None:
+            _load_layerkv_span_ops_library()
+            op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_scatter", None)
         _FUSED_SPAN_SCATTER_OP = getattr(op, "default", op)
     except Exception:
         _FUSED_SPAN_SCATTER_OP = None
@@ -47,6 +73,11 @@ def _get_fused_span_scatter_batched_op() -> Optional[Any]:
         import sgl_kernel  # noqa: F401
 
         op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_scatter_batched", None)
+        if op is None:
+            _load_layerkv_span_ops_library()
+            op = getattr(
+                torch.ops.sgl_kernel, "layerkv_copy_kv_span_scatter_batched", None
+            )
         _FUSED_SPAN_SCATTER_BATCHED_OP = getattr(op, "default", op)
     except Exception:
         _FUSED_SPAN_SCATTER_BATCHED_OP = None
@@ -62,6 +93,11 @@ def _get_fused_span_backup_batched_op() -> Optional[Any]:
         import sgl_kernel  # noqa: F401
 
         op = getattr(torch.ops.sgl_kernel, "layerkv_copy_kv_span_backup_batched", None)
+        if op is None:
+            _load_layerkv_span_ops_library()
+            op = getattr(
+                torch.ops.sgl_kernel, "layerkv_copy_kv_span_backup_batched", None
+            )
         _FUSED_SPAN_BACKUP_BATCHED_OP = getattr(op, "default", op)
     except Exception:
         _FUSED_SPAN_BACKUP_BATCHED_OP = None
@@ -363,8 +399,31 @@ class _LayerKVHostKVStore:
     ) -> Tuple[Tuple[int, int, int], ...]:
         if not src_slots or not dst_slots or len(src_slots) != len(dst_slots):
             return ()
-        pairs = sorted((int(src), int(dst)) for src, dst in zip(src_slots, dst_slots))
         spans: List[Tuple[int, int, int]] = []
+        src_start = int(src_slots[0])
+        dst_start = int(dst_slots[0])
+        prev_src = src_start
+        prev_dst = dst_start
+        length = 1
+        ordered = True
+        for raw_src, raw_dst in zip(src_slots[1:], dst_slots[1:]):
+            src = int(raw_src)
+            dst = int(raw_dst)
+            if src < prev_src:
+                ordered = False
+                break
+            if src == prev_src + 1 and dst == prev_dst + 1:
+                length += 1
+            else:
+                spans.append((src_start, dst_start, length))
+                src_start, dst_start = src, dst
+                length = 1
+            prev_src, prev_dst = src, dst
+        if ordered:
+            spans.append((src_start, dst_start, length))
+            return tuple(spans)
+
+        pairs = sorted((int(src), int(dst)) for src, dst in zip(src_slots, dst_slots))
         src_start, dst_start = pairs[0]
         prev_src, prev_dst = src_start, dst_start
         length = 1
@@ -529,23 +588,47 @@ class _LayerKVHostKVStore:
 
         def issue_copy() -> None:
             start.record(stream)
+            t_group = time.perf_counter()
             by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
             offset = 0
-            for entry in entries:
-                layer_offset = int(entry.layer_id) - self.start_layer
-                if layer_offset < 0 or layer_offset >= self.layer_num:
-                    raise RuntimeError(
-                        f"invalid per-layer KVC layer_id={entry.layer_id}"
+            if len(host_slots) == len(entries) and all(
+                int(entry.token_count) == 1 for entry in entries
+            ):
+                for entry, slot in zip(entries, host_slots):
+                    layer_offset = int(entry.layer_id) - self.start_layer
+                    if layer_offset < 0 or layer_offset >= self.layer_num:
+                        raise RuntimeError(
+                            f"invalid per-layer KVC layer_id={entry.layer_id}"
+                        )
+                    device_locs = entry.device_loc_list()
+                    if not device_locs:
+                        continue
+                    layer_device_locs, layer_host_slots = by_layer.setdefault(
+                        layer_offset, ([], [])
                     )
-                count = entry.token_count
-                slots = host_slots[offset : offset + count]
-                offset += count
-                layer_device_locs, layer_host_slots = by_layer.setdefault(
-                    layer_offset, ([], [])
-                )
-                layer_device_locs.extend(entry.device_loc_list())
-                layer_host_slots.extend(int(slot) for slot in slots)
+                    layer_device_locs.append(int(device_locs[0]))
+                    layer_host_slots.append(int(slot))
+            else:
+                for entry in entries:
+                    layer_offset = int(entry.layer_id) - self.start_layer
+                    if layer_offset < 0 or layer_offset >= self.layer_num:
+                        raise RuntimeError(
+                            f"invalid per-layer KVC layer_id={entry.layer_id}"
+                        )
+                    count = entry.token_count
+                    slots = host_slots[offset : offset + count]
+                    offset += count
+                    layer_device_locs, layer_host_slots = by_layer.setdefault(
+                        layer_offset, ([], [])
+                    )
+                    layer_device_locs.extend(entry.device_loc_list())
+                    layer_host_slots.extend(int(slot) for slot in slots)
+            self._add_profile(
+                "profile_kvc_backup_group_ms",
+                (time.perf_counter() - t_group) * 1000.0,
+            )
             if fused_backup_op is not None:
+                t_span = time.perf_counter()
                 src_ks: List[torch.Tensor] = []
                 src_vs: List[torch.Tensor] = []
                 dst_ks: List[torch.Tensor] = []
@@ -575,11 +658,21 @@ class _LayerKVHostKVStore:
                         break
                     span_rows.extend(spans)
                     span_batch_ids.extend([batch_id] * len(spans))
+                self._add_profile(
+                    "profile_kvc_backup_span_build_ms",
+                    (time.perf_counter() - t_span) * 1000.0,
+                )
                 if span_rows and src_ks:
-                    spans_tensor, span_batch_tensor = (
-                        self._cpu_spans_and_batch_tensors(span_rows, span_batch_ids)
+                    t_tensor = time.perf_counter()
+                    spans_tensor, span_batch_tensor = self._cpu_spans_and_batch_tensors(
+                        span_rows, span_batch_ids
+                    )
+                    self._add_profile(
+                        "profile_kvc_backup_tensor_cache_ms",
+                        (time.perf_counter() - t_tensor) * 1000.0,
                     )
                     item_size = int(src_ks[0][0].numel() * src_ks[0].element_size())
+                    t_issue = time.perf_counter()
                     fused_backup_op(
                         src_ks,
                         src_vs,
@@ -589,8 +682,13 @@ class _LayerKVHostKVStore:
                         span_batch_tensor,
                         item_size,
                     )
+                    self._add_profile(
+                        "profile_kvc_backup_op_issue_ms",
+                        (time.perf_counter() - t_issue) * 1000.0,
+                    )
                     end.record(stream)
                     return
+            t_fallback = time.perf_counter()
             for layer_offset, (device_loc_list, host_slot_list) in by_layer.items():
                 if not device_loc_list or not host_slot_list:
                     continue
@@ -619,6 +717,10 @@ class _LayerKVHostKVStore:
                     self.v_buffers[layer_offset].index_copy_(
                         0, host_index, v_src.to("cpu", non_blocking=True)
                     )
+            self._add_profile(
+                "profile_kvc_backup_fallback_issue_ms",
+                (time.perf_counter() - t_fallback) * 1000.0,
+            )
             end.record(stream)
 
         with torch.cuda.stream(stream):

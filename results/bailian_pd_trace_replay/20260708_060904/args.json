@@ -1,0 +1,26 @@
+{
+  "channel_capacity": 40960,
+  "decode_gpu": "1",
+  "decode_port": 30001,
+  "log_level": "info",
+  "max_running_requests": null,
+  "max_total_tokens": null,
+  "mem_fraction_static": null,
+  "model_name": "qwen3.6-35b-a3b-fp16",
+  "model_path": "/root/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0",
+  "num_producer": 32,
+  "output_dir": "/sgl-workspace/sglang/results/bailian_pd_trace_replay",
+  "prefill_gpu": "0",
+  "prefill_port": 30000,
+  "rates": [
+    1.0,
+    2.0,
+    4.0
+  ],
+  "replayer_bin": "/sgl-workspace/trace-replayer/target/release/client",
+  "router_metrics_port": 26700,
+  "router_port": 8000,
+  "startup_timeout_s": 900,
+  "time_in_secs": 300,
+  "trace_path": "/sgl-workspace/sglang/dataset/qwen_traceA_blksz_16.jsonl"
+}

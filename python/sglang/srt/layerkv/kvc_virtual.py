@@ -1780,14 +1780,24 @@ class LayerKVKvcVirtualMixin:
             metadata_kind = "unknown"
             metadata_shape = ()
             metadata_device = ""
-        metadata_signature = (
-            self._metadata_int_tuple_signature(demand.req_indices),
-            self._metadata_int_tuple_signature(demand.positions),
-            self._metadata_int_tuple_signature(demand.row_indices),
-            self._metadata_int_tuple_signature(demand.flat_indices),
-            self._metadata_span_signature(demand.flat_spans),
-            self._metadata_span_signature(demand.row_spans),
-        )
+        metadata_signature: Any = self._metadata_patch_layout_signature(demand)
+        if metadata_signature is None and (demand.base_signature or demand.signature):
+            metadata_signature = (
+                str(demand.base_signature or ""),
+                int(demand.token_count),
+                int(demand.max_row_index),
+                int(demand.max_position),
+                int(demand.max_flat_index),
+            )
+        elif metadata_signature is None:
+            metadata_signature = (
+                self._metadata_int_tuple_signature(demand.req_indices),
+                self._metadata_int_tuple_signature(demand.positions),
+                self._metadata_int_tuple_signature(demand.row_indices),
+                self._metadata_int_tuple_signature(demand.flat_indices),
+                self._metadata_span_signature(demand.flat_spans),
+                self._metadata_span_signature(demand.row_spans),
+            )
         stable_key = (
             int(layer_id),
             metadata_kind,
@@ -1797,7 +1807,6 @@ class LayerKVKvcVirtualMixin:
         )
         shared_key = (
             metadata_kind,
-            metadata_shape,
             metadata_device,
             metadata_signature,
         )
@@ -1825,6 +1834,29 @@ class LayerKVKvcVirtualMixin:
             entry.hit_count += 1
             self.stats.metadata_patch_cache_hit_count += 1
         return entry
+
+    def _metadata_patch_layout_signature(
+        self, demand: _LayerKVKvcDemand
+    ) -> Optional[Tuple[Any, ...]]:
+        if not (
+            demand.flat_spans
+            or demand.row_spans
+            or demand.flat_indices
+            or demand.row_indices
+            or demand.positions
+        ):
+            return None
+        return (
+            int(demand.token_count),
+            int(demand.max_row_index),
+            int(demand.max_position),
+            int(demand.max_flat_index),
+            self._metadata_int_tuple_signature(demand.positions),
+            self._metadata_int_tuple_signature(demand.row_indices),
+            self._metadata_int_tuple_signature(demand.flat_indices),
+            self._metadata_span_signature(demand.flat_spans),
+            self._metadata_span_signature(demand.row_spans),
+        )
 
     @staticmethod
     def _metadata_int_tuple_signature(

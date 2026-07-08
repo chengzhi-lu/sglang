@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -97,6 +97,158 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+@dataclass
+class ReclaimResult:
+    attempted: bool = False
+    success: bool = False
+    policy: str = "none"
+    reclaimed_kv_tokens: int = 0
+    reclaimed_kv_bytes: int = 0
+    reclaimed_expert_bytes: int = 0
+    num_kv_victims: int = 0
+    num_expert_victims: int = 0
+    elapsed_ms: float = 0.0
+    reason: str = "policy_none"
+
+
+class DecodePreallocReclaimManager:
+    """Minimal admission hook for PD decode prealloc pressure."""
+
+    def __init__(self, queue: "DecodePreallocQueue"):
+        self.queue = queue
+        self.scheduler = queue.scheduler
+        self.server_args = queue.scheduler.server_args
+        self.policy = self.server_args.decode_prealloc_reclaim_policy
+        self.dry_run = self.server_args.decode_prealloc_reclaim_dry_run
+        self.safe_only = self.server_args.decode_prealloc_kv_reclaim_safe_only
+        self._warned_expert_unavailable = False
+
+    def reclaim_for_prealloc(
+        self,
+        request: "Req",
+        required_tokens: int,
+        available_tokens: int,
+        context: Dict[str, Any],
+    ) -> ReclaimResult:
+        if self.policy == "none":
+            return ReclaimResult(policy=self.policy)
+
+        start = time.perf_counter()
+        result = ReclaimResult(attempted=True, policy=self.policy)
+        try:
+            if self.policy in ("kv_lru", "joint_simple"):
+                self._reclaim_kv(required_tokens, available_tokens, result)
+            if self.policy in ("expert_lru", "joint_simple") and not result.success:
+                self._reclaim_expert(request, required_tokens, available_tokens, result)
+            reclaimed_any = (
+                result.reclaimed_kv_tokens > 0
+                or result.reclaimed_kv_bytes > 0
+                or result.reclaimed_expert_bytes > 0
+            )
+            result.success = reclaimed_any and self._has_capacity(required_tokens)
+            if not result.success and result.reason == "":
+                result.reason = context.get("failure_reason", "insufficient_capacity")
+        except Exception as exc:
+            result.success = False
+            result.reason = f"reclaim_exception:{type(exc).__name__}"
+            logger.exception("decode prealloc reclaim failed")
+        finally:
+            result.elapsed_ms = (time.perf_counter() - start) * 1000
+            self._observe(result)
+        return result
+
+    def _reclaim_kv(
+        self, required_tokens: int, available_tokens: int, result: ReclaimResult
+    ) -> None:
+        deficit = max(0, required_tokens - available_tokens)
+        if deficit <= 0:
+            result.success = True
+            result.reason = "already_enough_capacity"
+            return
+        if (
+            self.safe_only
+            and not self.server_args.disaggregation_decode_enable_radix_cache
+        ):
+            result.reason = "no_safe_kv_victims_without_decode_radix_cache"
+            return
+
+        evictable = int(self.queue.tree_cache.evictable_size() or 0)
+        if evictable <= 0:
+            result.reason = "no_safe_kv_victims"
+            return
+
+        num_to_evict = min(deficit, evictable)
+        if self.dry_run:
+            result.reclaimed_kv_tokens += num_to_evict
+            result.reclaimed_kv_bytes += num_to_evict * self.queue.kv_bytes_per_token()
+            result.num_kv_victims += 1
+            result.success = num_to_evict >= deficit
+            result.reason = "dry_run"
+            return
+
+        evict_result = self.queue.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+        reclaimed = int(getattr(evict_result, "num_tokens_evicted", 0) or 0)
+        result.reclaimed_kv_tokens += reclaimed
+        result.reclaimed_kv_bytes += reclaimed * self.queue.kv_bytes_per_token()
+        result.num_kv_victims += 1 if reclaimed > 0 else 0
+        result.reason = "kv_evictable_cache"
+
+    def _reclaim_expert(
+        self,
+        request: "Req",
+        required_tokens: int,
+        available_tokens: int,
+        result: ReclaimResult,
+    ) -> None:
+        feasibility = self.queue._expert_eviction_feasibility
+        if not feasibility["can_unblock_prealloc"]:
+            result.reason = "expert_eviction_cannot_unblock_prealloc"
+            if self.dry_run:
+                deficit_tokens = max(0, int(required_tokens) - int(available_tokens))
+                bytes_needed = deficit_tokens * self.queue.kv_bytes_per_token()
+                if feasibility["reclaimable_expert_bytes"] >= bytes_needed > 0:
+                    result.reason = (
+                        "dry_run_expert_bytes_available_but_token_pool_static"
+                    )
+            return
+
+        runtime = getattr(
+            getattr(getattr(self.scheduler, "tp_worker", None), "model_runner", None),
+            "layerkv_runtime",
+            None,
+        )
+        if runtime is None or not hasattr(runtime, "prepare_reclaim_for_scheduler"):
+            result.reason = "expert_hooks_unavailable"
+            if not self._warned_expert_unavailable:
+                logger.warning(
+                    "decode prealloc expert_lru requested, but expert residency hooks are unavailable"
+                )
+                self._warned_expert_unavailable = True
+            return
+
+        result.reason = "expert_lru_real_eviction_not_implemented_without_dedicated_expert_only_hook"
+
+    def _has_capacity(self, required_tokens: int) -> bool:
+        return (
+            self.queue._allocatable_token_budgets(count_retracted=True)
+            >= required_tokens
+        )
+
+    def _observe(self, result: ReclaimResult) -> None:
+        collector = getattr(self.scheduler, "metrics_collector", None)
+        if collector is None or not result.attempted:
+            return
+        collector.observe_decode_prealloc_reclaim(
+            success=result.success,
+            reclaimed_kv_tokens=result.reclaimed_kv_tokens,
+            reclaimed_kv_bytes=result.reclaimed_kv_bytes,
+            reclaimed_expert_bytes=result.reclaimed_expert_bytes,
+            num_kv_victims=result.num_kv_victims,
+            num_expert_victims=result.num_expert_victims,
+            elapsed_ms=result.elapsed_ms,
+        )
 
 
 class DecodeReqToTokenPool:
@@ -331,6 +483,168 @@ class DecodePreallocQueue:
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+        self.reclaim_manager = DecodePreallocReclaimManager(self)
+        self._kv_bytes_per_token_cache: Optional[int] = None
+        self._expert_eviction_feasibility = (
+            self.check_expert_eviction_can_help_prealloc()
+        )
+        logger.info(
+            "EXPERT_EVICTION_CAN_UNBLOCK_PREALLOC = %s; reason=%s; "
+            "experts_tracked=%s; expert_runtime_free_supported=%s; "
+            "token_pool_static=%s; token_pool_can_grow=%s; "
+            "resident_expert_bytes=%d; reclaimable_expert_bytes=%d",
+            self._expert_eviction_feasibility["can_unblock_prealloc"],
+            self._expert_eviction_feasibility["reason"],
+            self._expert_eviction_feasibility["experts_tracked"],
+            self._expert_eviction_feasibility["expert_runtime_free_supported"],
+            self._expert_eviction_feasibility["token_pool_static"],
+            self._expert_eviction_feasibility["token_pool_can_grow"],
+            self._expert_eviction_feasibility["resident_expert_bytes"],
+            self._expert_eviction_feasibility["reclaimable_expert_bytes"],
+        )
+
+    def kv_bytes_per_token(self) -> int:
+        if self._kv_bytes_per_token_cache is not None:
+            return self._kv_bytes_per_token_cache
+        try:
+            total_bytes = sum(int(x) for x in self.kv_manager.kv_args.kv_data_lens)
+            self._kv_bytes_per_token_cache = max(
+                0, total_bytes // self.max_total_num_tokens
+            )
+        except Exception:
+            self._kv_bytes_per_token_cache = 0
+        return self._kv_bytes_per_token_cache
+
+    def check_expert_eviction_can_help_prealloc(self) -> Dict[str, Any]:
+        """Diagnose whether expert eviction can directly unblock decode prealloc.
+
+        The current decode admission check is against fixed startup pools
+        (req_to_token, token_to_kv, SWA, and mamba state). Freeing expert HBM only
+        helps this path if the token/KV pool can grow after startup.
+        """
+        runtime = getattr(
+            getattr(getattr(self.scheduler, "tp_worker", None), "model_runner", None),
+            "layerkv_runtime",
+            None,
+        )
+        expert_layers = getattr(runtime, "_expert_layers", {}) if runtime else {}
+        experts_tracked = bool(expert_layers)
+        expert_runtime_free_supported = bool(
+            runtime is not None
+            and getattr(runtime, "physical_expert_supported", False)
+            and hasattr(runtime, "prepare_reclaim_for_scheduler")
+        )
+        token_pool_can_grow = any(
+            hasattr(self.token_to_kv_pool_allocator, name)
+            for name in ("grow", "resize", "expand", "increase_capacity")
+        )
+        resident_expert_bytes = 0
+        reclaimable_expert_bytes = 0
+        for state in expert_layers.values():
+            expert_bytes = int(getattr(state, "expert_bytes", 0) or 0)
+            resident_count = int(getattr(state, "resident_count", 0) or 0)
+            slot_capacity = int(getattr(state, "slot_capacity", resident_count) or 0)
+            resident_expert_bytes += resident_count * expert_bytes
+            reclaimable_expert_bytes += max(0, slot_capacity - 1) * expert_bytes
+
+        can_unblock = expert_runtime_free_supported and token_pool_can_grow
+        if can_unblock:
+            reason = (
+                "expert eviction hooks and elastic token/KV pool growth are available"
+            )
+        elif expert_runtime_free_supported:
+            reason = (
+                "Expert eviction frees HBM but cannot directly increase token-pool "
+                "allocatable capacity in the current runtime. Use static expert "
+                "budget or implement elastic token pool."
+            )
+        elif experts_tracked:
+            reason = (
+                "experts are tracked, but runtime expert-free hooks are unavailable"
+            )
+        else:
+            reason = (
+                "experts are not separately tracked as resident objects in this run"
+            )
+        return {
+            "can_unblock_prealloc": can_unblock,
+            "reason": reason,
+            "experts_tracked": experts_tracked,
+            "expert_runtime_free_supported": expert_runtime_free_supported,
+            "token_pool_static": not token_pool_can_grow,
+            "token_pool_can_grow": token_pool_can_grow,
+            "resident_expert_bytes": resident_expert_bytes,
+            "reclaimable_expert_bytes": reclaimable_expert_bytes,
+        }
+
+    def _mamba_available_size(self) -> Optional[int]:
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return None
+        try:
+            return int(mamba_pool.available_size())
+        except Exception:
+            return None
+
+    def _mamba_usage(self) -> Optional[int]:
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        available = self._mamba_available_size()
+        if mamba_pool is None or available is None:
+            return None
+        return max(0, int(getattr(mamba_pool, "size", 0) or 0) - available)
+
+    def _cuda_free_memory_bytes(self) -> int:
+        try:
+            if torch.cuda.is_available():
+                free, _ = torch.cuda.mem_get_info()
+                return int(free)
+        except Exception:
+            pass
+        return 0
+
+    def _prealloc_diagnostic_context(
+        self,
+        *,
+        required_tokens: int = 0,
+        available_full_tokens: Optional[int] = None,
+        available_swa_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if available_full_tokens is None:
+            available_full_tokens = self._allocatable_token_budgets(
+                count_retracted=True
+            )
+        if available_swa_tokens is None and self._uses_swa_tail_prealloc():
+            available_swa_tokens = self.token_to_kv_pool_allocator.swa_available_size()
+        return {
+            "required_tokens": int(required_tokens),
+            "available_full_tokens": int(available_full_tokens),
+            "available_swa_tokens": (
+                int(available_swa_tokens) if available_swa_tokens is not None else -1
+            ),
+            "available_req_slots": int(self.req_to_token_pool.available_size()),
+            "available_metadata_slots": int(
+                self.req_to_metadata_buffer_idx_allocator.available_size()
+            ),
+            "mamba_usage": self._mamba_usage(),
+            "mamba_available": self._mamba_available_size(),
+            "full_token_usage": self.num_tokens_pre_allocated
+            / max(1, self.max_total_num_tokens),
+            "cuda_free_bytes": self._cuda_free_memory_bytes(),
+            "resident_expert_bytes": self._expert_eviction_feasibility[
+                "resident_expert_bytes"
+            ],
+            "reclaimable_expert_bytes": self._expert_eviction_feasibility[
+                "reclaimable_expert_bytes"
+            ],
+        }
+
+    def _record_prealloc_failure(self, reason: str, context: Dict[str, Any]) -> None:
+        collector = getattr(self.scheduler, "metrics_collector", None)
+        if collector is not None and hasattr(
+            collector, "increment_decode_prealloc_failure"
+        ):
+            collector.increment_decode_prealloc_failure(reason)
+        logger.debug("decode prealloc admission blocked: reason=%s %s", reason, context)
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -811,12 +1125,41 @@ class DecodePreallocQueue:
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                mamba_avail = self._mamba_available_size()
+                reason = "mamba" if mamba_avail == 0 else "req_pool"
+                self._record_prealloc_failure(
+                    reason,
+                    self._prealloc_diagnostic_context(
+                        available_full_tokens=full_allocatable_tokens,
+                        available_swa_tokens=(
+                            swa_allocatable_tokens if uses_swa_tail_prealloc else None
+                        ),
+                    ),
+                )
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                self._record_prealloc_failure(
+                    "metadata",
+                    self._prealloc_diagnostic_context(
+                        available_full_tokens=full_allocatable_tokens,
+                        available_swa_tokens=(
+                            swa_allocatable_tokens if uses_swa_tail_prealloc else None
+                        ),
+                    ),
+                )
                 break
 
             if hisparse_req_budget <= 0:
+                self._record_prealloc_failure(
+                    "other",
+                    self._prealloc_diagnostic_context(
+                        available_full_tokens=full_allocatable_tokens,
+                        available_swa_tokens=(
+                            swa_allocatable_tokens if uses_swa_tail_prealloc else None
+                        ),
+                    ),
+                )
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -853,22 +1196,76 @@ class DecodePreallocQueue:
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
-            if (
-                    max(
-                        required_tokens_for_request,
-                        origin_input_len
-                        - prefix_len
-                        + self._estimated_output_tokens(decode_req.req)
-                        - retractable_tokens,
-                    )
-                    > full_allocatable_tokens
-            ):
+            def _try_reclaim_once(
+                required_tokens: int, available_tokens: int, reason: str
+            ) -> int:
+                # Admission failure path: the request stays in DecodePreallocQueue
+                # unless a policy frees HBM-backed capacity and this iteration can retry.
+                result = self.reclaim_manager.reclaim_for_prealloc(
+                    decode_req.req,
+                    required_tokens=required_tokens,
+                    available_tokens=available_tokens,
+                    context={"failure_reason": reason},
+                )
+                if not result.attempted:
+                    return available_tokens
+                refreshed = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs),
+                )
+                if refreshed >= required_tokens:
+                    collector = getattr(self.scheduler, "metrics_collector", None)
+                    if collector is not None:
+                        collector.increment_decode_prealloc_retry_success()
+                return refreshed
+
+            full_capacity_need = max(
+                required_tokens_for_request,
+                origin_input_len
+                - prefix_len
+                + self._estimated_output_tokens(decode_req.req)
+                - retractable_tokens,
+            )
+            if full_capacity_need > full_allocatable_tokens:
+                full_allocatable_tokens = _try_reclaim_once(
+                    full_capacity_need,
+                    full_allocatable_tokens,
+                    "full_token_budget",
+                )
+            if full_capacity_need > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                self._record_prealloc_failure(
+                    "full_token_pool",
+                    self._prealloc_diagnostic_context(
+                        required_tokens=full_capacity_need,
+                        available_full_tokens=full_allocatable_tokens,
+                        available_swa_tokens=(
+                            swa_allocatable_tokens if uses_swa_tail_prealloc else None
+                        ),
+                    ),
+                )
                 break
+            if required_tokens_for_request > full_allocatable_tokens:
+                full_allocatable_tokens = _try_reclaim_once(
+                    required_tokens_for_request,
+                    full_allocatable_tokens,
+                    "required_alloc_tokens",
+                )
             if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                self._record_prealloc_failure(
+                    "full_token_pool",
+                    self._prealloc_diagnostic_context(
+                        required_tokens=required_tokens_for_request,
+                        available_full_tokens=full_allocatable_tokens,
+                        available_swa_tokens=(
+                            swa_allocatable_tokens if uses_swa_tail_prealloc else None
+                        ),
+                    ),
+                )
                 break
 
             if uses_swa_tail_prealloc:
@@ -882,8 +1279,41 @@ class DecodePreallocQueue:
                     )
                     > swa_allocatable_tokens
                 ):
+                    full_allocatable_tokens = _try_reclaim_once(
+                        max(
+                            swa_required,
+                            swa_len + max_new_tokens - retractable_swa_tokens,
+                        ),
+                        swa_allocatable_tokens,
+                        "swa_token_budget",
+                    )
+                    _, swa_allocatable_tokens = (
+                        self._swa_aware_allocatable_token_budgets(
+                            retractable_tokens=retractable_tokens,
+                            retractable_swa_tokens=retractable_swa_tokens,
+                            count_retracted=True,
+                        )
+                    )
+                if (
+                    max(
+                        swa_required,
+                        swa_len + max_new_tokens - retractable_swa_tokens,
+                    )
+                    > swa_allocatable_tokens
+                ):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    self._record_prealloc_failure(
+                        "swa_token_pool",
+                        self._prealloc_diagnostic_context(
+                            required_tokens=max(
+                                swa_required,
+                                swa_len + max_new_tokens - retractable_swa_tokens,
+                            ),
+                            available_full_tokens=full_allocatable_tokens,
+                            available_swa_tokens=swa_allocatable_tokens,
+                        ),
+                    )
                     break
 
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
@@ -1006,7 +1436,9 @@ class DecodePreallocQueue:
         )
 
     def _estimated_output_tokens(self, req: Req) -> int:
-        estimate = self.scheduler.server_args.disaggregation_decode_output_estimate_tokens
+        estimate = (
+            self.scheduler.server_args.disaggregation_decode_output_estimate_tokens
+        )
         if estimate is not None:
             return min(max(0, estimate), CLIP_MAX_NEW_TOKEN)
         return min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
@@ -1146,6 +1578,8 @@ class DecodePreallocQueue:
                 int(available_tokens) + int(credit) < int(required_tokens)
                 and hasattr(runtime, "prepare_reclaim_for_scheduler")
                 and len(getattr(self.scheduler.running_batch, "reqs", []) or []) > 0
+                and self.scheduler.server_args.decode_prealloc_reclaim_policy
+                not in ("expert_lru", "joint_simple")
             ):
                 runtime.prepare_reclaim_for_scheduler(
                     schedule_batch=self.scheduler.running_batch,

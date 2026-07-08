@@ -1,0 +1,20 @@
+{
+  "duration_ms": "80338.074",
+  "e2e_mean_ms": "18909.688",
+  "e2e_p90_ms": "38417.833",
+  "e2e_p95_ms": "45690.995",
+  "e2e_p99_ms": "53868.726",
+  "output_tokens_total": "28078",
+  "requests_success": "85",
+  "requests_total": "85",
+  "throughput_rps": "1.058",
+  "throughput_tps": "349.498",
+  "tpot_mean_ms": "55.408",
+  "tpot_p90_ms": "56.948",
+  "tpot_p95_ms": "57.933",
+  "tpot_p99_ms": "60.607",
+  "ttft_mean_ms": "1.447",
+  "ttft_p90_ms": "0.021",
+  "ttft_p95_ms": "0.051",
+  "ttft_p99_ms": "40.811"
+}

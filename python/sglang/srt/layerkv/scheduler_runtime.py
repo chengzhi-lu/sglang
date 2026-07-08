@@ -130,9 +130,6 @@ class LayerKVSchedulerMixin:
                 self.stats.layerkv_no_pressure_scheduler_skip_count += 1
             else:
                 self._run_deadline_scheduler(forward_batch)
-                need_tokens = self._planned_kvc_evict_need_tokens(forward_batch)
-                if need_tokens > 0:
-                    self._prepare_kvc_evict_selection(forward_batch, need_tokens)
             self._add_profile(
                 "profile_forward_begin_scheduler_control_ms",
                 (time.perf_counter() - phase_t0) * 1000.0,

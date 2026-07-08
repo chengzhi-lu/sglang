@@ -1,0 +1,38 @@
+trace:
+  path: dataset/qwen_traceA_blksz_16.jsonl
+  name: qwen_traceA
+
+cluster:
+  num_workers: 2
+  hbm_budget_gb: 80
+
+model:
+  base_model_gb: 70
+  workspace_gb: 4
+  resident_expert_gb: 0
+
+kv_cache:
+  num_layers: 10
+  num_kv_heads: 2
+  head_dim: 256
+  bytes_per_elem: 2
+
+linear_attention_state:
+  num_layers: 30
+  num_qk_heads: 16
+  num_v_heads: 32
+  head_dim: 128
+  bytes_per_elem: 2
+
+serving:
+  decode_tokens_per_second: 1000
+  max_active_sessions: 64
+
+simulation:
+  sticky_session: true
+  keep_kv_between_turns: true
+  queue_policy: fifo
+  kv_idle_timeout_s: 300
+
+output:
+  result_dir: results/bailian_sticky_hbm_queue

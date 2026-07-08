@@ -229,6 +229,14 @@ class LayerKVKvcResidencyMixin:
             loc = int(mapping.get(int(loc), int(loc)))
         return loc if loc > 0 else None
 
+    def _per_layer_slot_source_for_layer(self, layer_id: int) -> Optional[torch.Tensor]:
+        table = self._per_layer_req_to_token_overrides.get(int(layer_id))
+        if table is not None:
+            return table
+        if self._req_to_token_pool is None:
+            return None
+        return getattr(self._req_to_token_pool, "req_to_token", None)
+
     def _import_per_layer_arena_loc(self, layer_id: int, loc: int) -> None:
         """Register a native/canonical KV slot as a per-layer arena resident."""
         layer_id = int(layer_id)
@@ -278,10 +286,365 @@ class LayerKVKvcResidencyMixin:
             generation=self._per_layer_req_generation(int(req_idx)),
         )
         self._per_layer_residency[key] = entry
+        self._index_per_layer_page_entry(entry)
         self._per_layer_resident_token_count_fast += 1
         self._mark_active_req_per_layer_allocated(int(req_idx), [key])
         self._sync_kvc_group_if_needed(entry)
         return entry
+
+    def _per_layer_virtual_page_tokens(self) -> int:
+        if self.config.kvc_backend != "per-layer-arena":
+            return max(1, int(self._page_size))
+        return max(1, int(self._per_layer_kvc_block_page_size()))
+
+    def _per_layer_page_id_for_pos(self, pos: int) -> int:
+        page_tokens = self._per_layer_virtual_page_tokens()
+        return max(0, int(pos)) // page_tokens
+
+    def _per_layer_page_ids_for_entry(self, entry: _LayerKVResidencyEntry) -> range:
+        page_tokens = self._per_layer_virtual_page_tokens()
+        start = max(0, int(entry.pos))
+        end = start + max(1, int(entry.token_count))
+        first_page = start // page_tokens
+        last_page = max(first_page, (end - 1) // page_tokens)
+        return range(first_page, last_page + 1)
+
+    def _set_per_layer_page_state_bits(
+        self,
+        *,
+        req_idx: int,
+        layer_id: int,
+        state: str,
+        page_ids: range,
+        add: bool,
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        first_page = int(page_ids.start)
+        last_page = int(page_ids.stop) - 1
+        if last_page < first_page:
+            return
+        width = int(last_page) - int(first_page) + 1
+        mask = ((1 << width) - 1) << int(first_page)
+        key = (int(req_idx), int(layer_id), str(state))
+        old_bits = int(self._per_layer_page_bits_by_req_layer_state.get(key, 0))
+        if add:
+            self._per_layer_page_bits_by_req_layer_state[key] = old_bits | int(mask)
+            return
+        new_bits = old_bits & ~int(mask)
+        if new_bits:
+            self._per_layer_page_bits_by_req_layer_state[key] = new_bits
+        else:
+            self._per_layer_page_bits_by_req_layer_state.pop(key, None)
+
+    def _per_layer_entry_has_resident_device(
+        self, entry: _LayerKVResidencyEntry
+    ) -> bool:
+        return str(entry.state) == "resident" and bool(entry.device_loc_list())
+
+    def _per_layer_resident_span_key_for_entry(
+        self, entry: _LayerKVResidencyEntry
+    ) -> Tuple[int, int, int]:
+        return (
+            int(entry.req_idx),
+            int(entry.layer_id),
+            int(entry.pos) // self._per_layer_virtual_page_tokens(),
+        )
+
+    def _add_per_layer_resident_span_entry(self, entry: _LayerKVResidencyEntry) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        if not self._per_layer_entry_has_resident_device(entry):
+            return
+        self._per_layer_resident_span_by_req_layer_page[
+            self._per_layer_resident_span_key_for_entry(entry)
+        ] = entry
+
+    def _remove_per_layer_resident_span_entry(
+        self, entry: _LayerKVResidencyEntry
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        key = self._per_layer_resident_span_key_for_entry(entry)
+        if self._per_layer_resident_span_by_req_layer_page.get(key) is entry:
+            self._per_layer_resident_span_by_req_layer_page.pop(key, None)
+
+    def _enqueue_per_layer_resident_entry(self, entry: _LayerKVResidencyEntry) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        if str(entry.state) != "resident":
+            return
+        self._add_per_layer_resident_span_entry(entry)
+        self._per_layer_resident_queue_by_layer.setdefault(
+            int(entry.layer_id), []
+        ).append(entry)
+        self._per_layer_resident_queue_by_req_layer.setdefault(
+            (int(entry.req_idx), int(entry.layer_id)), []
+        ).append(entry)
+
+    def _unindex_per_layer_page_entry(self, entry: _LayerKVResidencyEntry) -> None:
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        page_ids = self._per_layer_page_ids_for_entry(entry)
+        removed = False
+        for page_id in page_ids:
+            page_key = (req_idx, layer_id, int(page_id))
+            entries = self._per_layer_page_table.get(page_key)
+            if not entries:
+                continue
+            old_len = len(entries)
+            entries = [item for item in entries if item is not entry]
+            if len(entries) != old_len:
+                removed = True
+            if entries:
+                self._per_layer_page_table[page_key] = entries
+            else:
+                self._per_layer_page_table.pop(page_key, None)
+                req_page_keys = self._per_layer_page_keys_by_req.get(req_idx)
+                if req_page_keys is not None:
+                    req_page_keys.discard(page_key)
+                    if not req_page_keys:
+                        self._per_layer_page_keys_by_req.pop(req_idx, None)
+        for state in ("resident", "offloaded", "reloading", "evicting"):
+            self._set_per_layer_page_state_bits(
+                req_idx=req_idx,
+                layer_id=layer_id,
+                state=state,
+                page_ids=page_ids,
+                add=False,
+            )
+        self._remove_per_layer_resident_span_entry(entry)
+        if removed:
+            self._per_layer_active_entry_count = max(
+                0, int(self._per_layer_active_entry_count) - 1
+            )
+            req_count = max(
+                0,
+                int(self._per_layer_active_entry_count_by_req.get(req_idx, 0)) - 1,
+            )
+            if req_count > 0:
+                self._per_layer_active_entry_count_by_req[req_idx] = req_count
+            else:
+                self._per_layer_active_entry_count_by_req.pop(req_idx, None)
+
+    def _index_per_layer_page_entry(self, entry: _LayerKVResidencyEntry) -> None:
+        req_idx = int(entry.req_idx)
+        layer_id = int(entry.layer_id)
+        page_ids = self._per_layer_page_ids_for_entry(entry)
+        was_active = False
+        for page_id in page_ids:
+            page_key = (req_idx, layer_id, int(page_id))
+            entries = self._per_layer_page_table.setdefault(page_key, [])
+            if any(item is entry for item in entries):
+                was_active = True
+            else:
+                entries.append(entry)
+            self._per_layer_page_keys_by_req.setdefault(req_idx, set()).add(page_key)
+        if not was_active:
+            self._per_layer_active_entry_count += 1
+            self._per_layer_active_entry_count_by_req[req_idx] = (
+                int(self._per_layer_active_entry_count_by_req.get(req_idx, 0)) + 1
+            )
+            self._enqueue_per_layer_resident_entry(entry)
+        for state in ("resident", "offloaded", "reloading", "evicting"):
+            self._set_per_layer_page_state_bits(
+                req_idx=req_idx,
+                layer_id=layer_id,
+                state=state,
+                page_ids=page_ids,
+                add=(
+                    str(entry.state) == state
+                    and (
+                        state != "resident"
+                        or self._per_layer_entry_has_resident_device(entry)
+                    )
+                ),
+            )
+        self._add_per_layer_resident_span_entry(entry)
+
+    def _set_per_layer_page_entry_state(
+        self, entry: _LayerKVResidencyEntry, state: str
+    ) -> None:
+        old_state = str(entry.state)
+        next_state = str(state)
+        page_ids = self._per_layer_page_ids_for_entry(entry)
+        self._remove_per_layer_resident_span_entry(entry)
+        for state_name in ("resident", "offloaded", "reloading", "evicting"):
+            self._set_per_layer_page_state_bits(
+                req_idx=int(entry.req_idx),
+                layer_id=int(entry.layer_id),
+                state=state_name,
+                page_ids=page_ids,
+                add=False,
+            )
+        entry.state = next_state
+        if old_state != "resident" and next_state == "resident":
+            self._enqueue_per_layer_resident_entry(entry)
+        self._set_per_layer_page_state_bits(
+            req_idx=int(entry.req_idx),
+            layer_id=int(entry.layer_id),
+            state=next_state,
+            page_ids=page_ids,
+            add=(
+                next_state != "resident"
+                or self._per_layer_entry_has_resident_device(entry)
+            ),
+        )
+        self._add_per_layer_resident_span_entry(entry)
+
+    def _per_layer_page_entry_for_span(
+        self, layer_id: int, req_idx: int, pos: int, count: int
+    ) -> Optional[_LayerKVResidencyEntry]:
+        if count <= 0:
+            return None
+        page_tokens = self._per_layer_virtual_page_tokens()
+        start = int(pos)
+        end = start + int(count)
+        first_page = start // page_tokens
+        last_page = max(first_page, (end - 1) // page_tokens)
+        entry: Optional[_LayerKVResidencyEntry] = None
+        for page_id in range(first_page, last_page + 1):
+            items = self._per_layer_page_table.get(
+                (int(req_idx), int(layer_id), int(page_id))
+            )
+            if not items:
+                return None
+            item = None
+            for candidate in items:
+                candidate_start = int(candidate.pos)
+                candidate_end = candidate_start + int(candidate.token_count)
+                if candidate_start <= start and candidate_end >= end:
+                    item = candidate
+                    break
+            if item is None:
+                return None
+            if entry is None:
+                entry = item
+            elif entry is not item:
+                return None
+        if entry is None:
+            return None
+        if not self._per_layer_entry_is_current(entry):
+            return None
+        if int(entry.pos) > start:
+            return None
+        if int(entry.pos) + int(entry.token_count) < end:
+            return None
+        return entry
+
+    def _per_layer_page_entries_for_exact_span(
+        self, layer_id: int, req_idx: int, pos: int, count: int, *, state: str
+    ) -> Optional[List[_LayerKVResidencyEntry]]:
+        if count <= 0:
+            return []
+        page_tokens = self._per_layer_virtual_page_tokens()
+        start = int(pos)
+        end = start + int(count)
+        first_page = start // page_tokens
+        last_page = max(first_page, (end - 1) // page_tokens)
+        entries: List[_LayerKVResidencyEntry] = []
+        seen: Set[int] = set()
+        for page_id in range(first_page, last_page + 1):
+            page_entries = self._per_layer_page_table.get(
+                (int(req_idx), int(layer_id), int(page_id))
+            )
+            if not page_entries:
+                return None
+            for entry in page_entries:
+                if id(entry) in seen:
+                    continue
+                entry_start = int(entry.pos)
+                entry_end = entry_start + int(entry.token_count)
+                if entry_end <= start or entry_start >= end:
+                    continue
+                seen.add(id(entry))
+                if str(entry.state) != str(state):
+                    return None
+                if not self._per_layer_entry_is_current(entry):
+                    return None
+                entries.append(entry)
+        entries.sort(key=lambda item: int(item.pos))
+        cursor = start
+        total = 0
+        for entry in entries:
+            if int(entry.pos) != cursor:
+                return None
+            token_count = int(entry.token_count)
+            cursor += token_count
+            total += token_count
+        if cursor != end or total != int(count):
+            return None
+        return entries
+
+    def _drop_per_layer_page_index_for_req(
+        self, req_idx: int, *, collect_entries: bool = True
+    ) -> List[_LayerKVResidencyEntry]:
+        req_idx = int(req_idx)
+        entries: List[_LayerKVResidencyEntry] = []
+        seen: Set[int] = set()
+        for page_key in tuple(self._per_layer_page_keys_by_req.pop(req_idx, set())):
+            page_entries = self._per_layer_page_table.pop(page_key, ()) or ()
+            if not collect_entries:
+                continue
+            for entry in page_entries:
+                entry_id = id(entry)
+                if entry_id in seen:
+                    continue
+                seen.add(entry_id)
+                entries.append(entry)
+        for key in tuple(self._per_layer_page_bits_by_req_layer_state.keys()):
+            if int(key[0]) == req_idx:
+                self._per_layer_page_bits_by_req_layer_state.pop(key, None)
+        for key in tuple(self._per_layer_resident_span_by_req_layer_page.keys()):
+            if int(key[0]) == req_idx:
+                self._per_layer_resident_span_by_req_layer_page.pop(key, None)
+        if collect_entries and entries:
+            req_entry_count = self._take_per_layer_active_entry_count_for_req(req_idx)
+            entry_count = req_entry_count if req_entry_count > 0 else len(entries)
+            self._per_layer_active_entry_count = max(
+                0, int(self._per_layer_active_entry_count) - entry_count
+            )
+        return entries
+
+    def _take_per_layer_active_entry_count_for_req(self, req_idx: int) -> int:
+        return max(
+            0,
+            int(self._per_layer_active_entry_count_by_req.pop(int(req_idx), 0)),
+        )
+
+    def _mark_per_layer_page_entries_dropped(self, entry_count: int) -> None:
+        entry_count = max(0, int(entry_count))
+        if entry_count <= 0:
+            return
+        self._per_layer_active_entry_count = max(
+            0, int(self._per_layer_active_entry_count) - entry_count
+        )
+        self._per_layer_residency_tombstone_count += entry_count
+
+    def _per_layer_page_table_entry_count(self) -> int:
+        return max(0, int(self._per_layer_active_entry_count))
+
+    def _gc_per_layer_residency_tombstones(self, *, force: bool = False) -> int:
+        if self.config.kvc_backend != "per-layer-arena":
+            return 0
+        tombstones = int(self._per_layer_residency_tombstone_count)
+        threshold = int(self._per_layer_residency_gc_threshold)
+        if not force and (tombstones <= 0 or tombstones < threshold):
+            return 0
+        active_ids: Set[int] = set()
+        for entries in self._per_layer_page_table.values():
+            for entry in entries:
+                active_ids.add(id(entry))
+        dropped = 0
+        for key, entry in list(self._per_layer_residency.items()):
+            if id(entry) in active_ids and self._per_layer_entry_is_current(entry):
+                continue
+            self._per_layer_residency.pop(key, None)
+            dropped += 1
+        self._per_layer_residency_tombstone_count = max(
+            0, int(self._per_layer_residency_tombstone_count) - dropped
+        )
+        return dropped
 
     def register_native_kvc_runs_for_extend(
         self,
@@ -423,6 +786,117 @@ class LayerKVKvcResidencyMixin:
         native_locs = native_run.loc_slice(pos, count) if native_run is not None else ()
         if native_locs and len(native_locs) != count:
             return None
+        if self.config.kvc_backend == "per-layer-arena":
+            page_tokens = self._per_layer_virtual_page_tokens()
+            start_page = int(pos) // page_tokens
+            page_count = max(1, (int(count) + page_tokens - 1) // page_tokens)
+            resident_bits = int(
+                self._per_layer_page_bits_by_req_layer_state.get(
+                    (int(req_idx), int(layer_id), "resident"), 0
+                )
+            )
+            required_bits = ((1 << page_count) - 1) << int(start_page)
+            source = self._per_layer_slot_source_for_layer(layer_id)
+            if (
+                source is not None
+                and required_bits
+                and (resident_bits & required_bits) == required_bits
+            ):
+                try:
+                    locs = [
+                        int(x)
+                        for x in source[req_idx, pos : pos + count]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ]
+                except Exception:
+                    locs = []
+                if len(locs) == count and all(int(loc) > 0 for loc in locs):
+                    old_entries: List[_LayerKVResidencyEntry] = []
+                    seen: Set[int] = set()
+                    for page_id in range(start_page, start_page + page_count):
+                        for entry in self._per_layer_page_table.get(
+                            (req_idx, layer_id, int(page_id)), ()
+                        ):
+                            entry_id = id(entry)
+                            if entry_id in seen:
+                                continue
+                            entry_start = int(entry.pos)
+                            entry_end = entry_start + int(entry.token_count)
+                            if entry_end <= pos or entry_start >= pos + count:
+                                continue
+                            seen.add(entry_id)
+                            old_entries.append(entry)
+                    for entry in old_entries:
+                        old_key = (layer_id, req_idx, int(entry.pos))
+                        if self._per_layer_residency.get(old_key) is entry:
+                            self._per_layer_residency.pop(old_key, None)
+                        self._unindex_per_layer_page_entry(entry)
+                    segment = _LayerKVResidencyEntry(
+                        req_idx=req_idx,
+                        pos=pos,
+                        state="resident",
+                        layer_id=layer_id,
+                        device_loc=locs[0],
+                        device_locs=locs,
+                        page_size=count,
+                        last_access_step=self._decode_step,
+                        generation=self._per_layer_req_generation(req_idx),
+                    )
+                    self._per_layer_residency[(layer_id, req_idx, pos)] = segment
+                    self._index_per_layer_page_entry(segment)
+                    self._sync_kvc_group_if_needed(segment)
+                    return [segment]
+        page_entries = self._per_layer_page_entries_for_exact_span(
+            layer_id, req_idx, pos, count, state="resident"
+        )
+        if page_entries is not None:
+            if len(page_entries) > 1:
+                segment_locs: List[int] = []
+                cursor = pos
+                can_coalesce = True
+                for entry in page_entries:
+                    entry_tokens = int(entry.token_count)
+                    if int(entry.pos) != cursor or entry_tokens <= 0:
+                        can_coalesce = False
+                        break
+                    locs = entry.device_loc_list()
+                    if len(locs) != entry_tokens or not all(
+                        int(loc) > 0 for loc in locs
+                    ):
+                        can_coalesce = False
+                        break
+                    segment_locs.extend(int(loc) for loc in locs)
+                    cursor += entry_tokens
+                if (
+                    can_coalesce
+                    and cursor == pos + count
+                    and len(segment_locs) == count
+                ):
+                    for entry in page_entries:
+                        old_key = (layer_id, req_idx, int(entry.pos))
+                        if self._per_layer_residency.get(old_key) is entry:
+                            self._per_layer_residency.pop(old_key, None)
+                        self._unindex_per_layer_page_entry(entry)
+                    segment = _LayerKVResidencyEntry(
+                        req_idx=req_idx,
+                        pos=pos,
+                        state="resident",
+                        layer_id=layer_id,
+                        device_loc=segment_locs[0],
+                        device_locs=segment_locs,
+                        page_size=count,
+                        last_access_step=self._decode_step,
+                        generation=self._per_layer_req_generation(req_idx),
+                    )
+                    self._per_layer_residency[(layer_id, req_idx, pos)] = segment
+                    self._index_per_layer_page_entry(segment)
+                    self._sync_kvc_group_if_needed(segment)
+                    return [segment]
+            for entry in page_entries:
+                entry.last_access_step = self._decode_step
+            return page_entries
         start_key = (layer_id, req_idx, pos)
         if (
             native_locs
@@ -462,6 +936,7 @@ class LayerKVKvcResidencyMixin:
                 generation=self._per_layer_req_generation(req_idx),
             )
             self._per_layer_residency[start_key] = entry
+            self._index_per_layer_page_entry(entry)
             self._per_layer_resident_token_count_fast += count
             self._mark_active_req_per_layer_allocated(req_idx, [start_key])
             self._sync_kvc_group_if_needed(entry)
@@ -525,8 +1000,11 @@ class LayerKVKvcResidencyMixin:
                     generation=self._per_layer_req_generation(req_idx),
                 )
                 self._per_layer_residency[range_keys[0]] = segment
+                self._index_per_layer_page_entry(segment)
                 for key in range_keys[1:]:
-                    self._per_layer_residency.pop(key, None)
+                    old_entry = self._per_layer_residency.pop(key, None)
+                    if old_entry is not None and old_entry is not segment:
+                        self._unindex_per_layer_page_entry(old_entry)
                 if missing_keys and import_arena:
                     self._import_per_layer_arena_locs(layer_id, segment_locs)
                 segment.pos = pos
@@ -572,6 +1050,7 @@ class LayerKVKvcResidencyMixin:
                 generation=self._per_layer_req_generation(req_idx),
             )
             self._per_layer_residency[range_keys[0]] = entry
+            self._index_per_layer_page_entry(entry)
             self._per_layer_resident_token_count_fast += count
             self._mark_active_req_per_layer_allocated(req_idx, [range_keys[0]])
             self._sync_kvc_group_if_needed(entry)
@@ -605,6 +1084,7 @@ class LayerKVKvcResidencyMixin:
                     generation=self._per_layer_req_generation(req_idx),
                 )
                 self._per_layer_residency[key] = entry
+                self._index_per_layer_page_entry(entry)
                 self._per_layer_resident_token_count_fast += 1
                 created_keys.append(key)
                 self._sync_kvc_group_if_needed(entry)
@@ -676,6 +1156,7 @@ class LayerKVKvcResidencyMixin:
         device = self._allocator.device
         req_tensor = torch.full((count,), req_idx, dtype=torch.int64, device=device)
         pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+        page_tokens = self._per_layer_virtual_page_tokens()
         for layer_id in layer_ids:
             layer_locs = locs_by_layer[layer_id]
             if (
@@ -693,40 +1174,41 @@ class LayerKVKvcResidencyMixin:
             mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
             for canonical, physical in zip(canonical_locs, layer_locs):
                 self._record_per_layer_mapping(layer_id, int(canonical), int(physical))
-            for pos, physical in zip(positions, layer_locs):
-                key = (int(layer_id), req_idx, int(pos))
-                entry = self._per_layer_residency.get(key)
-                if reused_invalid and entry is not None:
-                    entry.req_idx = req_idx
-                    entry.pos = int(pos)
-                    entry.state = "resident"
-                    entry.layer_id = int(layer_id)
-                    entry.device_loc = int(physical)
-                    entry.device_locs = [int(physical)]
-                    entry.host_slot = None
-                    entry.host_slots = None
-                    entry.evicted_device_locs = None
-                    entry.page_size = 1
-                    entry.ready_start_event = None
-                    entry.ready_event = None
-                    entry.ready_waited = False
-                    entry.last_access_step = self._decode_step
-                    entry.generation = current_generation
-                else:
-                    entry = _LayerKVResidencyEntry(
-                        req_idx=req_idx,
-                        pos=int(pos),
-                        state="resident",
-                        layer_id=int(layer_id),
-                        device_loc=int(physical),
-                        device_locs=[int(physical)],
-                        page_size=1,
-                        last_access_step=self._decode_step,
-                        generation=current_generation,
-                    )
+            group_start = 0
+            while group_start < count:
+                group_pos = int(positions[group_start])
+                group_page = group_pos // page_tokens
+                group_end = group_start + 1
+                while group_end < count:
+                    next_pos = int(positions[group_end])
+                    if next_pos != int(positions[group_end - 1]) + 1:
+                        break
+                    if next_pos // page_tokens != group_page:
+                        break
+                    group_end += 1
+                page_positions = [int(pos) for pos in positions[group_start:group_end]]
+                page_locs = [int(loc) for loc in layer_locs[group_start:group_end]]
+                pos = page_positions[0]
+                key = (int(layer_id), req_idx, pos)
+                old_entry = self._per_layer_residency.get(key)
+                if old_entry is not None:
+                    self._unindex_per_layer_page_entry(old_entry)
+                entry = _LayerKVResidencyEntry(
+                    req_idx=req_idx,
+                    pos=pos,
+                    state="resident",
+                    layer_id=int(layer_id),
+                    device_loc=int(page_locs[0]),
+                    device_locs=page_locs,
+                    page_size=len(page_locs),
+                    last_access_step=self._decode_step,
+                    generation=current_generation,
+                )
                 self._per_layer_residency[key] = entry
+                self._index_per_layer_page_entry(entry)
                 self._sync_kvc_group_if_needed(entry)
                 owned_keys.append(key)
+                group_start = group_end
         setattr(req, "layerkv_per_layer_allocated", True)
         setattr(req, "skip_radix_cache_insert", True)
         self._mark_req_layerkv_owned(req_idx, owned_keys)
@@ -891,6 +1373,7 @@ class LayerKVKvcResidencyMixin:
                     generation=self._per_layer_req_generation(int(req_idx)),
                 )
                 self._per_layer_residency[key] = entry
+                self._index_per_layer_page_entry(entry)
                 self._sync_kvc_group_if_needed(entry)
                 owned_by_req[int(req_idx)].append(key)
         for req, req_idx in zip(valid_reqs, req_indices):
@@ -1492,16 +1975,22 @@ class LayerKVKvcResidencyMixin:
                 continue
             override = self._per_layer_req_to_token_overrides.get(layer_id)
             source = override if override is not None else table
-            loc = 0
+            locs: List[int] = []
             if source is not None:
                 try:
-                    loc = int(source[req_idx, pos].item())
+                    locs = [
+                        int(x)
+                        for x in source[req_idx, entry.logical_positions()]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ]
                 except Exception:
-                    loc = 0
-            if loc > 0:
-                entry.state = "resident"
-                entry.device_loc = loc
-                entry.device_locs = [loc]
+                    locs = []
+            if locs and all(int(loc) > 0 for loc in locs):
+                entry.device_loc = int(locs[0])
+                entry.device_locs = locs
+                self._set_per_layer_page_entry_state(entry, "resident")
                 entry.host_slot = None
                 entry.host_slots = None
                 entry.ready_event = None
@@ -1509,7 +1998,9 @@ class LayerKVKvcResidencyMixin:
                 entry.ready_waited = False
                 restored += 1
             else:
-                self._per_layer_residency.pop(key, None)
+                dropped_entry = self._per_layer_residency.pop(key, None)
+                if dropped_entry is not None:
+                    self._unindex_per_layer_page_entry(dropped_entry)
                 dropped += 1
         self._per_layer_offloaded_keys.clear()
         self._per_layer_offloaded_keys_by_req.clear()
@@ -1607,7 +2098,10 @@ class LayerKVKvcResidencyMixin:
                         self._host_store.free(host_slots)
                     entry.host_slots = None
                     entry.host_slot = None
-                entry.state = "resident"
+                if self.config.kvc_backend == "per-layer-arena":
+                    self._set_per_layer_page_entry_state(entry, "resident")
+                else:
+                    entry.state = "resident"
                 if self.config.kvc_backend == "per-layer-arena":
                     self._untrack_per_layer_offloaded_key(
                         (int(entry.layer_id), int(entry.req_idx), int(entry.pos)),
@@ -1680,7 +2174,8 @@ class LayerKVKvcResidencyMixin:
         finalized_tokens = 0
         with self._profile("profile_kvc_evict_commit_ms"):
             with self._profile("profile_kvc_layer_evict_commit_ms"):
-                per_layer_locs_to_overwrite: Dict[int, List[int]] = {}
+                per_layer_overwrite_bits: Dict[int, int] = {}
+                cleanup_remove_bits_by_req_layer: Dict[Tuple[int, int], int] = {}
                 stale_host_slots_by_layer: Dict[int, List[int]] = {}
                 for entry in entries:
                     key = (int(entry.layer_id), int(entry.req_idx), int(entry.pos))
@@ -1717,13 +2212,17 @@ class LayerKVKvcResidencyMixin:
                     old_locs_for_overwrite = entry.device_loc_list()
                     entry.evicted_device_locs = old_locs_for_overwrite or None
                     if old_locs_for_overwrite:
-                        self._remove_per_layer_cleanup_locs(
-                            entry, old_locs_for_overwrite
-                        )
-                        per_layer_locs_to_overwrite.setdefault(
-                            int(entry.layer_id), []
-                        ).extend(int(loc) for loc in old_locs_for_overwrite)
-                    entry.state = "offloaded"
+                        layer_id = int(entry.layer_id)
+                        bits = self._locs_to_bitset(old_locs_for_overwrite, min_value=1)
+                        if bits:
+                            req_layer = (int(entry.req_idx), layer_id)
+                            cleanup_remove_bits_by_req_layer[req_layer] = int(
+                                cleanup_remove_bits_by_req_layer.get(req_layer, 0)
+                            ) | int(bits)
+                            per_layer_overwrite_bits[layer_id] = int(
+                                per_layer_overwrite_bits.get(layer_id, 0)
+                            ) | int(bits)
+                    self._set_per_layer_page_entry_state(entry, "offloaded")
                     entry.device_loc = None
                     entry.device_locs = None
                     entry.ready_event = None
@@ -1745,10 +2244,21 @@ class LayerKVKvcResidencyMixin:
                 if finalized_entries:
                     self._track_per_layer_offloaded_keys_batch(finalized_entries)
                     self._track_per_layer_offloaded_runs(finalized_entries)
-                if per_layer_locs_to_overwrite:
+                    for (
+                        req_idx,
+                        layer_id,
+                    ), bits in cleanup_remove_bits_by_req_layer.items():
+                        self._remove_per_layer_cleanup_loc_bits(
+                            int(req_idx), int(layer_id), int(bits)
+                        )
+                if per_layer_overwrite_bits:
                     with self._profile("profile_kvc_free_locs_ms"):
-                        for layer_id, locs in per_layer_locs_to_overwrite.items():
-                            self._push_per_layer_overwrite_locs(layer_id, locs)
+                        for layer_id, bits in per_layer_overwrite_bits.items():
+                            self._push_per_layer_overwrite_bits(
+                                int(layer_id),
+                                int(bits),
+                                token_count=int(bits).bit_count(),
+                            )
                 if self._host_store is not None and stale_host_slots_by_layer:
                     for layer_id, host_slots in stale_host_slots_by_layer.items():
                         self._host_store.free_per_layer(int(layer_id), host_slots)
@@ -1798,11 +2308,13 @@ class LayerKVKvcResidencyMixin:
         did_finalize = False
         finalized_token_total = 0
         for pending in self._pending_kvc_evict_events:
-            eligible = [
-                entry
-                for entry in pending.entries
-                if int(entry.layer_id) < max_layer_exclusive
-            ]
+            eligible: List[_LayerKVResidencyEntry] = []
+            remaining: List[_LayerKVResidencyEntry] = []
+            for entry in pending.entries:
+                if int(entry.layer_id) < max_layer_exclusive:
+                    eligible.append(entry)
+                else:
+                    remaining.append(entry)
             if not eligible:
                 still_pending.append(pending)
                 continue
@@ -1819,10 +2331,7 @@ class LayerKVKvcResidencyMixin:
             finalized_tokens = self._finalize_per_layer_kvc_evict_entries(
                 pending, eligible
             )
-            finalized_ids = {id(entry) for entry in eligible}
-            pending.entries = [
-                entry for entry in pending.entries if id(entry) not in finalized_ids
-            ]
+            pending.entries = remaining
             pending.token_count = sum(
                 int(entry.token_count) for entry in pending.entries
             )
@@ -1879,7 +2388,10 @@ class LayerKVKvcResidencyMixin:
                         offset : offset + entry.token_count
                     ]
                     offset += entry.token_count
-                    entry.state = "offloaded"
+                    if self.config.kvc_backend == "per-layer-arena":
+                        self._set_per_layer_page_entry_state(entry, "offloaded")
+                    else:
+                        entry.state = "offloaded"
                     entry.host_slots = [int(x) for x in page_host_slots]
                     entry.host_slot = (
                         int(page_host_slots[0]) if page_host_slots else None

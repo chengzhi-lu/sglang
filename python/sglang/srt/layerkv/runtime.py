@@ -224,6 +224,30 @@ class LayerKVRuntime(
         self._per_layer_residency: Dict[
             Tuple[int, int, int], _LayerKVResidencyEntry
         ] = {}
+        self._per_layer_page_table: Dict[
+            Tuple[int, int, int], List[_LayerKVResidencyEntry]
+        ] = {}
+        self._per_layer_page_keys_by_req: Dict[int, Set[Tuple[int, int, int]]] = {}
+        self._per_layer_page_bits_by_req_layer_state: Dict[
+            Tuple[int, int, str], int
+        ] = {}
+        self._per_layer_resident_span_by_req_layer_page: Dict[
+            Tuple[int, int, int], _LayerKVResidencyEntry
+        ] = {}
+        self._per_layer_resident_queue_by_layer: Dict[
+            int, List[_LayerKVResidencyEntry]
+        ] = {}
+        self._per_layer_resident_queue_cursor_by_layer: Dict[int, int] = {}
+        self._per_layer_resident_queue_by_req_layer: Dict[
+            Tuple[int, int], List[_LayerKVResidencyEntry]
+        ] = {}
+        self._per_layer_resident_queue_cursor_by_req_layer: Dict[
+            Tuple[int, int], int
+        ] = {}
+        self._per_layer_active_entry_count: int = 0
+        self._per_layer_active_entry_count_by_req: Dict[int, int] = {}
+        self._per_layer_residency_tombstone_count: int = 0
+        self._per_layer_residency_gc_threshold: int = 262144
         self._per_layer_offloaded_keys: Set[Tuple[int, int, int]] = set()
         self._per_layer_offloaded_keys_by_req: Dict[int, Set[Tuple[int, int, int]]] = {}
         self._per_layer_offloaded_keys_by_req_layer: Dict[
@@ -654,6 +678,11 @@ class LayerKVRuntime(
                 "profile_kvc_free_locs_ms",
                 "profile_kvc_host_alloc_ms",
                 "profile_kvc_evict_staging_alloc_ms",
+                "profile_kvc_backup_group_ms",
+                "profile_kvc_backup_span_build_ms",
+                "profile_kvc_backup_tensor_cache_ms",
+                "profile_kvc_backup_op_issue_ms",
+                "profile_kvc_backup_fallback_issue_ms",
                 "profile_kvc_cost_observe_ms",
                 "profile_kvc_refresh_stats_ms",
                 "profile_virtual_select_ms",
@@ -799,98 +828,9 @@ class LayerKVRuntime(
         )
 
     def prepare_first_decode_kvc_eviction_decision(self, forward_batch: Any) -> bool:
-        if int(self._decode_step) != 0:
-            return False
-        if self._prepared_kvc_evict_entries or self._prepared_kvc_evict_schedule:
-            return True
-        if self.config.mode not in ("kvc-only", "kvc-expert"):
-            return False
-        if not self.config.dynamic_pressure_from_kvc:
-            return False
-        if not self.physical_kvc_supported:
-            return False
-        if (
-            self.config.kvc_backend == "per-layer-arena"
-            and not self._ensure_virtual_scratch()
-        ):
-            return False
-
-        old_mode = self._current_forward_mode
-        old_scheduler_pressure_tokens = int(self._scheduler_pressure_tokens)
-        old_scheduler_budget_pressure_tokens = int(
-            getattr(self.stats, "scheduler_budget_pressure_tokens", 0) or 0
-        )
-        t0 = time.perf_counter()
-        warmed_bitmaps = 0
-        try:
-            self._current_forward_mode = "decode"
-            pressure_tokens = self._estimate_next_decode_pressure_tokens(forward_batch)
-            if pressure_tokens > 0:
-                self._scheduler_pressure_tokens = max(
-                    int(self._scheduler_pressure_tokens), int(pressure_tokens)
-                )
-                self.stats.scheduler_budget_pressure_tokens = int(
-                    self._scheduler_pressure_tokens
-                )
-            need_tokens = self._planned_kvc_evict_need_tokens(forward_batch)
-            prepared = False
-            if need_tokens > 0:
-                prepare_schedule = getattr(
-                    self, "_prepare_kvc_evict_selection_schedule", None
-                )
-                if prepare_schedule is not None:
-                    prepared = bool(
-                        prepare_schedule(
-                            forward_batch,
-                            need_tokens,
-                            max_steps=16,
-                        )
-                    )
-                if not prepared:
-                    prepared = self._prepare_kvc_evict_selection(
-                        forward_batch, need_tokens
-                    )
-            if prepared and self.config.kvc_backend == "per-layer-arena":
-                warmed_bitmaps = self._prewarm_per_layer_overwrite_bitmaps()
-        finally:
-            self._current_forward_mode = old_mode
-            self._scheduler_pressure_tokens = old_scheduler_pressure_tokens
-            self.stats.scheduler_budget_pressure_tokens = (
-                old_scheduler_budget_pressure_tokens
-            )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        if prepared:
-            logger.info(
-                "LayerKV first decode KVC eviction decision prepared: %s",
-                json.dumps(
-                    {
-                        "elapsed_ms": elapsed_ms,
-                        "need_tokens": int(need_tokens),
-                        "pressure_tokens": int(pressure_tokens),
-                        "prepared_tokens": int(
-                            sum(
-                                int(entry.token_count)
-                                for entry in self._prepared_kvc_evict_entries
-                            )
-                        ),
-                        "overwrite_bitmap_layers": int(warmed_bitmaps),
-                    },
-                    sort_keys=True,
-                ),
-            )
-        elif self.config.debug_stats:
-            logger.info(
-                "LayerKV first decode KVC eviction decision skipped: %s",
-                json.dumps(
-                    {
-                        "elapsed_ms": elapsed_ms,
-                        "need_tokens": int(need_tokens),
-                        "pressure_tokens": int(pressure_tokens),
-                    },
-                    sort_keys=True,
-                ),
-            )
-        return bool(prepared)
+        # KVC preselect currently duplicates selector work instead of owning a
+        # prepared candidate pool, so keep first-decode reclaim selection lazy.
+        return False
 
     def _prewarm_expert_hotness_buffers(self, forward_batch: Any) -> int:
         if not self._expert_layers and not self._expert_modules:
@@ -1152,6 +1092,7 @@ class LayerKVRuntime(
                 "layerkv_kvc_scheduler": self.config.kvc_scheduler,
                 "layerkv_runtime_profile": self.config.runtime_profile,
                 "layerkv_worker_role": self.config.worker_role,
+                "expert_residency_budget_ratio": self.config.expert_residency_budget_ratio,
                 "layerkv_physical_kvc_supported": self.physical_kvc_supported,
                 "layerkv_physical_expert_supported": self.physical_expert_supported,
                 "layerkv_expert_layer_count": len(self._expert_layers),

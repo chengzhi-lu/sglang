@@ -731,11 +731,8 @@ class LayerKVPlannerMixin:
 
     def _refresh_resident_group_stats(self) -> None:
         if not self._expert_group_tracking_enabled():
-            if (
-                self.config.kvc_backend == "per-layer-arena"
-                and self._coresid_optimized_policy_enabled()
-            ):
-                kvc_groups = len(self._per_layer_residency)
+            if self.config.kvc_backend == "per-layer-arena":
+                kvc_groups = self._per_layer_page_table_entry_count()
                 kvc_resident = int(self._per_layer_resident_token_count_fast)
                 kvc_offloaded = int(self._per_layer_offloaded_token_count_fast)
             else:

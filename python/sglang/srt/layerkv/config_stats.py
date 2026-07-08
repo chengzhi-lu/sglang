@@ -34,6 +34,7 @@ class LayerKVConfig:
     expert_copy_max_budget_mb: float = 0.0
     expert_copy_lookahead_layers: int = 0
     expert_copy_force_drain: bool = False
+    expert_residency_budget_ratio: float = 1.0
     worker_role: str = "standalone"
 
     @classmethod
@@ -89,9 +90,7 @@ class LayerKVConfig:
             expert_hotness_sample_interval=max(
                 1,
                 int(
-                    getattr(
-                        server_args, "layerkv_expert_hotness_sample_interval", 16
-                    )
+                    getattr(server_args, "layerkv_expert_hotness_sample_interval", 16)
                     or 16
                 ),
             ),
@@ -118,15 +117,13 @@ class LayerKVConfig:
             expert_copy_budget_mb=max(
                 0.0,
                 float(
-                    getattr(server_args, "layerkv_expert_copy_budget_mb", 64.0)
-                    or 0.0
+                    getattr(server_args, "layerkv_expert_copy_budget_mb", 64.0) or 0.0
                 ),
             ),
             expert_copy_chunk_mb=max(
                 1.0,
                 float(
-                    getattr(server_args, "layerkv_expert_copy_chunk_mb", 128.0)
-                    or 128.0
+                    getattr(server_args, "layerkv_expert_copy_chunk_mb", 128.0) or 128.0
                 ),
             ),
             expert_copy_max_budget_mb=max(
@@ -142,6 +139,9 @@ class LayerKVConfig:
             ),
             expert_copy_force_drain=bool(
                 getattr(server_args, "layerkv_expert_copy_force_drain", False)
+            ),
+            expert_residency_budget_ratio=float(
+                getattr(server_args, "expert_residency_budget_ratio", 1.0) or 1.0
             ),
             worker_role=worker_role,
         )
@@ -832,6 +832,11 @@ class LayerKVStats:
     virtual_kvc_reload_direct_token_count: int = 0
     virtual_kvc_reload_index_token_count: int = 0
     profile_kvc_evict_staging_alloc_ms: float = 0.0
+    profile_kvc_backup_group_ms: float = 0.0
+    profile_kvc_backup_span_build_ms: float = 0.0
+    profile_kvc_backup_tensor_cache_ms: float = 0.0
+    profile_kvc_backup_op_issue_ms: float = 0.0
+    profile_kvc_backup_fallback_issue_ms: float = 0.0
     profile_kvc_host_alloc_ms: float = 0.0
     profile_kvc_backup_wall_ms: float = 0.0
     profile_kvc_evict_commit_ms: float = 0.0

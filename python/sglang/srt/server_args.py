@@ -708,6 +708,12 @@ class ServerArgs:
     layerkv_expert_copy_max_budget_mb: float = 0.0
     layerkv_expert_copy_lookahead_layers: int = 0
     layerkv_expert_copy_force_drain: bool = False
+    expert_residency_budget_ratio: float = 1.0
+    decode_prealloc_reclaim_policy: Literal[
+        "none", "kv_lru", "expert_lru", "joint_simple"
+    ] = "none"
+    decode_prealloc_reclaim_dry_run: bool = False
+    decode_prealloc_kv_reclaim_safe_only: bool = True
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3517,11 +3523,31 @@ class ServerArgs:
 
     def _handle_layerkv(self):
         """Normalize experimental LayerKV residency settings."""
+        if self.expert_residency_budget_ratio not in (1.0, 0.75, 0.5, 0.25):
+            raise ValueError(
+                "--expert-residency-budget-ratio must be one of: 1.0, 0.75, 0.5, 0.25"
+            )
         if not self.enable_layerkv:
+            if self.expert_residency_budget_ratio != 1.0:
+                logger.warning(
+                    "--expert-residency-budget-ratio=%s requested, but LayerKV "
+                    "expert residency is not enabled; this is a no-op.",
+                    self.expert_residency_budget_ratio,
+                )
             self.layerkv_mode = "off"
             self.layerkv_policy = "none"
             self.layerkv_reclaim_limit_mb = 0.0
             return
+
+        if (
+            self.expert_residency_budget_ratio != 1.0
+            and self.layerkv_mode != "kvc-expert"
+        ):
+            logger.warning(
+                "--expert-residency-budget-ratio=%s requested, but "
+                "--layerkv-mode is not kvc-expert; this is a no-op.",
+                self.expert_residency_budget_ratio,
+            )
 
         if self.disaggregation_mode == "prefill":
             logger.warning(
@@ -3592,9 +3618,7 @@ class ServerArgs:
         if self.layerkv_expert_copy_chunk_mb <= 0:
             raise ValueError("--layerkv-expert-copy-chunk-mb must be positive")
         if self.layerkv_expert_copy_max_budget_mb < 0:
-            raise ValueError(
-                "--layerkv-expert-copy-max-budget-mb must be non-negative"
-            )
+            raise ValueError("--layerkv-expert-copy-max-budget-mb must be non-negative")
         if self.layerkv_expert_copy_lookahead_layers < 0:
             raise ValueError(
                 "--layerkv-expert-copy-lookahead-layers must be non-negative"
@@ -3604,7 +3628,9 @@ class ServerArgs:
                 "--layerkv-expert-cpu-backing-mode must be one of: none, all"
             )
         if self.layerkv_expert_hotness_sample_interval <= 0:
-            raise ValueError("--layerkv-expert-hotness-sample-interval must be positive")
+            raise ValueError(
+                "--layerkv-expert-hotness-sample-interval must be positive"
+            )
 
         # v1 recovery is scheduled outside graph capture.
         if not self.disable_cuda_graph:
@@ -6642,6 +6668,31 @@ class ServerArgs:
             "--layerkv-expert-copy-force-drain",
             action="store_true",
             help="Experiment mode: block to drain expert install D2H and slots after plan creation.",
+        )
+        parser.add_argument(
+            "--expert-residency-budget-ratio",
+            type=float,
+            choices=[1.0, 0.75, 0.5, 0.25],
+            default=ServerArgs.expert_residency_budget_ratio,
+            help="Experimental startup expert residency budget ratio. Values below 1.0 require LayerKV expert residency hooks; otherwise this is a no-op with a warning.",
+        )
+        parser.add_argument(
+            "--decode-prealloc-reclaim-policy",
+            type=str,
+            choices=["none", "kv_lru", "expert_lru", "joint_simple"],
+            default=ServerArgs.decode_prealloc_reclaim_policy,
+            help="Experimental PD decode prealloc admission reclaim policy.",
+        )
+        parser.add_argument(
+            "--decode-prealloc-reclaim-dry-run",
+            action="store_true",
+            help="Record PD decode prealloc reclaim opportunities without freeing memory.",
+        )
+        parser.add_argument(
+            "--decode-prealloc-kv-reclaim-safe-only",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.decode_prealloc_kv_reclaim_safe_only,
+            help="Only reclaim decode KV that is already safely evictable.",
         )
 
         # Hierarchical sparse attention

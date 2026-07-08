@@ -474,9 +474,9 @@ class LayerKVExpertPlannerMixin:
                 key=lambda item: (float(item[0]), int(item[3])),
             )
             max_evict = max(0, full_capacity - min_capacity)
-            points: List[
-                Tuple[int, float, float, float, float, float, int, float]
-            ] = [(0, 0.0, 0.0, 0.0, 0.0, 0.0, full_capacity, 0.0)]
+            points: List[Tuple[int, float, float, float, float, float, int, float]] = [
+                (0, 0.0, 0.0, 0.0, 0.0, 0.0, full_capacity, 0.0)
+            ]
             reclaimed = 0
             base_cost = 0.0
             expected_calls = 0.0
@@ -639,8 +639,7 @@ class LayerKVExpertPlannerMixin:
             for layer_id, capacity in zip(layer_ids, state[6])
         }
         layer_costs = {
-            int(layer_id): float(cost)
-            for layer_id, cost in zip(layer_ids, state[7])
+            int(layer_id): float(cost) for layer_id, cost in zip(layer_ids, state[7])
         }
         return (
             float(state[0]),
@@ -673,9 +672,7 @@ class LayerKVExpertPlannerMixin:
             or precomputed is None
         ):
             return fallback_capacities, fallback_layer_costs
-        base_capacities, min_capacities, expert_bytes_by_layer, candidates = (
-            precomputed
-        )
+        base_capacities, min_capacities, expert_bytes_by_layer, candidates = precomputed
         if not base_capacities or reclaim_mb <= 0.0:
             return fallback_capacities, fallback_layer_costs
 
@@ -741,9 +738,9 @@ class LayerKVExpertPlannerMixin:
         # The first plan uses a short pressure lookahead so later decode steps do
         # not keep introducing new E values.  Once a compact E exists, keep that
         # E stable and only add more layers at the same shape.
-        best_plan: Optional[Tuple[int, float, int, Dict[int, int], Dict[int, float]]] = (
-            None
-        )
+        best_plan: Optional[
+            Tuple[int, float, int, Dict[int, int], Dict[int, float]]
+        ] = None
         best_under_plan: Optional[
             Tuple[int, float, int, Dict[int, int], Dict[int, float], int]
         ] = None
@@ -756,8 +753,7 @@ class LayerKVExpertPlannerMixin:
             evict_count = full_capacity - int(compact_capacity)
             layer_options: List[Tuple[float, int, int]] = []
             capacities = {
-                int(layer_id): int(full_capacity)
-                for layer_id in base_capacities
+                int(layer_id): int(full_capacity) for layer_id in base_capacities
             }
             layer_costs = {int(layer_id): 0.0 for layer_id in base_capacities}
             reclaimed = 0
@@ -779,7 +775,9 @@ class LayerKVExpertPlannerMixin:
                         forced_valid = False
                         break
                     continue
-                layer_cost = sum(float(item[0]) for item in layer_candidates[:evict_count])
+                layer_cost = sum(
+                    float(item[0]) for item in layer_candidates[:evict_count]
+                )
                 layer_bytes = sum(
                     max(1, int(item[1])) for item in layer_candidates[:evict_count]
                 )
@@ -1232,6 +1230,11 @@ class LayerKVExpertPlannerMixin:
         return total / float(1024 * 1024)
 
     def _refresh_reclaim_target_stats(self, forward_batch: Any = None) -> float:
+        per_layer_entry_count = (
+            self._per_layer_page_table_entry_count()
+            if self.config.kvc_backend == "per-layer-arena"
+            else len(self._per_layer_residency)
+        )
         cache_key = (
             id(forward_batch),
             self._current_forward_mode,
@@ -1239,7 +1242,7 @@ class LayerKVExpertPlannerMixin:
             round(float(self.stats.physical_kvc_reclaim_mb), 3),
             round(float(self.stats.physical_expert_reclaim_mb), 3),
             len(self._expert_layers),
-            len(self._per_layer_residency),
+            per_layer_entry_count,
             len(self._residency),
         )
         if self._cached_reclaim_target_key == cache_key:
@@ -1303,7 +1306,9 @@ class LayerKVExpertPlannerMixin:
         if not self.config.dynamic_pressure_from_kvc:
             return max(0.0, float(self.config.reclaim_limit_mb))
         configured = max(0.0, float(self.config.reclaim_limit_mb))
-        dynamic_needed = max(0.0, float(self._dynamic_needed_pressure_mb(forward_batch)))
+        dynamic_needed = max(
+            0.0, float(self._dynamic_needed_pressure_mb(forward_batch))
+        )
         return min(configured, dynamic_needed) if configured > 0.0 else dynamic_needed
 
     def _no_pressure_fast_path_active(self, forward_batch: Any = None) -> bool:
@@ -1500,9 +1505,7 @@ class LayerKVExpertPlannerMixin:
             applied_capacities = self._current_applied_expert_capacities()
             signature = (
                 tuple(sorted((int(k), int(v)) for k, v in capacities.items())),
-                tuple(
-                    sorted((int(k), int(v)) for k, v in applied_capacities.items())
-                ),
+                tuple(sorted((int(k), int(v)) for k, v in applied_capacities.items())),
                 str(context),
             )
             if (
@@ -1551,11 +1554,10 @@ class LayerKVExpertPlannerMixin:
     ) -> Dict[int, int]:
         if self.config.policy != "coresid":
             return self._plan_expert_slot_capacities(target_mb)
-        if (
-            not self._planned_expert_slot_capacities_by_layer
-            or float(target_mb)
-            > float(self._planned_expert_target_mb)
-            + max(1e-3, self._expert_reclaim_quantum_mb())
+        if not self._planned_expert_slot_capacities_by_layer or float(
+            target_mb
+        ) > float(self._planned_expert_target_mb) + max(
+            1e-3, self._expert_reclaim_quantum_mb()
         ):
             plan_target_mb = max(
                 float(target_mb), float(self._planned_expert_target_mb)

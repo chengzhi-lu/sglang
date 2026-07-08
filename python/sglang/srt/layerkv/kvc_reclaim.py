@@ -204,7 +204,10 @@ class LayerKVKvcReclaimMixin:
                 offset += entry.token_count
                 entry.last_access_step = self._decode_step
                 if async_copy and ready_event is not None:
-                    entry.state = "reloading"
+                    if self.config.kvc_backend == "per-layer-arena":
+                        self._set_per_layer_page_entry_state(entry, "reloading")
+                    else:
+                        entry.state = "reloading"
                     if self.config.kvc_backend == "per-layer-arena":
                         host_slots = entry.host_slot_list()
                         if host_slots:
@@ -235,7 +238,10 @@ class LayerKVKvcReclaimMixin:
                     entry.ready_event = ready_event
                     entry.ready_waited = False
                 else:
-                    entry.state = "resident"
+                    if self.config.kvc_backend == "per-layer-arena":
+                        self._set_per_layer_page_entry_state(entry, "resident")
+                    else:
+                        entry.state = "resident"
                     if self.config.kvc_backend == "per-layer-arena":
                         host_slots = entry.host_slot_list()
                         if host_slots:
@@ -628,7 +634,7 @@ class LayerKVKvcReclaimMixin:
                             page_host_slots = per_layer_host_slots_by_entry.get(
                                 id(entry), []
                             )
-                            entry.state = "evicting"
+                            self._set_per_layer_page_entry_state(entry, "evicting")
                             entry.host_slots = list(page_host_slots)
                             entry.host_slot = (
                                 int(page_host_slots[0]) if page_host_slots else None
@@ -728,7 +734,8 @@ class LayerKVKvcReclaimMixin:
                 self.stats.kvc_allocator_free_count += 1
             with self._profile("profile_kvc_evict_commit_ms"):
                 offset = 0
-                per_layer_locs_to_overwrite: Dict[int, List[int]] = {}
+                per_layer_overwrite_bits: Dict[int, int] = {}
+                cleanup_remove_bits_by_req_layer: Dict[Tuple[int, int], int] = {}
                 per_layer_offloaded_to_track: List[_LayerKVResidencyEntry] = []
                 for entry in selected:
                     if self.config.kvc_backend == "per-layer-arena":
@@ -740,10 +747,13 @@ class LayerKVKvcReclaimMixin:
                             offset : offset + entry.token_count
                         ]
                         offset += entry.token_count
-                    entry.state = "offloaded"
                     if self.config.kvc_backend == "virtual-arena":
+                        entry.state = "offloaded"
                         self.stats.virtual_kvc_evict_count += int(entry.token_count)
+                    elif self.config.kvc_backend != "per-layer-arena":
+                        entry.state = "offloaded"
                     if self.config.kvc_backend == "per-layer-arena":
+                        self._set_per_layer_page_entry_state(entry, "offloaded")
                         per_layer_offloaded_to_track.append(entry)
                         self._per_layer_resident_token_count_fast = max(
                             0,
@@ -756,12 +766,16 @@ class LayerKVKvcReclaimMixin:
                         old_locs_for_free = entry.device_loc_list()
                         entry.evicted_device_locs = old_locs_for_free or None
                         if old_locs_for_free:
-                            self._remove_per_layer_cleanup_locs(
-                                entry, old_locs_for_free
-                            )
-                            per_layer_locs_to_overwrite.setdefault(
-                                int(entry.layer_id), []
-                            ).extend(int(loc) for loc in old_locs_for_free)
+                            layer_id = int(entry.layer_id)
+                            bits = self._locs_to_bitset(old_locs_for_free, min_value=1)
+                            if bits:
+                                req_layer = (int(entry.req_idx), layer_id)
+                                cleanup_remove_bits_by_req_layer[req_layer] = int(
+                                    cleanup_remove_bits_by_req_layer.get(req_layer, 0)
+                                ) | int(bits)
+                                per_layer_overwrite_bits[layer_id] = int(
+                                    per_layer_overwrite_bits.get(layer_id, 0)
+                                ) | int(bits)
                         entry.device_loc = None
                         entry.device_locs = None
                     entry.host_slots = [int(x) for x in page_host_slots]
@@ -785,10 +799,21 @@ class LayerKVKvcReclaimMixin:
                         per_layer_offloaded_to_track
                     )
                     self._track_per_layer_offloaded_runs(selected)
-                if per_layer_locs_to_overwrite:
+                    for (
+                        req_idx,
+                        layer_id,
+                    ), bits in cleanup_remove_bits_by_req_layer.items():
+                        self._remove_per_layer_cleanup_loc_bits(
+                            int(req_idx), int(layer_id), int(bits)
+                        )
+                if per_layer_overwrite_bits:
                     with self._profile("profile_kvc_free_locs_ms"):
-                        for layer_id, locs in per_layer_locs_to_overwrite.items():
-                            self._push_per_layer_overwrite_locs(layer_id, locs)
+                        for layer_id, bits in per_layer_overwrite_bits.items():
+                            self._push_per_layer_overwrite_bits(
+                                int(layer_id),
+                                int(bits),
+                                token_count=int(bits).bit_count(),
+                            )
                 if self.config.kvc_backend == "virtual-arena":
                     for req_idx in {int(entry.req_idx) for entry in selected}:
                         self._mark_req_virtualized(req_idx)
@@ -953,8 +978,12 @@ class LayerKVKvcReclaimMixin:
             if self.config.kvc_backend == "per-layer-arena"
             else self._residency
         )
-        self.stats.kvc_residency_entry_count = len(entries)
-        self.stats.kvc_per_layer_arena_entry_count = len(self._per_layer_residency)
+        if self.config.kvc_backend == "per-layer-arena":
+            current_entry_count = self._per_layer_page_table_entry_count()
+        else:
+            current_entry_count = len(entries)
+        self.stats.kvc_residency_entry_count = int(current_entry_count)
+        self.stats.kvc_per_layer_arena_entry_count = int(current_entry_count)
         if (
             self.config.kvc_backend == "per-layer-arena"
             and self._coresid_optimized_policy_enabled()
@@ -1453,6 +1482,12 @@ class LayerKVKvcReclaimMixin:
             return
         if not self._per_layer_released_req_generations:
             return
+        if self._coresid_optimized_policy_enabled():
+            dropped = self._gc_per_layer_residency_tombstones()
+            if dropped > 0:
+                self._recompute_per_layer_residency_fast_counts()
+                self._refresh_kvc_residency_stats()
+            return
         released = self._per_layer_released_req_generations
         keys = [
             key
@@ -1655,11 +1690,24 @@ class LayerKVKvcReclaimMixin:
                 )
         t0 = time.perf_counter()
         if self.config.kvc_backend == "per-layer-arena":
+            per_layer_dropped_tokens = 0
             for req_idx, req_keys in per_layer_to_drop_by_req.items():
-                self._drop_per_layer_residency_for_finished_req(
-                    req_idx, req_keys, refresh=False
+                per_layer_dropped_tokens += (
+                    self._drop_per_layer_residency_for_finished_req(
+                        req_idx, req_keys, refresh=False
+                    )
                 )
-            if per_layer_to_drop:
+            if per_layer_dropped_tokens > 0:
+                cleaned_reqs = set(int(req_idx) for req_idx in per_layer_to_drop_by_req)
+                for req in getattr(forward_batch, "reqs", []) or []:
+                    req_pool_idx = getattr(req, "req_pool_idx", None)
+                    if req_pool_idx is None or int(req_pool_idx) not in cleaned_reqs:
+                        continue
+                    try:
+                        req.layerkv_per_layer_cleaned = True
+                    except Exception:
+                        pass
+            if per_layer_dropped_tokens > 0:
                 refresh_t0 = time.perf_counter()
                 self._refresh_per_layer_allocator_stats()
                 self._add_profile(
@@ -1895,9 +1943,28 @@ class LayerKVKvcReclaimMixin:
             if state is not None
             else self._per_layer_cleanup_token_count_by_req.pop(req_idx, 0)
         )
+        fallback_owned_keys = self._per_layer_owned_keys_by_req.pop(req_idx, set())
         self._per_layer_cleanup_tracked_keys_by_req.pop(req_idx, None)
         self._per_layer_cleanup_layers_by_req.pop(req_idx, None)
-        self._per_layer_owned_keys_by_req.pop(req_idx, None)
+        had_page_index = req_idx in self._per_layer_page_keys_by_req
+        if had_page_index:
+            dropped_entry_count = self._take_per_layer_active_entry_count_for_req(
+                req_idx
+            )
+            self._drop_per_layer_page_index_for_req(req_idx, collect_entries=False)
+            self._mark_per_layer_page_entries_dropped(dropped_entry_count)
+            self._gc_per_layer_residency_tombstones()
+        else:
+            owned_keys = list(fallback_owned_keys)
+            if not owned_keys:
+                owned_keys = list(keys)
+            for key in owned_keys:
+                entry = self._per_layer_residency.pop(key, None)
+                if entry is None:
+                    continue
+                self._remove_resident_group(
+                    "kvc", -1, (int(entry.req_idx), int(entry.pos))
+                )
 
         offloaded_req_keys = self._per_layer_offloaded_keys_by_req.pop(req_idx, set())
         if offloaded_req_keys:
@@ -2024,12 +2091,7 @@ class LayerKVKvcReclaimMixin:
                         (req_idx, layer_id), None
                     )
         if state is not None:
-            state.layers.clear()
-            state.tracked_keys.clear()
-            state.loc_bits_by_layer.clear()
-            state.loc_counts_by_layer.clear()
-            state.host_slot_bits_by_layer.clear()
-            state.host_slot_counts_by_layer.clear()
+            pass
         else:
             self._per_layer_cleanup_state_by_req.pop(req_idx, None)
         self._per_layer_resident_token_count_fast = max(
@@ -2150,6 +2212,7 @@ class LayerKVKvcReclaimMixin:
             entry = self._per_layer_residency.pop(key, None)
             if entry is None:
                 continue
+            self._unindex_per_layer_page_entry(entry)
             layer_id = int(entry.layer_id)
             token_count = int(entry.token_count)
             token_count_total += token_count
@@ -2253,6 +2316,7 @@ class LayerKVKvcReclaimMixin:
             )
         self._per_layer_owned_keys_by_req.pop(req_idx, None)
         self._per_layer_owned_req_indices.discard(req_idx)
+        self._drop_per_layer_page_index_for_req(req_idx)
         if refresh:
             t0 = time.perf_counter()
             self._refresh_kvc_residency_stats()
@@ -2280,6 +2344,8 @@ class LayerKVKvcReclaimMixin:
             self._untrack_per_layer_offloaded_key(key)
             entry = self._per_layer_residency.pop(key, None)
             if entry is not None:
+                if self.config.kvc_backend == "per-layer-arena":
+                    self._unindex_per_layer_page_entry(entry)
                 layer_id = int(entry.layer_id)
                 req_idx = int(entry.req_idx)
                 token_count = int(entry.token_count)
@@ -2449,7 +2515,7 @@ class LayerKVKvcReclaimMixin:
                     ):
                         stale.append(key)
                         continue
-                    if entry.pos + entry.token_count > required_prefix_len:
+                    if int(entry.pos) >= int(required_prefix_len):
                         continue
                     selected.append(entry)
         self.stats.kvc_layerwise_required_index_scan_count += scanned
@@ -2490,7 +2556,7 @@ class LayerKVKvcReclaimMixin:
         )
 
     def _clear_prepared_kvc_evict_selection(
-        self, *, clear_host_slots: bool = True
+        self, *, clear_host_slots: bool = True, clear_schedule: bool = True
     ) -> None:
         if clear_host_slots:
             self._clear_prepared_kvc_evict_host_slots()
@@ -2498,9 +2564,10 @@ class LayerKVKvcReclaimMixin:
         self._prepared_kvc_evict_signature = (0, 0, 0, 0)
         self._prepared_kvc_evict_cursors = {}
         self._prepared_kvc_evict_cursors_by_layer = {}
-        self._clear_prepared_kvc_evict_selection_schedule(
-            clear_host_slots=clear_host_slots
-        )
+        if clear_schedule:
+            self._clear_prepared_kvc_evict_selection_schedule(
+                clear_host_slots=clear_host_slots
+            )
 
     def _clear_prepared_kvc_evict_selection_schedule(
         self, *, clear_host_slots: bool = True
@@ -2560,7 +2627,7 @@ class LayerKVKvcReclaimMixin:
         backup_entries = [
             entry
             for entry in selected
-            if entry.state == "resident"
+            if str(entry.state) in ("resident", "prepared")
             and entry.device_loc_list()
             and len(entry.host_slot_list()) != int(entry.token_count)
         ]
@@ -2713,7 +2780,7 @@ class LayerKVKvcReclaimMixin:
             self._kvc_evict_cursors_by_layer = old_cursors_by_layer
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if not selected:
-            self._clear_prepared_kvc_evict_selection()
+            self._clear_prepared_kvc_evict_selection(clear_schedule=False)
             return False
         self._prepared_kvc_evict_entries = list(selected)
         self._prepared_kvc_evict_signature = signature
@@ -2811,10 +2878,12 @@ class LayerKVKvcReclaimMixin:
         self._prepare_kvc_evict_host_slots(schedule[0][0], signature)
         self.stats.kvc_evict_schedule_build_count += 1
         self.stats.kvc_evict_schedule_step_count += len(schedule)
-        self.stats.kvc_evict_schedule_token_count += sum(item[3] for item in schedule)
+        self.stats.kvc_evict_schedule_token_count += sum(
+            int(item[-1]) for item in schedule
+        )
         self.stats.kvc_evict_schedule_build_ms += elapsed_ms
         self.stats.kvc_evict_preselect_count += 1
-        self.stats.kvc_evict_preselect_token_count += int(schedule[0][3])
+        self.stats.kvc_evict_preselect_token_count += int(schedule[0][-1])
         self.stats.kvc_evict_preselect_ms += elapsed_ms
         return True
 
@@ -2826,7 +2895,6 @@ class LayerKVKvcReclaimMixin:
                 return None
             need_tokens = self._align_tokens_down(max(0, int(need_tokens)))
             if need_tokens <= 0:
-                self._clear_prepared_kvc_evict_selection_schedule()
                 return None
             selected, cursors, cursors_by_layer, token_count = (
                 self._prepared_kvc_evict_schedule[0]
@@ -2854,7 +2922,7 @@ class LayerKVKvcReclaimMixin:
                     seq_len = int(active_lens.get(req_idx, -1))
                     evictable_len = self._align_tokens_down(max(0, seq_len - 1))
                     if (
-                        entry.state != "resident"
+                        str(entry.state) not in ("resident", "prepared")
                         or not entry.device_loc_list()
                         or seq_len <= 0
                         or int(entry.pos) + int(entry.token_count) > int(evictable_len)
@@ -2915,14 +2983,20 @@ class LayerKVKvcReclaimMixin:
             signature = self._kvc_evict_selection_signature(forward_batch, need_tokens)
             if self._prepared_kvc_evict_signature != signature:
                 self.stats.kvc_evict_preselect_invalid_count += 1
-                self._clear_prepared_kvc_evict_selection()
+                self._clear_prepared_kvc_evict_selection(clear_schedule=False)
                 return None
             selected = list(self._prepared_kvc_evict_entries)
             prepared_cursors = dict(self._prepared_kvc_evict_cursors)
             prepared_cursors_by_layer = dict(self._prepared_kvc_evict_cursors_by_layer)
-            self._clear_prepared_kvc_evict_selection(clear_host_slots=False)
+            self._prepared_kvc_evict_entries = []
+            self._prepared_kvc_evict_signature = (0, 0, 0, 0)
+            self._prepared_kvc_evict_cursors = {}
+            self._prepared_kvc_evict_cursors_by_layer = {}
             for entry in selected:
-                if entry.state != "resident" or not entry.device_loc_list():
+                if (
+                    str(entry.state) not in ("resident", "prepared")
+                    or not entry.device_loc_list()
+                ):
                     self.stats.kvc_evict_preselect_invalid_count += 1
                     self._clear_prepared_kvc_evict_host_slots()
                     return None
@@ -3211,6 +3285,8 @@ class LayerKVKvcReclaimMixin:
         selected: List[_LayerKVResidencyEntry] = []
         selected_layers: Set[int] = set()
         global_remaining = self._align_tokens_down(max(0, int(max_tokens)))
+        scratch_capacity = self._per_layer_virtual_scratch_capacity_tokens()
+        offload_run_index_by_req_layer: Dict[Tuple[int, int], int] = {}
 
         def merge_segments(
             segments: List[Tuple[int, int, int]],
@@ -3247,17 +3323,26 @@ class LayerKVKvcReclaimMixin:
             )
             if not runs:
                 return pos, end
-            for run in runs:
+            run_key = (int(req_idx), int(layer_id))
+            run_index = int(offload_run_index_by_req_layer.get(run_key, 0))
+            run_count = len(runs)
+            while run_index < run_count:
+                run = runs[run_index]
                 run_start = int(run.pos)
                 run_end = run_start + int(run.token_count)
                 if run_end <= pos:
+                    run_index += 1
                     continue
                 if run_start <= pos:
                     pos = self._align_tokens_up(run_end)
                     if pos >= end:
+                        offload_run_index_by_req_layer[run_key] = run_index
                         return end, end
+                    run_index += 1
                     continue
+                offload_run_index_by_req_layer[run_key] = run_index
                 return pos, min(end, self._align_tokens_down(run_start))
+            offload_run_index_by_req_layer[run_key] = run_index
             return pos, end
 
         for layer_id, target_tokens in sorted(plan.items()):
@@ -3270,7 +3355,6 @@ class LayerKVKvcReclaimMixin:
             need_tokens = self._align_tokens_down(max(0, int(target_tokens) - current))
             need_tokens = min(int(need_tokens), int(global_remaining))
             need_tokens = self._align_tokens_down(int(need_tokens))
-            scratch_capacity = self._per_layer_virtual_scratch_capacity_tokens()
             if scratch_capacity > 0:
                 need_tokens = min(need_tokens, max(0, scratch_capacity - current))
                 need_tokens = self._align_tokens_down(need_tokens)
@@ -3298,11 +3382,11 @@ class LayerKVKvcReclaimMixin:
             if not pair_meta:
                 continue
             self.stats.kvc_evict_selector_fast_hit += 1
-            round_offsets = {req_idx: 0 for req_idx, _seq_len, _cursor in pair_meta}
+            round_offsets = [0 for _ in pair_meta]
             while remaining >= block_size:
                 progressed = False
-                for req_idx, evictable_len, cursor in pair_meta:
-                    offset = round_offsets[req_idx]
+                for pair_idx, (req_idx, evictable_len, cursor) in enumerate(pair_meta):
+                    offset = int(round_offsets[pair_idx])
                     raw_pos = cursor + offset
                     if raw_pos + block_size > evictable_len:
                         continue
@@ -3310,7 +3394,7 @@ class LayerKVKvcReclaimMixin:
                         layer_id, req_idx, raw_pos, evictable_len
                     )
                     if pos + block_size > span_end:
-                        round_offsets[req_idx] = max(
+                        round_offsets[pair_idx] = max(
                             offset + block_size, int(span_end) - int(cursor)
                         )
                         continue
@@ -3318,12 +3402,22 @@ class LayerKVKvcReclaimMixin:
                         min(int(remaining), int(span_end) - int(pos))
                     )
                     if span_tokens < block_size:
-                        round_offsets[req_idx] = max(
+                        round_offsets[pair_idx] = max(
                             offset + block_size, int(span_end) - int(cursor)
                         )
                         continue
                     key = (layer_id, req_idx, pos)
-                    existing = self._per_layer_residency.get(key)
+                    direct_entry = self._per_layer_residency.get(key)
+                    existing = (
+                        direct_entry
+                        if direct_entry is not None
+                        and self._per_layer_entry_is_current(direct_entry)
+                        else None
+                    )
+                    if existing is None:
+                        existing = self._per_layer_page_entry_for_span(
+                            layer_id, req_idx, pos, span_tokens
+                        )
                     self.stats.kvc_evict_selector_scanned_entries += 1
                     if (
                         existing is not None
@@ -3335,13 +3429,13 @@ class LayerKVKvcReclaimMixin:
                             "evicting",
                         )
                     ):
-                        round_offsets[req_idx] = max(
+                        round_offsets[pair_idx] = max(
                             offset + block_size, int(pos) + block_size - int(cursor)
                         )
                         continue
                     layer_segments.append((req_idx, pos, span_tokens))
                     remaining -= span_tokens
-                    round_offsets[req_idx] = int(pos) + int(span_tokens) - int(cursor)
+                    round_offsets[pair_idx] = int(pos) + int(span_tokens) - int(cursor)
                     progressed = True
                     self.stats.kvc_layerwise_evict_cursor_hit_count += 1
                     if remaining < block_size:
@@ -3364,7 +3458,7 @@ class LayerKVKvcReclaimMixin:
                     int(count),
                     import_arena=False,
                 )
-                self.stats.kvc_evict_selector_scanned_entries += int(count)
+                self.stats.kvc_evict_selector_scanned_entries += 1
                 if segment_entries is None or sum(
                     int(entry.token_count) for entry in segment_entries
                 ) != int(count):

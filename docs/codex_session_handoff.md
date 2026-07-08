@@ -1133,3 +1133,141 @@ Validation:
 - `PYTHONNOUSERSITE=1 /data/wenyan/conda/envs/moe-runtime/bin/python -m py_compile python/sglang/srt/layerkv/runtime.py python/sglang/srt/mem_cache/common.py`
   passed.
 - `git diff --check` passed.
+
+## Current KVC-side Optimization State
+
+Recorded: 2026-07-08T03:19:30Z
+
+Context:
+
+- The current work is focused on LayerKV KVC reclaim/reload overhead on the
+  batch-heavy 2048-token workload, especially the KVC side rather than expert
+  reclaim.
+- The canonical local workload is `batch-heavy-2048` with the ShareGPT dataset
+  at `/root/.cache/huggingface/dataset/ShareGPT_V3_unfiltered_cleaned_split.json`.
+- The comparable pressure run must include `--dynamic-pressure-from-kvc`; without
+  it, the run can shift into expert reclaim and no longer exercises the virtual
+  KVC metadata patch path.
+
+Current retained code state:
+
+- `kvc_reclaim.py`: selector scan accounting was changed so
+  `kvc_evict_selector_scanned_entries` counts materialization attempts instead
+  of token counts. This is a stats-only correction; the selector path itself is
+  still span based.
+- `kvc_residency.py` and `runtime.py`: page/index/queue infrastructure from the
+  earlier KVC experiments remains present, but the experimental page-pool
+  eviction direction was not adopted as the final semantic model.
+- `kvc_virtual.py`: metadata patch cache now keys tensor reuse by the actual
+  row/flat metadata layout signature instead of the broader demand string, and
+  the shared tensor cache no longer includes `metadata_shape` in the key. This
+  improves index/span tensor reuse across compatible metadata instances.
+- Removed/disabled experimental native/bitset/preselect paths:
+  `_select_per_layer_resident_prefix_pages_from_native_runs`,
+  `_select_per_layer_resident_prefix_pages_from_bits`,
+  `_coalesce_per_layer_resident_eviction_selection`, and `prefer_native` are not
+  active.
+
+Attempted but reverted:
+
+- A direct metadata dirty guard that skipped patching when the previous metadata
+  patch had the same decode step, metadata tensor, scratch tensor, and layout.
+- It was correct enough for the local run, but only skipped 51 patches and 11216
+  slots. The extra signature work did not reduce
+  `profile_virtual_direct_metadata_patch_ms`, so the guard was removed.
+
+Reference command:
+
+```bash
+PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=0 \
+LAYERKV_SPAN_OPS_LIB=/tmp/layerkv_span_ext/layerkv_span_ops_ext.so \
+PYTHONPATH=/sgl-workspace/sglang/python:$PYTHONPATH \
+python3 scripts/layerkv_policy_eval.py \
+  --backend server --gpu 0 \
+  --model-path /root/.cache/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39 \
+  --workload batch-heavy-2048 --max-total-tokens 225000 \
+  --policies coresid --dynamic-pressure-from-kvc --profile-detail \
+  --output-dir outputs/layerkv_batch_heavy_2048_kvc_side_metadata_patch_key_pressure \
+  --timeout-s 900 --startup-timeout-s 900 --request-timeout-s 900 \
+  --watchdog-timeout-s 1200 --log-level info
+```
+
+Important run outputs:
+
+- Baseline-ish reference:
+  `outputs/layerkv_batch_heavy_2048_kvc_side_span_stat_only_pressure/policy_eval_summary.json`
+- Retained metadata layout-key change:
+  `outputs/layerkv_batch_heavy_2048_kvc_side_metadata_patch_key_pressure/policy_eval_summary.json`
+- Reverted dirty-guard trial:
+  `outputs/layerkv_batch_heavy_2048_kvc_side_metadata_patch_dirty_guard/policy_eval_summary.json`
+
+Key observations:
+
+- Baseline-ish stat-only run:
+  - `valid=True`
+  - `output_throughput_tok_s=125.7087`
+  - `request_wall_ms=16291.64`
+  - `kvc_evict_selector_scanned_entries=548`
+  - `kvc_evict_selector_selected_entries=132`
+  - `kvc_evict_candidate_selected_tokens=40416`
+  - `virtual_kvc_direct_metadata_patch_count=616`
+  - `metadata_patch_cache_hit_count=65`
+  - `metadata_patch_cache_miss_count=616`
+  - `metadata_patch_slice_count=766`
+  - `metadata_patch_slice_token_count=479481`
+  - `profile_virtual_direct_metadata_patch_ms=44.10`
+  - `profile_virtual_plan_cache_lookup_ms=39.77`
+  - `profile_virtual_host_order_ms=33.44`
+  - `profile_virtual_index_build_ms=25.28`
+- Retained layout-key run:
+  - `valid=True`
+  - `output_throughput_tok_s=121.3786`
+  - `request_wall_ms=16872.83`
+  - `kvc_evict_candidate_selected_tokens=55096`
+  - `virtual_kvc_direct_metadata_patch_count=616`
+  - `metadata_patch_cache_hit_count=509`
+  - `metadata_patch_cache_miss_count=616`
+  - `metadata_patch_slice_count=766`
+  - `metadata_patch_slice_token_count=605936`
+  - `profile_virtual_direct_metadata_patch_ms=50.68`
+  - `profile_virtual_plan_cache_lookup_ms=27.38`
+  - `profile_virtual_host_order_ms=20.92`
+  - `profile_virtual_index_build_ms=30.68`
+
+Interpretation:
+
+- The layout-key cache change improves tensor/cache reuse; hits rose from 65 to
+  509 in the comparable KVC-pressure run.
+- The run-to-run total throughput did not improve because the retained run did
+  more KVC work: more selected eviction tokens, more materialized tokens, and
+  larger metadata patch token count.
+- `metadata_patch_slice_count` itself is not the main problem. It is about 1.24
+  slices per direct patch in the baseline-ish run. The bigger issue is repeated
+  per-layer/per-step metadata patching and cumulative slot count.
+- `metadata_patch_slice_token_count` equals
+  `kvc_per_layer_slot_override_token_count`, so it is cumulative metadata rewrite
+  work, not unique token cardinality.
+- The remaining overhead is mostly real work:
+  actual metadata writes, virtual demand construction/host ordering, and
+  KVC eviction/materialization volume. Further cache-key tuning alone is unlikely
+  to move end-to-end performance much.
+
+Suggested next direction after motivation experiments:
+
+1. Reduce how often virtual KVC needs per-layer metadata patching, rather than
+   only reducing tensor construction overhead.
+2. Investigate whether adjacent layers can share a coarser demand representation
+   or whether layer-specific eviction policy is creating avoidable layout churn.
+3. Continue optimizing commit/staging/backup only with normalized metrics, since
+   KVC selected-token volume varies substantially between runs.
+4. Treat page-pool eviction carefully: earlier exploration suggested a pure
+   page-pool model can break the original layer-specific eviction semantics.
+
+Validation after retained code:
+
+- `python3 -m black --check python/sglang/srt/layerkv/kvc_virtual.py python/sglang/srt/layerkv/runtime.py`
+  passed.
+- `python3 -m py_compile python/sglang/srt/layerkv/kvc_virtual.py python/sglang/srt/layerkv/runtime.py`
+  passed.
+- `PYTHONPATH=/sgl-workspace/sglang/python:$PYTHONPATH python3 scripts/layerkv_smoke.py`
+  passed.

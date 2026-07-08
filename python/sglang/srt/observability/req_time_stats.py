@@ -943,9 +943,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.decode_transfer_queue_entry_time = ts
 
         stage = RequestStage.DECODE_BOOTSTRAP
-        self.observe_per_stage_req_latency(
-            stage, ts - self.decode_prealloc_queue_entry_time
-        )
+        prealloc_wait = ts - self.decode_prealloc_queue_entry_time
+        self.observe_per_stage_req_latency(stage, prealloc_wait)
+        if self.enable_metrics:
+            self.metrics_collector.observe_decode_prealloc_wait(prealloc_wait)
         self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
 
         if self.enable_metrics and self.bootstrap_done_time > 0:
