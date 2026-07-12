@@ -342,6 +342,49 @@ class LayerKVKvcResidencyMixin:
     ) -> bool:
         return str(entry.state) == "resident" and bool(entry.device_loc_list())
 
+    def _append_per_layer_resident_tail(
+        self,
+        *,
+        layer_id: int,
+        req_idx: int,
+        pos: int,
+        physical_loc: int,
+        generation: int,
+    ) -> Optional[_LayerKVResidencyEntry]:
+        layer_id = int(layer_id)
+        req_idx = int(req_idx)
+        pos = int(pos)
+        physical_loc = int(physical_loc)
+        if physical_loc <= 0:
+            return None
+        page_tokens = self._per_layer_virtual_page_tokens()
+        page_id = max(0, pos) // page_tokens
+        entry = self._per_layer_resident_span_by_req_layer_page.get(
+            (req_idx, layer_id, page_id)
+        )
+        if entry is None:
+            return None
+        token_count = int(entry.token_count)
+        if (
+            int(entry.req_idx) != req_idx
+            or int(entry.layer_id) != layer_id
+            or int(entry.generation) != int(generation)
+            or str(entry.state) != "resident"
+            or int(entry.pos) + token_count != pos
+            or int(entry.pos) // page_tokens != page_id
+        ):
+            return None
+        device_locs = entry.device_locs
+        if device_locs is None:
+            device_locs = entry.device_loc_list()
+            entry.device_locs = device_locs
+        if len(device_locs) != token_count or not device_locs:
+            return None
+        device_locs.append(physical_loc)
+        entry.page_size = token_count + 1
+        entry.last_access_step = self._decode_step
+        return entry
+
     def _per_layer_resident_span_key_for_entry(
         self, entry: _LayerKVResidencyEntry
     ) -> Tuple[int, int, int]:
@@ -1405,23 +1448,33 @@ class LayerKVKvcResidencyMixin:
             for req_offset, (req_idx, pos, physical) in enumerate(
                 zip(req_indices, positions, layer_locs)
             ):
-                key = (int(layer_id), int(req_idx), int(pos))
-                entry = _LayerKVResidencyEntry(
-                    req_idx=int(req_idx),
-                    pos=int(pos),
-                    state="resident",
-                    layer_id=int(layer_id),
-                    device_loc=int(physical),
-                    device_locs=[int(physical)],
-                    page_size=1,
-                    last_access_step=self._decode_step,
+                entry = self._append_per_layer_resident_tail(
+                    layer_id=layer_id,
+                    req_idx=req_idx,
+                    pos=pos,
+                    physical_loc=physical,
                     generation=generations[req_offset],
                 )
-                self._per_layer_residency[key] = entry
-                self._index_per_layer_page_entry(entry)
+                if entry is None:
+                    key = (int(layer_id), int(req_idx), int(pos))
+                    entry = _LayerKVResidencyEntry(
+                        req_idx=int(req_idx),
+                        pos=int(pos),
+                        state="resident",
+                        layer_id=int(layer_id),
+                        device_loc=int(physical),
+                        device_locs=[int(physical)],
+                        page_size=1,
+                        last_access_step=self._decode_step,
+                        generation=generations[req_offset],
+                    )
+                    self._per_layer_residency[key] = entry
+                    self._index_per_layer_page_entry(entry)
+                    owned_keys_by_req[req_offset].append(key)
+                else:
+                    self._track_per_layer_cleanup_append(entry, physical)
                 if sync_resident_groups:
                     self._sync_kvc_group(entry)
-                owned_keys_by_req[req_offset].append(key)
         for req, req_idx, owned_keys in zip(valid_reqs, req_indices, owned_keys_by_req):
             setattr(req, "layerkv_per_layer_allocated", True)
             setattr(req, "skip_radix_cache_insert", True)

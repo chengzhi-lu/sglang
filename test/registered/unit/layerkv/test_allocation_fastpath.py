@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layerkv.common_types import _LayerKVResidencyEntry
 from sglang.srt.layerkv.kvc_allocator import LayerKVKvcAllocatorMixin
 from sglang.srt.layerkv.kvc_residency import LayerKVKvcResidencyMixin
 
@@ -16,6 +17,9 @@ class _MappingHarness(LayerKVKvcAllocatorMixin):
 class _DecodeAllocationHarness:
     allocate_decode_slots_for_batch = (
         LayerKVKvcResidencyMixin.allocate_decode_slots_for_batch
+    )
+    _append_per_layer_resident_tail = (
+        LayerKVKvcResidencyMixin._append_per_layer_resident_tail
     )
 
     def __init__(self):
@@ -38,10 +42,13 @@ class _DecodeAllocationHarness:
         self._per_layer_req_to_token_owned = {1}
         self._per_layer_non_identity_mapping = set()
         self._per_layer_residency = {}
+        self._per_layer_resident_span_by_req_layer_page = {}
         self._per_layer_resident_token_count_fast = 0
         self._decode_step = 3
+        self.allocation_round = 0
         self.generation_calls = []
         self.slot_updates = []
+        self.cleanup_appends = []
         self.owned = {}
         self.active_entries = 0
 
@@ -55,7 +62,9 @@ class _DecodeAllocationHarness:
         return None
 
     def _alloc_common_per_layer_locs(self, _count):
-        return [31, 32]
+        start = 31 + self.allocation_round * 2
+        self.allocation_round += 1
+        return [start, start + 1]
 
     def _per_layer_req_generation(self, req_idx):
         self.generation_calls.append(req_idx)
@@ -85,8 +94,18 @@ class _DecodeAllocationHarness:
     def _record_per_layer_mapping(self, *_args):
         raise AssertionError("identity mappings must not enter the mapping table")
 
-    def _index_per_layer_page_entry(self, _entry):
+    def _index_per_layer_page_entry(self, entry):
         self.active_entries += 1
+        page_id = int(entry.pos) // self._per_layer_virtual_page_tokens()
+        self._per_layer_resident_span_by_req_layer_page[
+            (int(entry.req_idx), int(entry.layer_id), page_id)
+        ] = entry
+
+    def _per_layer_virtual_page_tokens(self):
+        return 16
+
+    def _track_per_layer_cleanup_append(self, entry, physical_loc):
+        self.cleanup_appends.append((entry, physical_loc))
 
     def _sync_kvc_group(self, _entry):
         raise AssertionError("optimized allocation must not sync resident groups")
@@ -121,6 +140,46 @@ class _IndependentDecodeAllocationHarness(_DecodeAllocationHarness):
 
     def _record_per_layer_mapping(self, *_args):
         pass
+
+
+class _CleanupHarness(LayerKVKvcAllocatorMixin):
+    def __init__(self):
+        self.config = SimpleNamespace(kvc_backend="per-layer-arena")
+        self._per_layer_cleanup_state_by_req = {}
+
+    def _per_layer_entry_is_current(self, _entry):
+        return True
+
+
+class _ResidencyIndexHarness(LayerKVKvcResidencyMixin):
+    def __init__(self):
+        self.config = SimpleNamespace(kvc_backend="per-layer-arena")
+        self._decode_step = 4
+        self._per_layer_page_table = {}
+        self._per_layer_page_keys_by_req = {}
+        self._per_layer_page_bits_by_req_layer_state = {}
+        self._per_layer_resident_span_by_req_layer_page = {}
+        self._per_layer_resident_queue_by_layer = {}
+        self._per_layer_resident_queue_by_req_layer = {}
+        self._per_layer_active_entry_count = 0
+        self._per_layer_active_entry_count_by_req = {}
+
+    def _per_layer_virtual_page_tokens(self):
+        return 16
+
+    def _per_layer_entry_is_current(self, _entry):
+        return True
+
+
+def _batch(reqs, positions):
+    return SimpleNamespace(
+        reqs=reqs,
+        seq_lens=torch.tensor(positions, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(positions, dtype=torch.int64),
+        req_pool_indices=torch.tensor(
+            [req.req_pool_idx for req in reqs], dtype=torch.int64
+        ),
+    )
 
 
 def test_identity_mapping_is_implicit_and_cleans_stale_non_identity_entries():
@@ -192,3 +251,113 @@ def test_decode_independent_allocations_refresh_allocator_stats_once():
 
     assert runtime.alloc_calls == [(0, 2, False), (1, 2, False)]
     assert runtime.allocator_refresh_count == 1
+
+
+def test_decode_allocation_appends_to_resident_tail_within_page():
+    runtime = _DecodeAllocationHarness()
+    reqs = [SimpleNamespace(req_pool_idx=4), SimpleNamespace(req_pool_idx=9)]
+
+    runtime.allocate_decode_slots_for_batch(_batch(reqs, [5, 7]))
+    runtime.allocate_decode_slots_for_batch(_batch(reqs, [6, 8]))
+
+    assert len(runtime._per_layer_residency) == 4
+    assert runtime.active_entries == 4
+    assert len(runtime.cleanup_appends) == 4
+    assert runtime._per_layer_residency[(0, 4, 5)].device_locs == [31, 33]
+    assert runtime._per_layer_residency[(0, 4, 5)].token_count == 2
+    assert runtime._per_layer_residency[(1, 9, 7)].device_locs == [32, 34]
+    assert runtime.stats.kvc_resident_token_count == 8
+    assert runtime.stats.kvc_residency_entry_count == 4
+
+
+def test_decode_tail_append_rejects_page_boundary_and_stale_generation():
+    runtime = _DecodeAllocationHarness()
+    entry = _LayerKVResidencyEntry(
+        req_idx=4,
+        pos=15,
+        state="resident",
+        layer_id=1,
+        device_loc=41,
+        device_locs=[41],
+        page_size=1,
+        generation=104,
+    )
+    runtime._per_layer_resident_span_by_req_layer_page[(4, 1, 0)] = entry
+
+    assert (
+        runtime._append_per_layer_resident_tail(
+            layer_id=1,
+            req_idx=4,
+            pos=16,
+            physical_loc=42,
+            generation=104,
+        )
+        is None
+    )
+    runtime._per_layer_resident_span_by_req_layer_page[(4, 1, 1)] = entry
+    assert (
+        runtime._append_per_layer_resident_tail(
+            layer_id=1,
+            req_idx=4,
+            pos=16,
+            physical_loc=42,
+            generation=105,
+        )
+        is None
+    )
+    assert entry.device_locs == [41]
+    assert entry.token_count == 1
+
+
+def test_cleanup_tracking_counts_only_the_appended_token():
+    runtime = _CleanupHarness()
+    entry = _LayerKVResidencyEntry(
+        req_idx=4,
+        pos=5,
+        state="resident",
+        layer_id=1,
+        device_loc=41,
+        device_locs=[41, 42],
+        page_size=2,
+    )
+
+    runtime._track_per_layer_cleanup_append(entry, 42)
+    state = runtime._per_layer_cleanup_state_by_req[4]
+    assert state.token_count == 2
+    assert state.loc_counts_by_layer == {1: 2}
+
+    entry.device_locs.append(43)
+    entry.page_size = 3
+    runtime._track_per_layer_cleanup_append(entry, 43)
+    assert state.token_count == 3
+    assert state.loc_counts_by_layer == {1: 3}
+
+
+def test_tail_append_preserves_real_page_index_invariants():
+    runtime = _ResidencyIndexHarness()
+    entry = _LayerKVResidencyEntry(
+        req_idx=4,
+        pos=5,
+        state="resident",
+        layer_id=1,
+        device_loc=41,
+        device_locs=[41],
+        page_size=1,
+        generation=2,
+    )
+    runtime._index_per_layer_page_entry(entry)
+
+    appended = runtime._append_per_layer_resident_tail(
+        layer_id=1,
+        req_idx=4,
+        pos=6,
+        physical_loc=42,
+        generation=2,
+    )
+
+    assert appended is entry
+    assert runtime._per_layer_active_entry_count == 1
+    assert runtime._per_layer_page_table[(4, 1, 0)] == [entry]
+    assert runtime._per_layer_page_entry_for_span(1, 4, 5, 2) is entry
+    assert entry.logical_positions() == [5, 6]
+    assert entry.device_loc_list() == [41, 42]

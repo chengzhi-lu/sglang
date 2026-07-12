@@ -1061,6 +1061,22 @@ class LayerKVKvcAllocatorMixin:
         if host_slots:
             self._add_per_layer_cleanup_host_slots(entry, host_slots)
 
+    def _track_per_layer_cleanup_append(
+        self, entry: _LayerKVResidencyEntry, physical_loc: int
+    ) -> None:
+        if self.config.kvc_backend != "per-layer-arena":
+            return
+        if entry is None or not self._per_layer_entry_is_current(entry):
+            return
+        req_idx = int(entry.req_idx)
+        state = self._per_layer_cleanup_state_by_req.get(req_idx)
+        if state is None:
+            self._track_per_layer_cleanup_entry(entry)
+            return
+        state.token_count = int(state.token_count) + 1
+        state.layers.add(int(entry.layer_id))
+        self._add_per_layer_cleanup_locs(entry, [int(physical_loc)])
+
     def _add_per_layer_cleanup_locs(
         self, entry: _LayerKVResidencyEntry, locs: List[int]
     ) -> None:
