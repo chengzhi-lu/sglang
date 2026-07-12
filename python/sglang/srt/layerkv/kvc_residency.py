@@ -1290,8 +1290,17 @@ class LayerKVKvcResidencyMixin:
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
             return None
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
         try:
-            positions = [int(x) for x in seq_lens.detach().cpu().tolist()]
+            if seq_lens_cpu is not None:
+                values = (
+                    seq_lens_cpu.tolist()
+                    if isinstance(seq_lens_cpu, torch.Tensor)
+                    else seq_lens_cpu
+                )
+                positions = [int(x) for x in values]
+            else:
+                positions = [int(x) for x in seq_lens.detach().cpu().tolist()]
         except Exception:
             return None
         req_indices: List[int] = []
@@ -1325,23 +1334,50 @@ class LayerKVKvcResidencyMixin:
             else:
                 locs_by_layer = {}
                 for layer_id in layer_ids:
-                    layer_locs = self._alloc_per_layer_locs(layer_id, count)
+                    layer_locs = self._alloc_per_layer_locs(
+                        layer_id, count, refresh_stats=False
+                    )
                     if layer_locs is None:
                         for rollback_layer, rollback_locs in locs_by_layer.items():
                             self._push_per_layer_overwrite_locs(
                                 rollback_layer, rollback_locs
                             )
+                        self._refresh_per_layer_allocator_stats()
                         return None
                     locs_by_layer[layer_id] = layer_locs
+                self._refresh_per_layer_allocator_stats()
                 canonical_locs = list(locs_by_layer[layer_ids[0]])
                 self.stats.kvc_per_layer_independent_alloc_count += count
 
-        owned_by_req: Dict[int, List[Tuple[int, int, int]]] = {
-            int(req_idx): [] for req_idx in req_indices
-        }
+        owned_keys_by_req: List[List[Tuple[int, int, int]]] = [[] for _ in req_indices]
+        generations = [
+            self._per_layer_req_generation(req_idx) for req_idx in req_indices
+        ]
         device = self._allocator.device
-        req_tensor = torch.tensor(req_indices, dtype=torch.int64, device=device)
-        pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+        batch_req_tensor = getattr(batch, "req_pool_indices", None)
+        if (
+            isinstance(batch_req_tensor, torch.Tensor)
+            and int(batch_req_tensor.numel()) == count
+            and batch_req_tensor.device == device
+        ):
+            req_tensor = batch_req_tensor.to(dtype=torch.int64)
+        else:
+            req_tensor = torch.tensor(req_indices, dtype=torch.int64, device=device)
+        if (
+            isinstance(seq_lens, torch.Tensor)
+            and int(seq_lens.numel()) == count
+            and seq_lens.device == device
+        ):
+            pos_tensor = seq_lens.to(dtype=torch.int64)
+        else:
+            pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+        canonical_tensor = torch.tensor(
+            canonical_locs, dtype=torch.int64, device=device
+        )
+        sync_resident_groups = not (
+            self.config.kvc_backend == "per-layer-arena"
+            and self.config.runtime_profile == "optimized"
+        )
         for layer_id in layer_ids:
             layer_locs = locs_by_layer[layer_id]
             if (
@@ -1352,14 +1388,23 @@ class LayerKVKvcResidencyMixin:
                     layer_id,
                     req_indices,
                     positions,
-                    torch.tensor(layer_locs, dtype=torch.int64, device=device),
+                    (
+                        canonical_tensor
+                        if layer_locs == canonical_locs
+                        else torch.tensor(layer_locs, dtype=torch.int64, device=device)
+                    ),
                     req_tensor=req_tensor,
                     pos_tensor=pos_tensor,
                 )
-            mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
-            for canonical, physical in zip(canonical_locs, layer_locs):
-                self._record_per_layer_mapping(layer_id, int(canonical), int(physical))
-            for req_idx, pos, physical in zip(req_indices, positions, layer_locs):
+            if (
+                layer_locs != canonical_locs
+                or int(layer_id) in self._per_layer_non_identity_mapping
+            ):
+                for canonical, physical in zip(canonical_locs, layer_locs):
+                    self._record_per_layer_mapping(layer_id, canonical, physical)
+            for req_offset, (req_idx, pos, physical) in enumerate(
+                zip(req_indices, positions, layer_locs)
+            ):
                 key = (int(layer_id), int(req_idx), int(pos))
                 entry = _LayerKVResidencyEntry(
                     req_idx=int(req_idx),
@@ -1370,22 +1415,30 @@ class LayerKVKvcResidencyMixin:
                     device_locs=[int(physical)],
                     page_size=1,
                     last_access_step=self._decode_step,
-                    generation=self._per_layer_req_generation(int(req_idx)),
+                    generation=generations[req_offset],
                 )
                 self._per_layer_residency[key] = entry
                 self._index_per_layer_page_entry(entry)
-                self._sync_kvc_group_if_needed(entry)
-                owned_by_req[int(req_idx)].append(key)
-        for req, req_idx in zip(valid_reqs, req_indices):
+                if sync_resident_groups:
+                    self._sync_kvc_group(entry)
+                owned_keys_by_req[req_offset].append(key)
+        for req, req_idx, owned_keys in zip(valid_reqs, req_indices, owned_keys_by_req):
             setattr(req, "layerkv_per_layer_allocated", True)
             setattr(req, "skip_radix_cache_insert", True)
-            self._mark_req_layerkv_owned(int(req_idx), owned_by_req[int(req_idx)])
+            self._mark_req_layerkv_owned(int(req_idx), owned_keys)
         self.stats.kvc_per_layer_logical_token_count += count
         self._per_layer_resident_token_count_fast += count * len(layer_ids)
-        self._refresh_kvc_residency_stats()
-        return torch.tensor(
-            canonical_locs, dtype=torch.int64, device=self._allocator.device
-        )
+        if self._coresid_optimized_policy_enabled():
+            resident = int(max(0, self._per_layer_resident_token_count_fast))
+            entry_count = self._per_layer_page_table_entry_count()
+            self.stats.kvc_resident_token_count = resident
+            self.stats.kvc_per_layer_arena_resident_token_count = resident
+            self.stats.kvc_resident_page_count = resident
+            self.stats.kvc_residency_entry_count = entry_count
+            self.stats.kvc_per_layer_arena_entry_count = entry_count
+        else:
+            self._refresh_kvc_residency_stats()
+        return canonical_tensor
 
     def can_satisfy_decode_allocation(
         self, required_tokens: int, *, for_prefill: bool = False

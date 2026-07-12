@@ -308,7 +308,9 @@ class LayerKVKvcAllocatorMixin:
         self._refresh_per_layer_allocator_stats()
         return len(self._per_layer_arena_common_free_locs) >= min_free_tokens
 
-    def _alloc_per_layer_locs(self, layer_id: int, count: int) -> Optional[List[int]]:
+    def _alloc_per_layer_locs(
+        self, layer_id: int, count: int, *, refresh_stats: bool = True
+    ) -> Optional[List[int]]:
         layer_id = int(layer_id)
         count = max(0, int(count))
         if count <= 0:
@@ -363,7 +365,8 @@ class LayerKVKvcAllocatorMixin:
             self._per_layer_arena_common_free_locs.discard(int(loc))
         self._per_layer_arena_allocated_locs.setdefault(layer_id, set()).update(locs)
         self.stats.kvc_per_layer_physical_arena_alloc_count += remaining
-        self._refresh_per_layer_allocator_stats()
+        if refresh_stats:
+            self._refresh_per_layer_allocator_stats()
         return [int(x) for x in overwrite_locs] + [int(x) for x in locs]
 
     def _alloc_common_per_layer_locs(self, count: int) -> Optional[List[int]]:
@@ -1220,6 +1223,33 @@ class LayerKVKvcAllocatorMixin:
         layer_id = int(layer_id)
         canonical = int(canonical)
         physical = int(physical)
+        if canonical == physical:
+            mapping = self._per_layer_canonical_to_physical.get(layer_id)
+            reverse = self._per_layer_physical_to_canonical.get(layer_id)
+            if mapping is None and reverse is None:
+                return
+            mapping = mapping or {}
+            reverse = reverse or {}
+            previous_physical = mapping.pop(canonical, None)
+            if (
+                previous_physical is not None
+                and int(reverse.get(int(previous_physical), -1)) == canonical
+            ):
+                reverse.pop(int(previous_physical), None)
+            previous_canonical = reverse.pop(physical, None)
+            if (
+                previous_canonical is not None
+                and int(mapping.get(int(previous_canonical), -1)) == physical
+            ):
+                mapping.pop(int(previous_canonical), None)
+            if mapping:
+                self._per_layer_canonical_to_physical[layer_id] = mapping
+                self._per_layer_physical_to_canonical[layer_id] = reverse
+            else:
+                self._per_layer_canonical_to_physical.pop(layer_id, None)
+                self._per_layer_physical_to_canonical.pop(layer_id, None)
+                self._per_layer_non_identity_mapping.discard(layer_id)
+            return
         mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
         reverse = self._per_layer_physical_to_canonical.setdefault(layer_id, {})
         previous_physical = mapping.get(canonical)
@@ -1231,8 +1261,7 @@ class LayerKVKvcAllocatorMixin:
             mapping.pop(int(previous_canonical), None)
         mapping[canonical] = physical
         reverse[physical] = canonical
-        if canonical != physical:
-            self._per_layer_non_identity_mapping.add(layer_id)
+        self._per_layer_non_identity_mapping.add(layer_id)
 
     def _translate_per_layer_locs(self, layer_id: int, loc: Any) -> Any:
         if self.config.kvc_backend != "per-layer-arena":
