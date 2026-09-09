@@ -43,6 +43,9 @@ except Exception:  # pragma: no cover - optional JIT helper.
 
 class LayerKVExpertInstallMixin:
     def _apply_expert_plan_once(self, forward_batch: Any) -> None:
+        if self._shared_expert is not None:
+            self._shared_expert.ensure_installed()
+            return
         if self.config.mode != "kvc-expert":
             return
         if self.config.expert_collector_only:
@@ -385,6 +388,9 @@ class LayerKVExpertInstallMixin:
         new_capacity = max(1, min(int(new_capacity), int(state.slot_capacity)))
         if new_capacity >= int(state.slot_capacity):
             return
+        # Generic compact reinstallation is a cold path, not a ledger update.
+        state.backing_cache_accounted_by_id = None
+        state.backing_cache_accounted_bytes = 0
         current_resident = list(state.logical_to_slot.keys())
         candidate_order = self._expert_candidate_order_by_layer.get(
             int(state.layer_id)
@@ -1097,8 +1103,12 @@ class LayerKVExpertInstallMixin:
         return (str(tensor.device), tensor.dtype, tuple(int(x) for x in tensor.shape))
 
     def _alloc_expert_compact_tensor(
-        self, old: torch.Tensor, slot_capacity: int
+        self, old: torch.Tensor, slot_capacity: int, *, layer_id: Optional[int] = None
     ) -> torch.Tensor:
+        if self._shared_expert is not None:
+            return self._shared_expert.allocate_expert(
+                old, slot_capacity, layer_id=layer_id
+            )
         shape = (int(slot_capacity),) + tuple(old.shape[1:])
         key = (str(old.device), old.dtype, tuple(int(x) for x in shape))
         pool = self._expert_compact_tensor_pool.get(key)
@@ -1160,14 +1170,14 @@ class LayerKVExpertInstallMixin:
                         for name in param_names:
                             old = getattr(item.module, name).data
                             compact_params[name] = self._alloc_expert_compact_tensor(
-                                old, item.slot_capacity
+                                old, item.slot_capacity, layer_id=item.layer_id
                             )
                         ready_event.record(active_stream)
                 else:
                     for name in param_names:
                         old = getattr(item.module, name).data
                         compact_params[name] = self._alloc_expert_compact_tensor(
-                            old, item.slot_capacity
+                            old, item.slot_capacity, layer_id=item.layer_id
                         )
             item.preallocated_compact_params = compact_params
             item.prealloc_ready_event = ready_event
@@ -1260,17 +1270,34 @@ class LayerKVExpertInstallMixin:
                 self.stats.expert_prepared_backing_miss_count += 1
                 missing_cpu_experts.append(expert_id)
             if missing_cpu_experts:
-                self.stats.expert_install_d2h_sync_fallback_count += len(
-                    missing_cpu_experts
-                )
-                cpu_params.update(
-                    self._copy_experts_to_cpu_for_install_batched(
+                attempted_async = async_copy and device.type == "cuda"
+                async_submitted = False
+                if attempted_async:
+                    copied_bytes = self._copy_experts_to_cpu_for_install_batched_async(
                         module,
                         param_names,
                         missing_cpu_experts,
                         layer_id=layer_id,
+                        target_cpu_params=cpu_params,
+                        reason="install_backing_async",
                     )
-                )
+                    async_submitted = copied_bytes >= 0
+                if not async_submitted:
+                    # The async helper records a failed submission itself;
+                    # count a synchronous path here only when no async path
+                    # was attempted at all.
+                    if not attempted_async:
+                        self.stats.expert_install_d2h_sync_fallback_count += len(
+                            missing_cpu_experts
+                        )
+                    cpu_params.update(
+                        self._copy_experts_to_cpu_for_install_batched(
+                            module,
+                            param_names,
+                            missing_cpu_experts,
+                            layer_id=layer_id,
+                        )
+                    )
         self.stats.expert_install_metadata_ms += (
             time.perf_counter() - t_meta
         ) * 1000.0
@@ -1304,7 +1331,7 @@ class LayerKVExpertInstallMixin:
                         if new_data is None:
                             t_alloc = time.perf_counter()
                             new_data = self._alloc_expert_compact_tensor(
-                                old, slot_capacity
+                                old, slot_capacity, layer_id=layer_id
                             )
                             self.stats.expert_install_weight_alloc_ms += (
                                 time.perf_counter() - t_alloc
@@ -1327,7 +1354,7 @@ class LayerKVExpertInstallMixin:
                     if new_data is None:
                         t_alloc = time.perf_counter()
                         new_data = self._alloc_expert_compact_tensor(
-                            old, slot_capacity
+                            old, slot_capacity, layer_id=layer_id
                         )
                         self.stats.expert_install_weight_alloc_ms += (
                             time.perf_counter() - t_alloc
@@ -1426,12 +1453,20 @@ class LayerKVExpertInstallMixin:
         def wrapped_run_moe_core(dispatch_output: Any, *args, **kwargs):
             topk_output = getattr(dispatch_output, "topk_output", None)
             if self._expert_chunked_core_required(state, topk_output):
+                controller = self._shared_expert_controller_for_state(state)
+                if controller is not None:
+                    return controller.run_token_chunks(
+                        state, dispatch_output, *args, **kwargs
+                    )
                 return self._run_expert_core_chunked(
                     state, dispatch_output, *args, **kwargs
                 )
             rewritten_dispatch = self._prepare_expert_dispatch_for_core(
                 state, dispatch_output
             )
+            controller = self._shared_expert_controller_for_state(state)
+            if controller is not None:
+                controller.record_use(state, rewritten_dispatch)
             return state.orig_run_moe_core(rewritten_dispatch, *args, **kwargs)
 
         module.run_moe_core = wrapped_run_moe_core
@@ -1458,6 +1493,8 @@ class LayerKVExpertInstallMixin:
         slot_capacity: int,
         initial_resident: Optional[List[int]] = None,
         prepared_cpu_params: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+        *,
+        async_copy: bool = False,
     ) -> _LayerKVExpertLayerState:
         if getattr(module, "_layerkv_expert_wrapped", False):
             return self._expert_layers[layer_id]
@@ -1467,7 +1504,7 @@ class LayerKVExpertInstallMixin:
             slot_capacity,
             initial_resident=initial_resident,
             prepared_cpu_params=prepared_cpu_params,
-            async_copy=False,
+            async_copy=async_copy,
         )
         return self._commit_expert_layer_slot_install(build)
 
@@ -1528,5 +1565,3 @@ class LayerKVExpertInstallMixin:
         self._expert_host_backing_bytes += sum(int(t.nbytes) for t in backing.values())
         self._refresh_expert_host_backing_stat()
         return backing
-
-

@@ -158,7 +158,9 @@ def main() -> int:
     expert_rt = LayerKVRuntime(LayerKVConfig.from_server_args(expert_args))
     expert_runner = ExpertRunner()
     expert_rt.install_on_runner(expert_runner)
-    expert_rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    expert_rt.on_forward_begin(
+        mode="decode", forward_batch=SimpleNamespace(batch_size=1)
+    )
     expert_summary = expert_rt.summary()
     assert expert_summary["planned_kvc_reclaim_mb"] == 0.0
     assert expert_summary["planned_expert_reclaim_mb"] > 0.0
@@ -172,7 +174,9 @@ def main() -> int:
         router_logits=torch.empty((1, 4), dtype=torch.float32),
     )
     expert_runner.model.moe(torch.zeros((1, 2), dtype=torch.float32), topk)
-    expert_rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    expert_rt.on_forward_begin(
+        mode="decode", forward_batch=SimpleNamespace(batch_size=1)
+    )
     assert expert_runner.model.moe.w13_weight.shape[0] < 4
     state = expert_rt._expert_layers.get(expert_runner.model.moe.layer_id)
     offloaded = [

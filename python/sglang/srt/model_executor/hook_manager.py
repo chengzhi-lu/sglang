@@ -52,7 +52,9 @@ def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -
             continue
 
         for module_name, module in matched:
-            _ = module.register_forward_hook(hook)
+            _ = module.register_forward_hook(
+                hook, with_kwargs=spec.get("with_kwargs", False)
+            )
             logger.info(f"Registered forward hook '{spec_name}' " f"on {module_name}")
 
 

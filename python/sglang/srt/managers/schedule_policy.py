@@ -429,6 +429,14 @@ class PrefillAdder:
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+        # A LayerKV recall can make physically proven KV addresses available
+        # after this adder was constructed. Extend only this pass's input
+        # budget; the native total-token check still revalidates every request.
+        self.layerkv_prefill_credit_tokens = max(
+            0, int(self._layerkv_prefill_credit_tokens())
+        )
+        self.rem_input_tokens += self.layerkv_prefill_credit_tokens
+        self.layerkv_physical_admission_shortage_tokens = 0
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
 
@@ -480,6 +488,69 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+    def _prefill_admission_batch_size(self) -> int:
+        running = len(
+            getattr(getattr(self, "running_batch", None), "reqs", []) or []
+        )
+        return max(1, running + len(getattr(self, "can_run_list", []) or []) + 1)
+
+    def _try_layerkv_recall_for_admission(
+        self,
+        shortage_tokens: int,
+        *,
+        context_tokens: Optional[int] = None,
+        allow_kv_overflow: bool = True,
+    ) -> int:
+        if shortage_tokens <= 0:
+            return False
+        get_pool = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+        if get_pool is None:
+            return False
+        kv_pool = get_pool()
+        runtime = getattr(kv_pool, "layerkv_runtime", None)
+        recall = getattr(runtime, "recall_shared_expert_for_admission", None)
+        if recall is None:
+            return False
+        # Unlike the read-only credit query, ownership-transfer failures must
+        # propagate. Never continue admission after a partially failed recall.
+        required = int(shortage_tokens)
+        if required < shortage_tokens:
+            required += 1
+        recall_kwargs = {"shortage_tokens": required}
+        if context_tokens is not None:
+            batch_size_fn = getattr(self, "_prefill_admission_batch_size", None)
+            if callable(batch_size_fn):
+                batch_size = int(batch_size_fn())
+            else:
+                running = len(
+                    getattr(getattr(self, "running_batch", None), "reqs", []) or []
+                )
+                batch_size = max(
+                    1, running + len(getattr(self, "can_run_list", []) or []) + 1
+                )
+            recall_kwargs.update(
+                context_tokens=max(0, int(context_tokens)),
+                batch_size=batch_size,
+                allow_kv_overflow=bool(allow_kv_overflow),
+            )
+        try:
+            recovered = max(0, int(recall(**recall_kwargs) or 0))
+        except TypeError as error:
+            # Keep small test adapters and downstream integrations that expose
+            # the original shortage-only callback source-compatible. Do not
+            # hide TypeErrors raised from inside the callback itself.
+            if set(recall_kwargs) == {"shortage_tokens"} or (
+                "unexpected keyword" not in str(error)
+            ):
+                raise
+            recovered = max(0, int(recall(shortage_tokens=required) or 0))
+        if recovered > 0 and hasattr(self, "rem_input_tokens"):
+            self.rem_input_tokens += recovered
+            self.layerkv_prefill_credit_tokens = (
+                getattr(self, "layerkv_prefill_credit_tokens", 0) + recovered
+            )
+        return recovered
+
     def _layerkv_prefill_credit_tokens(self) -> int:
         try:
             kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -500,6 +571,144 @@ class PrefillAdder:
             )
         except Exception:
             return 0
+
+    def _try_layerkv_recall_for_prefill_budget(self, input_tokens: int) -> int:
+        """Use recalled KV capacity to extend a queued prefill pass.
+
+        ``max_prefill_tokens`` is normally a compute guard. LayerKV may have
+        just returned real KV addresses from expert backing, so a long-context
+        batch can safely consume that additional physical capacity. Require a
+        nonempty current batch and waiting queue: this is a batch-admission
+        expansion, not a reason to recall experts for an isolated request.
+        """
+        if (
+            len(getattr(self, "can_run_list", []) or []) == 0
+            or int(getattr(self, "waiting_queue_len", 0) or 0) <= 0
+            or int(input_tokens) < int(getattr(self, "rem_input_tokens", 0))
+        ):
+            return 0
+        shortage = int(input_tokens) - int(self.rem_input_tokens) + 1
+        return self._try_layerkv_recall_for_admission(
+            shortage, allow_kv_overflow=False
+        )
+
+    def _try_layerkv_recall_for_physical_admission(
+        self, input_tokens: int, *, context_tokens: Optional[int] = None
+    ) -> int:
+        """Make long-context admission use the physical KV free count.
+
+        The normal prefill budget may include reclaim credit or evictable
+        metadata that is not yet a free physical address in a per-layer arena.
+        Compare every long-context request against the allocator's actual free
+        count, including the first request of a new batch.  The controller
+        still applies the long-context/small-batch gate and physical page
+        feasibility check; short-context requests never enter this path.  A
+        new batch must be allowed to prepare its KV tail before the first
+        request is placed in ``can_run_list``; otherwise the first request can
+        consume the logical scheduler budget and leave the overflow callback
+        unreachable for the whole batch.
+        """
+        self.layerkv_physical_admission_shortage_tokens = 0
+        if int(input_tokens) <= 0:
+            return 0
+        context_tokens = (
+            int(input_tokens) if context_tokens is None else int(context_tokens)
+        )
+        if context_tokens <= 2048:
+            return 0
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        available_fn = getattr(allocator, "available_size", None)
+        if not callable(available_fn):
+            return 0
+        try:
+            available = max(0, int(available_fn()))
+        except (TypeError, ValueError, RuntimeError):
+            return 0
+        tree_evictable = 0
+        tree_cache = getattr(self, "tree_cache", None)
+        tree_evictable_fn = getattr(tree_cache, "evictable_size", None)
+        if callable(tree_evictable_fn):
+            try:
+                tree_evictable = max(0, int(tree_evictable_fn()))
+            except (TypeError, ValueError, RuntimeError):
+                tree_evictable = 0
+        required = max(0, int(self.ceil_paged_tokens(int(input_tokens))))
+        # Requests already accepted into ``can_run_list`` have not reached
+        # ``alloc_for_extend`` yet, so their KV demand is not reflected in
+        # allocator.available_size().  Compare against the whole candidate
+        # prefill batch; otherwise each request can pass independently and the
+        # aggregate allocation reaches SharedVMM only after admission has
+        # already committed the batch.
+        for queued_req in getattr(self, "can_run_list", []) or []:
+            queued_input_tokens = getattr(queued_req, "extend_input_len", 0)
+            try:
+                required += max(
+                    0, int(self.ceil_paged_tokens(int(queued_input_tokens)))
+                )
+            except (TypeError, ValueError):
+                continue
+        get_pool = getattr(allocator, "get_kvcache", None)
+        kv_pool = get_pool() if callable(get_pool) else None
+        runtime = getattr(kv_pool, "layerkv_runtime", None)
+        release_fn = getattr(
+            runtime, "release_scheduler_admission_credit_tokens", None
+        )
+        if callable(release_fn):
+            released = max(
+                0,
+                int(
+                    release_fn(
+                        required_tokens=required,
+                        available_tokens=available,
+                    )
+                    or 0
+                ),
+            )
+            available += released
+        credit_fn = getattr(runtime, "get_scheduler_admission_credit_tokens", None)
+        credit = 0
+        if callable(credit_fn):
+            credit = max(
+                0,
+                int(
+                    credit_fn(
+                        required_tokens=required,
+                        available_tokens=available,
+                        reason="decode_prealloc_admission",
+                    )
+                    or 0
+                ),
+            )
+        shortage = required - available - tree_evictable - credit
+        if shortage <= 0:
+            return 0
+        recovered = self._try_layerkv_recall_for_admission(
+            shortage,
+            context_tokens=context_tokens,
+            allow_kv_overflow=True,
+        )
+        try:
+            available_after = max(0, int(available_fn()))
+        except (TypeError, ValueError, RuntimeError):
+            available_after = available
+        credit_after = 0
+        if callable(credit_fn):
+            credit_after = max(
+                0,
+                int(
+                    credit_fn(
+                        required_tokens=required,
+                        available_tokens=available_after,
+                        reason="decode_prealloc_admission",
+                    )
+                    or 0
+                ),
+            )
+        self.layerkv_physical_admission_shortage_tokens = max(
+            0,
+            required - available_after - tree_evictable - credit_after,
+        )
+        return recovered
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -742,8 +951,21 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
-        if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+        self._try_layerkv_recall_for_prefill_budget(paged_input)
+        self._try_layerkv_recall_for_physical_admission(
+            paged_input, context_tokens=paged_input
+        )
+        if self.layerkv_physical_admission_shortage_tokens > 0:
             return AddReqResult.NO_TOKEN
+        remaining = min(self.cur_rem_tokens, self.rem_total_tokens)
+        if paged_input > remaining:
+            if self._try_layerkv_recall_for_admission(
+                paged_input - remaining,
+                context_tokens=paged_input,
+            ):
+                remaining = min(self.cur_rem_tokens, self.rem_total_tokens)
+            if paged_input > remaining:
+                return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
@@ -794,7 +1016,18 @@ class PrefillAdder:
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
                 # reserve tokens for corner cases
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
+                    if self._try_layerkv_recall_for_admission(
+                        IGNORE_EOS_RESERVE_TOKENS * bs + 1 - min_free_tokens,
+                        context_tokens=req.extend_input_len,
+                    ):
+                        cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
+                            req.extend_input_len
+                        )
+                        min_free_tokens = (
+                            cur_rem_tokens + tokens_freed - tokens_left * bs
+                        )
+                    if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                        return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
         if (self.prefill_delayer_single_pass is not None) and (
@@ -879,6 +1112,11 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            self._try_layerkv_recall_for_admission(
+                total_tokens + 1 - self.rem_total_tokens,
+                context_tokens=real_input_tokens,
+            )
+        if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
@@ -886,11 +1124,22 @@ class PrefillAdder:
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
+        self._try_layerkv_recall_for_prefill_budget(real_input_tokens)
+        self._try_layerkv_recall_for_physical_admission(
+            real_input_tokens, context_tokens=real_input_tokens
+        )
+        if self.layerkv_physical_admission_shortage_tokens > 0:
+            return AddReqResult.OTHER if self.can_run_list else AddReqResult.NO_TOKEN
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
+            if total_tokens >= self.rem_total_tokens:
+                self._try_layerkv_recall_for_admission(
+                    total_tokens + 1 - self.rem_total_tokens,
+                    context_tokens=real_input_tokens,
+                )
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -914,6 +1163,16 @@ class PrefillAdder:
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
+            self._try_layerkv_recall_for_prefill_budget(input_tokens)
+            self._try_layerkv_recall_for_physical_admission(
+                input_tokens, context_tokens=real_input_tokens
+            )
+            if self.layerkv_physical_admission_shortage_tokens > 0:
+                return (
+                    AddReqResult.OTHER
+                    if self.can_run_list
+                    else AddReqResult.NO_TOKEN
+                )
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 

@@ -216,6 +216,8 @@ class _LayerKVPendingExpertCopy:
     ready_event: Any
     layer_id: int
     logical_ids: Set[int]
+    slot_by_logical: Dict[int, int] = dataclasses.field(default_factory=dict)
+    invalidated_logical_ids: Set[int] = dataclasses.field(default_factory=set)
     waited_on_main_stream: bool = False
     wait_start_event: Optional[Any] = None
     wait_end_event: Optional[Any] = None
@@ -373,7 +375,16 @@ class _LayerKVExpertLayerState:
     free_slots: List[int] = dataclasses.field(default_factory=list)
     lru_heap: List[Tuple[int, int, int]] = dataclasses.field(default_factory=list)
     backing_lru: Dict[int, int] = dataclasses.field(default_factory=dict)
+    # Optional ledger for the bounded single-shared-layer fastpath.
+    backing_cache_accounted_by_id: Optional[Dict[int, int]] = None
+    backing_cache_accounted_bytes: int = 0
     last_decode_logical_ids: List[int] = dataclasses.field(default_factory=list)
+    last_decode_batch_size: int = 0
+    # Coarse request/context identity for route-aware speculative prefetch.
+    # Request generations prevent recycled req-pool slots from looking like
+    # the same request; the context bucket tolerates normal decode growth.
+    last_decode_request_signature: Tuple[Tuple[int, int, int], ...] = ()
+    last_decode_route_overlap: float = 0.0
     prefetched_logical_ids: Set[int] = dataclasses.field(default_factory=set)
     topk_ids_in_range_calibrated: bool = False
     topk_ids_invalid_observed: bool = False

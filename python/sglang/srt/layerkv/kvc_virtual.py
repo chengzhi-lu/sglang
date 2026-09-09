@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 
 
 class LayerKVKvcVirtualMixin:
+    def _restore_virtual_scratch_for_kvc_use(self) -> None:
+        """Make borrowed scratch pages resident before any KVC access."""
+        controller = getattr(self, "_shared_expert", None)
+        restore = getattr(controller, "restore_scratch", None)
+        if callable(restore):
+            restore()
+
     def _prepare_per_layer_kvc_attention(self, layer_id: int) -> None:
         if not self._uses_per_layer_attention_override():
             return
@@ -70,6 +77,7 @@ class LayerKVKvcVirtualMixin:
             return
         if self._last_forward_batch is None or self._runner is None:
             return
+        self._restore_virtual_scratch_for_kvc_use()
         key = (int(self._decode_step), layer_id)
         if key in self._per_layer_kvc_prepared_layers:
             self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
@@ -99,11 +107,13 @@ class LayerKVKvcVirtualMixin:
                         self._reload_required_kvc(
                             self._last_forward_batch, selected_entries=selected
                         )
+                    self._issue_next_per_layer_kvc_prefetch(layer_id)
                     return
             # The hook is active even before the arena allocator produces a
             # layer-specific mapping. Keep this cheap only when no recovery is
             # required for the current use point.
             self.stats.kvc_per_layer_metadata_rewrite_skip_count += 1
+            self._issue_next_per_layer_kvc_prefetch(layer_id)
             return
         try:
             table = getattr(self._req_to_token_pool, "req_to_token", None)
@@ -155,6 +165,149 @@ class LayerKVKvcVirtualMixin:
                     self._reload_required_kvc(
                         self._last_forward_batch, selected_entries=selected
                     )
+            self._issue_next_per_layer_kvc_prefetch(layer_id)
+
+    def _issue_next_per_layer_kvc_prefetch(
+        self, layer_id: int, *, allow_virtual_scratch: bool = False
+    ) -> None:
+        """Queue the next physical KVC layer while the current layer runs.
+
+        The current layer's metadata hook is the first point at which its
+        device locations are guaranteed to be prepared.  At that point the
+        copy stream can safely enqueue the next layer's reload.  Attention for
+        that next layer still waits on its own ready event at point of use.
+        """
+        if (
+            self.config.kvc_backend != "per-layer-arena"
+            or (
+                self._per_layer_virtual_scratch_enabled()
+                and not allow_virtual_scratch
+            )
+            or self.config.kvc_scheduler != "async-deadline"
+            or not self._optimized_profile_enabled()
+            or self._copy_stream is None
+            or self._last_forward_batch is None
+        ):
+            return
+        next_layer = self._next_kvc_layer_id(int(layer_id))
+        if next_layer is None:
+            return
+        selected = [
+            entry
+            for entry in self._select_required_offloaded_per_layer_entries(
+                self._last_forward_batch
+            )
+            if int(entry.layer_id) == int(next_layer)
+        ]
+        if not selected:
+            return
+        token_count = sum(int(entry.token_count) for entry in selected)
+        if allow_virtual_scratch and not self._allow_physical_kvc_prefetch(
+            int(layer_id), int(next_layer), int(token_count)
+        ):
+            self.stats.kvc_layer_prefetch_skip_count += 1
+            return
+        with self._profile("profile_kvc_layer_prefetch_ms"):
+            issued = self._reload_required_kvc(
+                self._last_forward_batch,
+                selected_entries=selected,
+                strict=False,
+            )
+        if issued:
+            self.stats.kvc_layer_prefetch_issue_count += 1
+            self.stats.kvc_layer_prefetch_layer_count += 1
+            self.stats.kvc_layer_prefetch_token_count += int(token_count)
+        else:
+            self.stats.kvc_layer_prefetch_skip_count += 1
+
+    def _allow_physical_kvc_prefetch(
+        self, current_layer_id: int, next_layer_id: int, token_count: int
+    ) -> bool:
+        """Bound the single-scratch physical fallback by measured copy state.
+
+        A fallback reload is useful only while the copy stream has a small
+        lookahead window.  Keep at most two unconsumed reload events (the
+        current recovery plus one successor).  Once layer reload timing has
+        been observed, reject a successor whose measured H2D estimate cannot
+        fit in an observed per-layer compute window.  Cold-start calls remain
+        eligible because rejecting them would prevent the runtime from ever
+        calibrating the gate.
+        """
+        # The first eligible call is deliberately allowed to calibrate a
+        # lightweight model-forward window on later decode steps. This is
+        # separate from profile_detail and does not add a CUDA sync.
+        self._kvc_prefetch_window_measurement_enabled = True
+        pending = sum(
+            1
+            for pending_reload in self._pending_kvc_reload_events
+            if not getattr(pending_reload, "waited_on_main_stream", False)
+        )
+        if pending >= 2:
+            self.stats.kvc_layer_prefetch_pending_cap_skip_count += 1
+            return False
+
+        estimated_ms = self._estimate_per_layer_kvc_prefetch_ms(
+            int(next_layer_id), int(token_count)
+        )
+        overlap_ms = self._estimate_profiled_kvc_layer_window_ms(
+            int(current_layer_id), int(next_layer_id)
+        )
+        self.stats.kvc_layer_prefetch_estimated_copy_ms = float(
+            estimated_ms or 0.0
+        )
+        self.stats.kvc_layer_prefetch_overlap_window_ms = float(overlap_ms or 0.0)
+        if estimated_ms is None or overlap_ms is None:
+            self.stats.kvc_layer_prefetch_unmeasured_allow_count += 1
+            return True
+        if float(estimated_ms) > float(overlap_ms) + 0.05:
+            self.stats.kvc_layer_prefetch_deadline_reject_count += 1
+            return False
+        return True
+
+    def _estimate_per_layer_kvc_prefetch_ms(
+        self, layer_id: int, token_count: int
+    ) -> Optional[float]:
+        if int(token_count) <= 0:
+            return 0.0
+        bytes_per_token = int(self._bytes_per_kvc_token_per_layer())
+        if bytes_per_token <= 0:
+            return None
+        ewma = getattr(self, "_kvc_reload_ms_per_mb_ewma_by_layer", {}).get(
+            int(layer_id)
+        )
+        if ewma is None:
+            aggregate = float(
+                getattr(self.stats, "kvc_layerwise_reload_ewma_ms_per_mb", 0.0)
+                or 0.0
+            )
+            ewma = aggregate if aggregate > 0.0 else None
+        if ewma is None or not math.isfinite(float(ewma)) or float(ewma) <= 0.0:
+            return None
+        mb = float(int(token_count) * bytes_per_token) / float(1024 * 1024)
+        return 0.03 + mb * float(ewma)
+
+    def _estimate_profiled_kvc_layer_window_ms(
+        self, current_layer_id: int, next_layer_id: int
+    ) -> Optional[float]:
+        del current_layer_id, next_layer_id
+        model_ms = float(
+            getattr(self.stats, "kvc_layer_prefetch_model_forward_ms", 0.0) or 0.0
+        )
+        forward_count = int(
+            getattr(self.stats, "kvc_layer_prefetch_model_forward_count", 0) or 0
+        )
+        # Keep detailed-profile artifacts usable as a compatibility fallback.
+        if model_ms <= 0.0 or forward_count <= 0:
+            model_ms = float(
+                getattr(self.stats, "profile_decode_model_forward_ms", 0.0) or 0.0
+            )
+            forward_count = int(
+                getattr(self.stats, "profile_decode_batch_count", 0) or 0
+            )
+        layer_count = len(self._kvc_layer_ids())
+        if model_ms <= 0.0 or forward_count <= 0 or layer_count <= 0:
+            return None
+        return max(0.0, model_ms / float(forward_count) / float(layer_count))
 
     def _prepare_virtual_kvc_attention(
         self, layer_id: int, *, guard: bool = True
@@ -165,6 +318,7 @@ class LayerKVKvcVirtualMixin:
             return
         if self._last_forward_batch is None or self._runner is None:
             return
+        self._restore_virtual_scratch_for_kvc_use()
         if not self._ensure_virtual_scratch():
             return
         layer_id = int(layer_id)
@@ -197,6 +351,12 @@ class LayerKVKvcVirtualMixin:
                         self._last_forward_batch,
                         selected_entries=overflow_entries,
                     )
+                # The overflow path is a physical per-layer reload even when
+                # the backend also owns virtual scratch. Use the compute
+                # window before the next layer to submit its physical reload.
+                self._issue_next_per_layer_kvc_prefetch(
+                    layer_id, allow_virtual_scratch=True
+                )
                 self._virtual_materialize_plans_by_layer.pop(layer_id, None)
                 self._virtual_kvc_demands.pop((int(self._decode_step), layer_id), None)
                 self._invalidate_virtual_layer_cache(layer_id)
@@ -244,6 +404,15 @@ class LayerKVKvcVirtualMixin:
                     if scratch_locs is None:
                         return
                 self._store_virtual_scratch_cache(demand, scratch_locs, buffer_idx)
+        if buffer_idx < 0 and self.config.kvc_backend == "per-layer-arena":
+            # A single scratch buffer cannot overlap the current materialize
+            # with the next layer.  The physical per-layer arena is still a
+            # valid destination, so use it as the bounded fallback window.
+            # This keeps the current layer's scratch mapping unchanged while
+            # allowing the next layer's H2D to overlap its compute window.
+            self._issue_next_per_layer_kvc_prefetch(
+                layer_id, allow_virtual_scratch=True
+            )
         self._rewrite_virtual_kvc_attention(
             layer_id,
             scratch_locs,
@@ -843,10 +1012,7 @@ class LayerKVKvcVirtualMixin:
         return plan
 
     def _virtual_metadata_kind(self) -> str:
-        forward_batch = self._last_forward_batch
-        attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
-            self._runner, "attn_backend", None
-        )
+        attn_backend = self._kvc_attention_backend()
         metadata = getattr(attn_backend, "forward_metadata", None)
         if metadata is None:
             return "unknown"
@@ -906,10 +1072,7 @@ class LayerKVKvcVirtualMixin:
         )
 
     def _virtual_metadata_uses_kv_indices(self) -> bool:
-        forward_batch = self._last_forward_batch
-        attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
-            self._runner, "attn_backend", None
-        )
+        attn_backend = self._kvc_attention_backend()
         metadata = getattr(attn_backend, "forward_metadata", None)
         if metadata is None:
             return False
@@ -1263,6 +1426,7 @@ class LayerKVKvcVirtualMixin:
         *,
         buffer_idx: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
+        self._restore_virtual_scratch_for_kvc_use()
         token_count = int(demand.token_count)
         if self._virtual_scratch_locs is None or token_count > int(
             self._virtual_scratch_locs.numel()
@@ -1396,10 +1560,7 @@ class LayerKVKvcVirtualMixin:
     ) -> bool:
         if demand.token_count <= 0:
             return False
-        forward_batch = self._last_forward_batch
-        attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
-            self._runner, "attn_backend", None
-        )
+        attn_backend = self._kvc_attention_backend()
         if attn_backend is None:
             return False
         metadata = getattr(attn_backend, "forward_metadata", None)
@@ -1903,6 +2064,7 @@ class LayerKVKvcVirtualMixin:
             or self._copy_stream is None
         ):
             return
+        self._restore_virtual_scratch_for_kvc_use()
         t0 = time.perf_counter()
         next_layer = self._next_kvc_layer_id(layer_id)
         self._add_profile(
@@ -1951,6 +2113,7 @@ class LayerKVKvcVirtualMixin:
             or self._host_store is None
         ):
             return False
+        self._restore_virtual_scratch_for_kvc_use()
         if getattr(self, "_virtual_batched_prefetch_step", None) == int(
             self._decode_step
         ):
@@ -2083,6 +2246,7 @@ class LayerKVKvcVirtualMixin:
             or self._copy_stream is None
         ):
             return False
+        self._restore_virtual_scratch_for_kvc_use()
         if demand is None or not demand.entries:
             return False
         key = (int(self._decode_step), int(demand.layer_id), demand.signature)
@@ -2165,6 +2329,7 @@ class LayerKVKvcVirtualMixin:
     def _wait_for_virtual_materialize(
         self, pending: _LayerKVPendingVirtualMaterialize
     ) -> Optional[torch.Tensor]:
+        self._restore_virtual_scratch_for_kvc_use()
         self.stats.virtual_kvc_prefetch_wait_count += 1
         self.stats.kvc_ready_use_check_count += 1
         self.stats.scheduler_ready_use_check_count += 1

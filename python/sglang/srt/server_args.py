@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -691,12 +692,45 @@ class ServerArgs:
     )
     layerkv_kvc_scheduler: Literal["sync", "async-deadline"] = "async-deadline"
     layerkv_virtual_scratch_tokens: int = 4096
+    layerkv_shared_expert_layer: int = -1
+    layerkv_shared_expert_all_layers: bool = False
+    layerkv_native_moe_graph_max_batch_size: int = 0
+    layerkv_shared_expert_initial_slots: int = 16
+    layerkv_shared_expert_extra_slots: int = 1
+    layerkv_shared_expert_kv_overflow_tokens: int = 0
+    layerkv_shared_expert_kv_min_slots: int = 0
+    layerkv_shared_expert_disable_donor_cache: bool = False
+    layerkv_shared_expert_free_kv_donors: bool = False
+    layerkv_shared_expert_lend_virtual_scratch: bool = False
+    layerkv_shared_expert_policy: str = "fixed"
+    layerkv_shared_expert_retain_across_requests: bool = False
+    layerkv_shared_expert_admission_policy: str = "recall"
+    layerkv_shared_expert_decision_interval: int = 8
+    layerkv_shared_expert_headroom_steps: int = 16
+    layerkv_shared_expert_benefit_horizon_steps: int = 0
+    layerkv_shared_expert_chunk_order: str = "input"
+    layerkv_shared_expert_prepare_path: str = "generic"
+    layerkv_shared_expert_gpu_grouping: bool = False
+    layerkv_shared_expert_gpu_grouping_min_rows: int = 128
+    layerkv_shared_expert_post_moe_prefetch: bool = False
+    layerkv_shared_expert_prefetch_groups: int = 1
+    layerkv_shared_expert_profile_chunks: bool = False
+    layerkv_shared_expert_profile_prepare: bool = False
+    layerkv_shared_expert_trace_waits: bool = False
+    layerkv_expert_remap_update: str = "scalar"
+    layerkv_expert_transfer_backend: str = "torch"
+    layerkv_expert_batch_backing_layout: str = "batch"
+    layerkv_expert_demand_d2h_wait: str = "host"
+    layerkv_expert_backing_release_validation: str = "eager"
     layerkv_runtime_profile: Literal["simple", "optimized"] = "optimized"
     layerkv_debug_stats: bool = False
     layerkv_profile_detail: bool = False
     layerkv_disallow_destructive_fallback: bool = True
     layerkv_expert_backing_cache_mb: float = 0.0
-    layerkv_expert_cpu_backing_mode: Literal["none", "all"] = "none"
+    layerkv_expert_backing_cache_accounting: str = "scan"
+    layerkv_expert_backing_cache_accounting_check: bool = False
+    layerkv_expert_cpu_backing_pool_mb: float = 256.0
+    layerkv_expert_cpu_backing_mode: Literal["none", "all", "selected"] = "none"
     layerkv_expert_forward_hooks: bool = True
     layerkv_expert_collector_only: bool = False
     layerkv_expert_hotness_sample_interval: int = 16
@@ -708,6 +742,8 @@ class ServerArgs:
     layerkv_expert_copy_max_budget_mb: float = 0.0
     layerkv_expert_copy_lookahead_layers: int = 0
     layerkv_expert_copy_force_drain: bool = False
+    layerkv_expert_prefetch_lookahead_layers: int = 1
+    layerkv_expert_prefetch_min_route_overlap: float = 0.5
     expert_residency_budget_ratio: float = 1.0
     decode_prealloc_reclaim_policy: Literal[
         "none", "kv_lru", "expert_lru", "joint_simple"
@@ -3523,6 +3559,219 @@ class ServerArgs:
 
     def _handle_layerkv(self):
         """Normalize experimental LayerKV residency settings."""
+
+        shared_expert_enabled = bool(
+            getattr(self, "layerkv_shared_expert_all_layers", False)
+            or self.layerkv_shared_expert_layer >= 0
+        )
+
+        for name in (
+            "layerkv_expert_backing_cache_mb",
+            "layerkv_expert_cpu_backing_pool_mb",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+
+        if self.layerkv_expert_backing_cache_accounting not in ("scan", "incremental"):
+            raise ValueError(
+                "expert backing cache accounting must be scan or incremental"
+            )
+        if (
+            self.layerkv_expert_backing_cache_accounting == "incremental"
+            and not shared_expert_enabled
+        ):
+            raise ValueError(
+                "incremental cache accounting requires a shared expert layer"
+            )
+        if (
+            self.layerkv_expert_backing_cache_accounting_check
+            and self.layerkv_expert_backing_cache_accounting != "incremental"
+        ):
+            raise ValueError("cache accounting check requires incremental accounting")
+        if self.layerkv_expert_remap_update not in ("scalar", "batch"):
+            raise ValueError("expert remap update must be scalar or batch")
+        if self.layerkv_expert_backing_release_validation not in ("eager", "admission"):
+            raise ValueError(
+                "expert backing release validation must be eager or admission"
+            )
+        if (
+            self.layerkv_expert_backing_release_validation == "admission"
+            and self.layerkv_expert_transfer_backend != "cuda-batch"
+        ):
+            raise ValueError(
+                "admission-time backing validation requires cuda-batch transfers"
+            )
+        if self.layerkv_expert_demand_d2h_wait not in ("host", "stream"):
+            raise ValueError("expert demand D2H wait must be host or stream")
+        if (
+            self.layerkv_expert_demand_d2h_wait == "stream"
+            and self.layerkv_expert_transfer_backend != "cuda-batch"
+        ):
+            raise ValueError("stream-ordered expert D2H requires cuda-batch transfers")
+        if self.layerkv_expert_transfer_backend not in ("torch", "cuda-batch"):
+            raise ValueError("expert transfer backend must be torch or cuda-batch")
+        if self.layerkv_expert_batch_backing_layout not in ("batch", "individual"):
+            raise ValueError("expert batch backing layout must be batch or individual")
+        if (
+            self.layerkv_expert_batch_backing_layout == "individual"
+            and self.layerkv_expert_transfer_backend != "cuda-batch"
+        ):
+            raise ValueError("individual batch backing requires cuda-batch transfers")
+        if (
+            self.layerkv_shared_expert_profile_prepare
+            and not self.layerkv_shared_expert_profile_chunks
+        ):
+            raise ValueError(
+                "--layerkv-shared-expert-profile-prepare requires --layerkv-shared-expert-profile-chunks"
+            )
+        if self.layerkv_shared_expert_trace_waits and (
+            not shared_expert_enabled
+            or self.layerkv_shared_expert_prepare_path != "cpu-known"
+            or self.layerkv_shared_expert_profile_chunks
+            or self.layerkv_shared_expert_profile_prepare
+        ):
+            raise ValueError(
+                "wait tracing requires shared CPU-known preparation without other profilers"
+            )
+        if self.layerkv_shared_expert_chunk_order not in (
+            "input",
+            "reuse",
+            "adaptive",
+        ):
+            raise ValueError(
+                "--layerkv-shared-expert-chunk-order must be input, reuse, or adaptive"
+            )
+        if self.layerkv_shared_expert_prepare_path not in ("generic", "cpu-known"):
+            raise ValueError("shared expert prepare path must be generic or cpu-known")
+        if self.layerkv_shared_expert_gpu_grouping_min_rows <= 0:
+            raise ValueError(
+                "--layerkv-shared-expert-gpu-grouping-min-rows must be positive"
+            )
+        if self.layerkv_shared_expert_prefetch_groups <= 0:
+            raise ValueError(
+                "--layerkv-shared-expert-prefetch-groups must be positive"
+            )
+        if (
+            self.layerkv_shared_expert_chunk_order != "input"
+            or self.layerkv_shared_expert_prepare_path != "generic"
+            or getattr(self, "layerkv_shared_expert_gpu_grouping", False)
+            or getattr(self, "layerkv_shared_expert_post_moe_prefetch", False)
+            or self.layerkv_shared_expert_profile_chunks
+        ) and not shared_expert_enabled:
+            raise ValueError(
+                "shared expert chunk options require a shared expert layer"
+            )
+        if (
+            self.layerkv_shared_expert_disable_donor_cache
+            or self.layerkv_shared_expert_free_kv_donors
+            or self.layerkv_shared_expert_lend_virtual_scratch
+        ) and not shared_expert_enabled:
+            raise ValueError(
+                "shared expert donor options require a shared expert layer"
+            )
+        if self.layerkv_shared_expert_lend_virtual_scratch and (
+            not self.layerkv_shared_expert_free_kv_donors
+            or self.layerkv_kvc_backend != "per-layer-arena"
+            or self.layerkv_virtual_scratch_tokens <= 0
+        ):
+            raise ValueError(
+                "virtual scratch lending requires free KV donors, the per-layer-arena backend, "
+                "and positive virtual scratch tokens"
+            )
+        if self.layerkv_shared_expert_layer < -1:
+            raise ValueError("--layerkv-shared-expert-layer must be -1 or nonnegative")
+        if (
+            getattr(self, "layerkv_shared_expert_all_layers", False)
+            and self.layerkv_shared_expert_layer >= 0
+        ):
+            raise ValueError(
+                "--layerkv-shared-expert-all-layers cannot be combined with "
+                "--layerkv-shared-expert-layer"
+            )
+        if self.layerkv_shared_expert_benefit_horizon_steps < 0:
+            raise ValueError("shared expert benefit horizon must be nonnegative")
+        if self.layerkv_shared_expert_benefit_horizon_steps and not shared_expert_enabled:
+            raise ValueError("shared expert benefit horizon requires a shared expert layer")
+        from sglang.srt.layerkv.native_moe_graph import validate_native_moe_graph_options
+
+        validate_native_moe_graph_options(self)
+        if self.layerkv_shared_expert_policy not in ("fixed", "adaptive"):
+            raise ValueError("shared expert policy must be fixed or adaptive")
+        if self.layerkv_shared_expert_admission_policy not in ("recall", "retain"):
+            raise ValueError("shared expert admission policy must be recall or retain")
+        if self.layerkv_shared_expert_retain_across_requests and (
+            not shared_expert_enabled
+            or not self.layerkv_shared_expert_free_kv_donors
+        ):
+            raise ValueError(
+                "cross-request expert retention requires a shared layer and free KV donors"
+            )
+        if self.layerkv_shared_expert_admission_policy == "retain" and (
+            not self.layerkv_shared_expert_retain_across_requests
+            or self.layerkv_shared_expert_policy != "fixed"
+        ):
+            raise ValueError(
+                "retain admission policy requires fixed cross-request expert retention"
+            )
+        if (
+            self.layerkv_shared_expert_decision_interval <= 0
+            or self.layerkv_shared_expert_headroom_steps <= 0
+        ):
+            raise ValueError(
+                "shared expert decision interval and headroom steps must be positive"
+            )
+        if self.layerkv_shared_expert_policy == "adaptive" and (
+            not shared_expert_enabled
+            or not self.layerkv_shared_expert_free_kv_donors
+        ):
+            raise ValueError(
+                "adaptive shared expert policy requires a shared layer and free KV donors"
+            )
+        if shared_expert_enabled:
+            if (
+                not self.enable_layerkv
+                or self.layerkv_mode != "kvc-expert"
+                or self.layerkv_policy != "expert-first"
+                or self.layerkv_kvc_backend != "per-layer-arena"
+                or not self.disable_radix_cache
+                or not self.disable_overlap_schedule
+                or self.tp_size != 1
+                or self.pp_size != 1
+                or self.attention_backend != "triton"
+                or self.moe_runner_backend != "triton"
+                or self.moe_a2a_backend != "none"
+                or self.chunked_prefill_size != -1
+                or self.enable_memory_saver
+                or self.speculative_algorithm is not None
+                or self.layerkv_expert_collector_only
+                or self.layerkv_dynamic_pressure_from_kvc
+                or self.expert_residency_budget_ratio != 1.0
+                or self.layerkv_expert_cpu_backing_mode not in ("none", "selected")
+                or (
+                    getattr(self, "layerkv_shared_expert_all_layers", False)
+                    and self.layerkv_expert_cpu_backing_mode == "selected"
+                )
+                or self.layerkv_reclaim_limit_mb <= 0
+                or self.layerkv_shared_expert_initial_slots <= 0
+                or self.layerkv_shared_expert_extra_slots < 0
+                or self.layerkv_shared_expert_kv_overflow_tokens < 0
+                or self.layerkv_shared_expert_kv_min_slots < 0
+                or self.layerkv_shared_expert_kv_min_slots
+                > self.layerkv_shared_expert_initial_slots
+            ):
+                raise ValueError(
+                "LayerKV shared VMM requires kvc-expert/expert-first/per-layer-arena, "
+                    "Triton, TP=PP=1, disabled radix/overlap/chunked-prefill, no "
+                    "memory-saver/speculation/collector-only/dynamic-pressure, "
+                    "Triton MoE without A2A, no separate expert budget or all-layer backing, "
+                    "positive reclaim limit/initial slots, and nonnegative extra slots"
+                )
+        elif (
+            self.layerkv_shared_expert_kv_overflow_tokens != 0
+            or self.layerkv_shared_expert_kv_min_slots != 0
+        ):
+            raise ValueError("shared expert KV overflow options require SharedVMM")
         if self.expert_residency_budget_ratio not in (1.0, 0.75, 0.5, 0.25):
             raise ValueError(
                 "--expert-residency-budget-ratio must be one of: 1.0, 0.75, 0.5, 0.25"
@@ -3623,9 +3872,21 @@ class ServerArgs:
             raise ValueError(
                 "--layerkv-expert-copy-lookahead-layers must be non-negative"
             )
-        if self.layerkv_expert_cpu_backing_mode not in ("none", "all"):
+        if self.layerkv_expert_prefetch_lookahead_layers <= 0:
             raise ValueError(
-                "--layerkv-expert-cpu-backing-mode must be one of: none, all"
+                "--layerkv-expert-prefetch-lookahead-layers must be positive"
+            )
+        if not math.isfinite(self.layerkv_expert_prefetch_min_route_overlap) or not (
+            0.0 <= self.layerkv_expert_prefetch_min_route_overlap <= 1.0
+        ):
+            raise ValueError(
+                "--layerkv-expert-prefetch-min-route-overlap must be in [0.0, 1.0]"
+            )
+        if self.layerkv_expert_cpu_backing_mode == "selected" and not shared_expert_enabled:
+            raise ValueError("selected CPU backing requires a shared expert layer")
+        if self.layerkv_expert_cpu_backing_mode not in ("none", "all", "selected"):
+            raise ValueError(
+                "--layerkv-expert-cpu-backing-mode must be one of: none, all, selected"
             )
         if self.layerkv_expert_hotness_sample_interval <= 0:
             raise ValueError(
@@ -6546,6 +6807,188 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--layerkv-shared-expert-layer",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_layer,
+            help="Experimental hybrid VMM: KV pages fund this expert layer; -1 disables.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-all-layers",
+            action="store_true",
+            default=ServerArgs.layerkv_shared_expert_all_layers,
+            help="Use one SharedVMM page budget for every discovered expert layer.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-initial-slots",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_initial_slots,
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-extra-slots",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_extra_slots,
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-kv-overflow-tokens",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_kv_overflow_tokens,
+            help=(
+                "Reserve a sparse KV tail that can be funded by physically "
+                "evicted shared-expert pages; 0 disables expert-to-KV overflow."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-kv-min-slots",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_kv_min_slots,
+            help=(
+                "Minimum resident shared-expert slots while KV overflow is "
+                "active; 0 uses the selected layer's top-k."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-native-moe-graph-max-batch-size",
+            type=int,
+            default=0,
+            help="Experimental resident native MoE decode replay batch limit; 0 disables. Requires shared expert mode, TP/EP=1, and disabled overlap and outer CUDA graphs.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-free-kv-donors",
+            action="store_true",
+            help="Experimental: lend exclusively free KV pages as well as backed offloaded pages; recall restores allocator capacity.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-lend-virtual-scratch",
+            action="store_true",
+            help=(
+                "Experimental: lend complete idle virtual-KVC scratch pages to the "
+                "shared expert layer; KVC use recalls the loan before touching scratch."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-policy",
+            choices=["fixed", "adaptive"],
+            default=ServerArgs.layerkv_shared_expert_policy,
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-retain-across-requests",
+            action="store_true",
+            help="Keep borrowed expert pages across prefill and request completion; admission may still recall them.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-admission-policy",
+            choices=["recall", "retain"],
+            default=ServerArgs.layerkv_shared_expert_admission_policy,
+            help="Whether queued admission can reclaim expert loans; retain is a fixed expert-heavy baseline.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-decision-interval",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_decision_interval,
+            help="Decode observations per adaptive expert benefit decision.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-headroom-steps",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_headroom_steps,
+            help="Reserve this many decode steps of common KV capacity at the actual batch size.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-benefit-horizon-steps", type=int, default=0,
+            help="Opt-in future benefit horizon cap for fixed-length requests; 0 retains one observed interval. Always capped by remaining decode work.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-disable-donor-cache",
+            action="store_true",
+            help="Disable negative donor caching for controlled shared-VMM comparisons.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-chunk-order",
+            choices=["input", "reuse", "adaptive"],
+            default=ServerArgs.layerkv_shared_expert_chunk_order,
+            help="Order token groups by input, resident reuse, or context/batch adaptive reuse.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-prepare-path",
+            choices=["generic", "cpu-known"],
+            default=ServerArgs.layerkv_shared_expert_prepare_path,
+            help="Reuse CPU-known prefill group demand; retain GPU remap validation.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-gpu-grouping",
+            action="store_true",
+            help="Build bounded shared-expert token groups on GPU and return only compact group metadata to CPU.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-gpu-grouping-min-rows",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_gpu_grouping_min_rows,
+            help=(
+                "Minimum routed rows for GPU grouping; smaller batches use the "
+                "measured faster CPU first-fit path."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-post-moe-prefetch",
+            action="store_true",
+            help="Prefetch dead-slot successor experts after the current MoE event; keep disabled for baseline comparisons.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-prefetch-groups",
+            type=int,
+            default=ServerArgs.layerkv_shared_expert_prefetch_groups,
+            help=(
+                "Bounded number of future token-route groups included in one "
+                "shared-expert prefetch submission; 1 preserves the immediate "
+                "successor behavior."
+            ),
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-profile-chunks",
+            action="store_true",
+            help="Measure prefill token-group CPU phases and CUDA stream intervals.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-profile-prepare",
+            action="store_true",
+            help="Collect CPU call attribution inside chunk preparation; requires chunk profiling.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-remap-update",
+            choices=["scalar", "batch"],
+            default=ServerArgs.layerkv_expert_remap_update,
+            help="Publish materialization remap changes per scalar or in one batch.",
+        )
+        parser.add_argument(
+            "--layerkv-shared-expert-trace-waits",
+            action="store_true",
+            help="Add Kineto wait-phase labels for shared CPU-known preparation (diagnostic only).",
+        )
+        parser.add_argument(
+            "--layerkv-expert-transfer-backend",
+            choices=["torch", "cuda-batch"],
+            default=ServerArgs.layerkv_expert_transfer_backend,
+            help="Expert demand/prefetch transfers; cuda-batch requires CUDA batch API bindings.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-batch-backing-layout",
+            choices=["batch", "individual"],
+            default=ServerArgs.layerkv_expert_batch_backing_layout,
+            help="CPU eviction backing layout for cuda-batch; individual enables owner-tensor pooling.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-backing-release-validation",
+            choices=["eager", "admission"],
+            default=ServerArgs.layerkv_expert_backing_release_validation,
+            help="Validate deferred backing fully at pool admission instead of twice.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-demand-d2h-wait",
+            choices=["host", "stream"],
+            default=ServerArgs.layerkv_expert_demand_d2h_wait,
+            help="Demand backup completion: host barrier or GPU stream dependency (cuda-batch only).",
+        )
+        parser.add_argument(
             "--layerkv-virtual-scratch-tokens",
             type=int,
             default=ServerArgs.layerkv_virtual_scratch_tokens,
@@ -6585,17 +7028,32 @@ class ServerArgs:
             help="Fail future physical LayerKV paths if they attempt destructive KV pointer replacement.",
         )
         parser.add_argument(
+            "--layerkv-expert-cpu-backing-pool-mb",
+            type=float,
+            default=ServerArgs.layerkv_expert_cpu_backing_pool_mb,
+            help="Limit reusable idle CPU expert buffers, separately from valid backing copies.",
+        )
+        parser.add_argument(
             "--layerkv-expert-backing-cache-mb",
             type=float,
             default=ServerArgs.layerkv_expert_backing_cache_mb,
             help="Extra resident-expert CPU backing cache budget in MB. Offloaded expert backing is never dropped.",
         )
         parser.add_argument(
+            "--layerkv-expert-backing-cache-accounting", choices=["scan", "incremental"],
+            default=ServerArgs.layerkv_expert_backing_cache_accounting,
+            help="Resident CPU copy accounting; incremental supports one shared expert layer.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-backing-cache-accounting-check", action="store_true",
+            help="Validate incremental cache accounting by a full scan at every trim (diagnostic only).",
+        )
+        parser.add_argument(
             "--layerkv-expert-cpu-backing-mode",
             type=str,
-            choices=["none", "all"],
+            choices=["none", "all", "selected"],
             default=ServerArgs.layerkv_expert_cpu_backing_mode,
-            help="Preload expert CPU backing. 'all' keeps one CPU copy of every supported expert to avoid decode-time D2H install backup.",
+            help="Preload immutable CPU weights: all uses pageable copies for every supported layer; selected pins only the shared expert layer. Default none.",
         )
         parser.add_argument(
             "--layerkv-expert-forward-hooks",
@@ -6668,6 +7126,18 @@ class ServerArgs:
             "--layerkv-expert-copy-force-drain",
             action="store_true",
             help="Experiment mode: block to drain expert install D2H and slots after plan creation.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-prefetch-lookahead-layers",
+            type=int,
+            default=ServerArgs.layerkv_expert_prefetch_lookahead_layers,
+            help="Maximum number of predicted expert layers to submit to the H2D copy stream at one decode safe point.",
+        )
+        parser.add_argument(
+            "--layerkv-expert-prefetch-min-route-overlap",
+            type=float,
+            default=ServerArgs.layerkv_expert_prefetch_min_route_overlap,
+            help="Minimum consecutive decode-route overlap required for previous-route expert H2D prefetch.",
         )
         parser.add_argument(
             "--expert-residency-budget-ratio",

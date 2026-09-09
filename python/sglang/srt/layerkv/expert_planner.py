@@ -3,35 +3,17 @@
 from __future__ import annotations
 
 import bisect
-import functools
-import heapq
 import json
 import logging
-import math
-import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-
-import torch
+from typing import Any, Dict, List, Optional, Tuple
 
 if __package__:
     from .common_types import (
-        _LayerKVExpertCopyDescriptor,
-        _LayerKVExpertInstallBuild,
-        _LayerKVExpertInstallD2HJob,
-        _LayerKVExpertInstallItem,
         _LayerKVExpertLayerState,
-        _LayerKVPendingExpertCopy,
-        _LayerKVPendingExpertD2H,
     )
 else:  # pragma: no cover - direct file-loading smoke tests.
     from common_types import (
-        _LayerKVExpertCopyDescriptor,
-        _LayerKVExpertInstallBuild,
-        _LayerKVExpertInstallD2HJob,
-        _LayerKVExpertInstallItem,
         _LayerKVExpertLayerState,
-        _LayerKVPendingExpertCopy,
-        _LayerKVPendingExpertD2H,
     )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +25,28 @@ except Exception:  # pragma: no cover - optional JIT helper.
 
 
 class LayerKVExpertPlannerMixin:
+    def _layerwise_expert_plan_enabled(self) -> bool:
+        """Return whether expert capacity must come from the cost-aware DP.
+
+        All supported generic expert policies can choose a non-zero expert
+        reclaim amount.  They should therefore share the same layer-aware
+        candidate selection instead of falling back to round-robin layer
+        shrinking.  ``coresid`` is kept as a user-facing alias for the joint
+        policy and is included explicitly for callers that inspect the raw
+        configuration value.
+        """
+
+        policy = str(getattr(getattr(self, "config", None), "policy", "none"))
+        return policy in {
+            "kv-first",
+            "ratio-25-75",
+            "ratio-50-50",
+            "ratio-75-25",
+            "layer-aware-joint",
+            "layer-aware-joint-dp",
+            "coresid",
+        }
+
     def _estimate_expert_reclaim_cost(
         self,
         reclaim_mb: float,
@@ -1164,6 +1168,12 @@ class LayerKVExpertPlannerMixin:
     def _kvc_layer_ids(self) -> List[int]:
         if self._kv_pool is None:
             return []
+        layer_ids = getattr(self._kv_pool, "layer_ids", None)
+        if layer_ids is not None:
+            if self._cached_kvc_layer_ids_key != layer_ids:
+                self._cached_kvc_layer_ids_key = layer_ids
+                self._cached_kvc_layer_ids = list(layer_ids)
+            return self._cached_kvc_layer_ids
         start = int(getattr(self._kv_pool, "start_layer", 0) or 0)
         layer_num = int(getattr(self._kv_pool, "layer_num", 0) or 0)
         if layer_num <= 0:
@@ -1289,6 +1299,7 @@ class LayerKVExpertPlannerMixin:
         self.stats.configured_reclaim_limit_mb = float(configured)
         self.stats.needed_pressure_mb = 0.0
         self.stats.effective_reclaim_target_mb = 0.0
+        self.stats.planner_estimated_kvc_capacity_benefit = 0.0
         self.stats.target_limited_reason = "no_runtime_pressure"
         self.stats.requested_total_reclaim_mb = 0.0
         self.stats.effective_kvc_reclaim_mb = 0.0
@@ -1552,7 +1563,9 @@ class LayerKVExpertPlannerMixin:
         target_mb: float,
         forward_batch: Any,
     ) -> Dict[int, int]:
-        if self.config.policy != "coresid":
+        if not self._layerwise_expert_plan_enabled():
+            return self._plan_expert_slot_capacities(target_mb)
+        if target_mb <= 0.0:
             return self._plan_expert_slot_capacities(target_mb)
         if not self._planned_expert_slot_capacities_by_layer or float(
             target_mb
@@ -1564,7 +1577,8 @@ class LayerKVExpertPlannerMixin:
             )
             precomputed = self._build_coresid_expert_plan_inputs(forward_batch)
             layerwise_table = self._build_coresid_expert_layerwise_plan_table(
-                precomputed
+                precomputed,
+                max_reclaim_mb=plan_target_mb,
             )
             (
                 _cost,

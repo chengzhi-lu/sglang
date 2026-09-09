@@ -142,10 +142,38 @@ class _IndependentDecodeAllocationHarness(_DecodeAllocationHarness):
         pass
 
 
+class _RequestAllocationHarness(_DecodeAllocationHarness):
+    allocate_per_layer_request_slots = (
+        LayerKVKvcResidencyMixin.allocate_per_layer_request_slots
+    )
+
+    def __init__(self):
+        super().__init__()
+        self._per_layer_canonical_to_physical = {}
+        self._per_layer_req_to_token_owned = set()
+        self.mapping_calls = []
+        self.refresh_count = 0
+        self.stats.kvc_per_layer_invalid_reuse_count = 0
+        self.stats.kvc_per_layer_invalid_reuse_token_count = 0
+
+    def _reuse_invalid_per_layer_request_locs(self, **_kwargs):
+        return None
+
+    def _record_per_layer_mapping(self, *args):
+        self.mapping_calls.append(args)
+
+    def _sync_kvc_group_if_needed(self, _entry):
+        pass
+
+    def _refresh_kvc_residency_stats(self):
+        self.refresh_count += 1
+
+
 class _CleanupHarness(LayerKVKvcAllocatorMixin):
     def __init__(self):
         self.config = SimpleNamespace(kvc_backend="per-layer-arena")
         self._per_layer_cleanup_state_by_req = {}
+        self._per_layer_arena_reserved_locs = set()
 
     def _per_layer_entry_is_current(self, _entry):
         return True
@@ -251,6 +279,25 @@ def test_decode_independent_allocations_refresh_allocator_stats_once():
 
     assert runtime.alloc_calls == [(0, 2, False), (1, 2, False)]
     assert runtime.allocator_refresh_count == 1
+
+
+def test_request_common_allocation_skips_identity_mapping_bookkeeping():
+    runtime = _RequestAllocationHarness()
+    req = SimpleNamespace(req_pool_idx=4)
+
+    locs = runtime.allocate_per_layer_request_slots(
+        req=req,
+        positions=[5, 6],
+        common_physical_locs=True,
+    )
+
+    assert locs.tolist() == [31, 32]
+    assert runtime.mapping_calls == []
+    assert runtime.refresh_count == 1
+    assert runtime._per_layer_residency[(0, 4, 5)].device_locs == [31, 32]
+    assert runtime._per_layer_residency[(1, 4, 5)].device_locs == [31, 32]
+    assert req.layerkv_per_layer_allocated is True
+    assert req.skip_radix_cache_insert is True
 
 
 def test_decode_allocation_appends_to_resident_tail_within_page():

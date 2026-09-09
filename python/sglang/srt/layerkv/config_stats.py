@@ -18,10 +18,43 @@ class LayerKVConfig:
     kvc_scheduler: str = "async-deadline"
     runtime_profile: str = "optimized"
     virtual_scratch_tokens: int = 4096
+    shared_expert_layer: int = -1
+    shared_expert_all_layers: bool = False
+    native_moe_graph_max_batch_size: int = 0
+    shared_expert_initial_slots: int = 16
+    shared_expert_extra_slots: int = 1
+    shared_expert_kv_overflow_tokens: int = 0
+    shared_expert_kv_min_slots: int = 0
+    shared_expert_disable_donor_cache: bool = False
+    shared_expert_free_kv_donors: bool = False
+    shared_expert_lend_virtual_scratch: bool = False
+    shared_expert_policy: str = "fixed"
+    shared_expert_retain_across_requests: bool = False
+    shared_expert_admission_policy: str = "recall"
+    shared_expert_decision_interval: int = 8
+    shared_expert_headroom_steps: int = 16
+    shared_expert_benefit_horizon_steps: int = 0
+    shared_expert_chunk_order: str = "input"
+    shared_expert_prepare_path: str = "generic"
+    shared_expert_gpu_grouping: bool = False
+    shared_expert_gpu_grouping_min_rows: int = 128
+    shared_expert_post_moe_prefetch: bool = False
+    shared_expert_prefetch_groups: int = 1
+    shared_expert_profile_chunks: bool = False
+    shared_expert_profile_prepare: bool = False
+    shared_expert_trace_waits: bool = False
+    expert_remap_update: str = "scalar"
+    expert_transfer_backend: str = "torch"
+    expert_batch_backing_layout: str = "batch"
+    expert_demand_d2h_wait: str = "host"
+    expert_backing_release_validation: str = "eager"
     debug_stats: bool = False
     profile_detail: bool = False
     disallow_destructive_fallback: bool = True
     expert_backing_cache_mb: float = 0.0
+    expert_backing_cache_accounting: str = "scan"
+    expert_backing_cache_accounting_check: bool = False
+    expert_cpu_backing_pool_mb: float = 256.0
     expert_cpu_backing_mode: str = "none"
     expert_forward_hooks: bool = True
     expert_collector_only: bool = False
@@ -34,8 +67,20 @@ class LayerKVConfig:
     expert_copy_max_budget_mb: float = 0.0
     expert_copy_lookahead_layers: int = 0
     expert_copy_force_drain: bool = False
+    # Number of predicted expert layers that may be submitted to the H2D
+    # copy stream at one decode safe point. Keep one as the compatibility
+    # default; larger values enable bounded cross-layer prefetch.
+    expert_prefetch_lookahead_layers: int = 1
+    # Minimum overlap of consecutive decode routes before previous-route H2D
+    # speculation is admitted. A higher value trades speculative overlap for
+    # less expert churn when routing is unstable.
+    expert_prefetch_min_route_overlap: float = 0.5
     expert_residency_budget_ratio: float = 1.0
     worker_role: str = "standalone"
+
+    @property
+    def shared_expert_enabled(self) -> bool:
+        return bool(self.shared_expert_all_layers or self.shared_expert_layer >= 0)
 
     @classmethod
     def from_server_args(cls, server_args: Any) -> "LayerKVConfig":
@@ -70,12 +115,138 @@ class LayerKVConfig:
                 int(getattr(server_args, "layerkv_virtual_scratch_tokens", 4096) or 0),
             ),
             debug_stats=bool(getattr(server_args, "layerkv_debug_stats", False)),
+            shared_expert_layer=int(
+                getattr(server_args, "layerkv_shared_expert_layer", -1)
+            ),
+            shared_expert_all_layers=bool(
+                getattr(server_args, "layerkv_shared_expert_all_layers", False)
+            ),
+            native_moe_graph_max_batch_size=int(
+                getattr(server_args, "layerkv_native_moe_graph_max_batch_size", 0)
+            ),
+            shared_expert_initial_slots=int(
+                getattr(server_args, "layerkv_shared_expert_initial_slots", 16)
+            ),
+            shared_expert_extra_slots=int(
+                getattr(server_args, "layerkv_shared_expert_extra_slots", 1)
+            ),
+            shared_expert_kv_overflow_tokens=max(
+                0,
+                int(
+                    getattr(server_args, "layerkv_shared_expert_kv_overflow_tokens", 0)
+                    or 0
+                ),
+            ),
+            shared_expert_kv_min_slots=max(
+                0,
+                int(getattr(server_args, "layerkv_shared_expert_kv_min_slots", 0) or 0),
+            ),
+            shared_expert_disable_donor_cache=bool(
+                getattr(server_args, "layerkv_shared_expert_disable_donor_cache", False)
+            ),
+            shared_expert_free_kv_donors=bool(
+                getattr(server_args, "layerkv_shared_expert_free_kv_donors", False)
+            ),
+            shared_expert_lend_virtual_scratch=bool(
+                getattr(
+                    server_args,
+                    "layerkv_shared_expert_lend_virtual_scratch",
+                    False,
+                )
+            ),
+            shared_expert_policy=str(
+                getattr(server_args, "layerkv_shared_expert_policy", "fixed")
+            ),
+            shared_expert_retain_across_requests=bool(
+                getattr(
+                    server_args, "layerkv_shared_expert_retain_across_requests", False
+                )
+            ),
+            shared_expert_admission_policy=str(
+                getattr(server_args, "layerkv_shared_expert_admission_policy", "recall")
+            ),
+            shared_expert_decision_interval=int(
+                getattr(server_args, "layerkv_shared_expert_decision_interval", 8)
+            ),
+            shared_expert_headroom_steps=int(
+                getattr(server_args, "layerkv_shared_expert_headroom_steps", 16)
+            ),
+            shared_expert_benefit_horizon_steps=int(
+                getattr(server_args, "layerkv_shared_expert_benefit_horizon_steps", 0)
+            ),
+            shared_expert_chunk_order=str(
+                getattr(server_args, "layerkv_shared_expert_chunk_order", "input")
+            ),
+            shared_expert_prepare_path=str(
+                getattr(server_args, "layerkv_shared_expert_prepare_path", "generic")
+            ),
+            shared_expert_gpu_grouping=bool(
+                getattr(server_args, "layerkv_shared_expert_gpu_grouping", False)
+            ),
+            shared_expert_gpu_grouping_min_rows=max(
+                1,
+                int(
+                    getattr(
+                        server_args,
+                        "layerkv_shared_expert_gpu_grouping_min_rows",
+                        128,
+                    )
+                    or 128
+                ),
+            ),
+            shared_expert_post_moe_prefetch=bool(
+                getattr(server_args, "layerkv_shared_expert_post_moe_prefetch", False)
+            ),
+            shared_expert_prefetch_groups=max(
+                1,
+                int(
+                    getattr(server_args, "layerkv_shared_expert_prefetch_groups", 1)
+                    or 1
+                ),
+            ),
+            shared_expert_profile_chunks=bool(
+                getattr(server_args, "layerkv_shared_expert_profile_chunks", False)
+            ),
+            shared_expert_profile_prepare=bool(
+                getattr(server_args, "layerkv_shared_expert_profile_prepare", False)
+            ),
+            shared_expert_trace_waits=bool(
+                getattr(server_args, "layerkv_shared_expert_trace_waits", False)
+            ),
+            expert_remap_update=str(
+                getattr(server_args, "layerkv_expert_remap_update", "scalar")
+            ),
+            expert_transfer_backend=str(
+                getattr(server_args, "layerkv_expert_transfer_backend", "torch")
+            ),
+            expert_batch_backing_layout=str(
+                getattr(server_args, "layerkv_expert_batch_backing_layout", "batch")
+            ),
+            expert_demand_d2h_wait=str(
+                getattr(server_args, "layerkv_expert_demand_d2h_wait", "host")
+            ),
+            expert_backing_release_validation=str(
+                getattr(
+                    server_args, "layerkv_expert_backing_release_validation", "eager"
+                )
+            ),
             profile_detail=bool(getattr(server_args, "layerkv_profile_detail", False)),
             disallow_destructive_fallback=bool(
                 getattr(server_args, "layerkv_disallow_destructive_fallback", True)
             ),
             expert_backing_cache_mb=float(
                 getattr(server_args, "layerkv_expert_backing_cache_mb", 0.0) or 0.0
+            ),
+            expert_backing_cache_accounting=str(
+                getattr(server_args, "layerkv_expert_backing_cache_accounting", "scan")
+            ),
+            expert_backing_cache_accounting_check=bool(
+                getattr(
+                    server_args, "layerkv_expert_backing_cache_accounting_check", False
+                )
+            ),
+            expert_cpu_backing_pool_mb=float(
+                getattr(server_args, "layerkv_expert_cpu_backing_pool_mb", 256.0)
             ),
             expert_cpu_backing_mode=str(
                 getattr(server_args, "layerkv_expert_cpu_backing_mode", "none")
@@ -139,6 +310,31 @@ class LayerKVConfig:
             ),
             expert_copy_force_drain=bool(
                 getattr(server_args, "layerkv_expert_copy_force_drain", False)
+            ),
+            expert_prefetch_lookahead_layers=max(
+                1,
+                int(
+                    getattr(
+                        server_args,
+                        "layerkv_expert_prefetch_lookahead_layers",
+                        1,
+                    )
+                    or 1
+                ),
+            ),
+            expert_prefetch_min_route_overlap=min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            server_args,
+                            "layerkv_expert_prefetch_min_route_overlap",
+                            0.5,
+                        )
+                        or 0.0
+                    ),
+                ),
             ),
             expert_residency_budget_ratio=float(
                 getattr(server_args, "expert_residency_budget_ratio", 1.0) or 1.0
@@ -213,6 +409,9 @@ class LayerKVStats:
     virtual_scratch_capacity_tokens: int = 0
     virtual_scratch_used_tokens: int = 0
     virtual_scratch_alloc_failed_count: int = 0
+    virtual_scratch_lend_page_count: int = 0
+    virtual_scratch_recall_count: int = 0
+    virtual_scratch_lend_skip_count: int = 0
     virtual_kvc_evict_count: int = 0
     virtual_kvc_materialize_count: int = 0
     virtual_kvc_materialize_token_count: int = 0
@@ -313,6 +512,9 @@ class LayerKVStats:
     planner_estimated_kvc_controller_cost: float = 0.0
     planner_estimated_kvc_overlap_ms: float = 0.0
     planner_estimated_kvc_exposed_ms: float = 0.0
+    # Modeled value of retaining KVC instead of paying its reclaim/reload
+    # critical-path cost for the current context/batch horizon.
+    planner_estimated_kvc_capacity_benefit: float = 0.0
     planner_estimated_expert_backing_miss_cost: float = 0.0
     planner_estimated_expert_materialize_cost: float = 0.0
     planner_dp_table_build_ms: float = 0.0
@@ -393,6 +595,20 @@ class LayerKVStats:
     kvc_per_layer_reload_mb_total: float = 0.0
     kvc_per_layer_backup_ms: float = 0.0
     kvc_per_layer_reload_ms: float = 0.0
+    kvc_layer_prefetch_issue_count: int = 0
+    kvc_layer_prefetch_skip_count: int = 0
+    kvc_layer_prefetch_layer_count: int = 0
+    kvc_layer_prefetch_token_count: int = 0
+    kvc_layer_prefetch_pending_cap_skip_count: int = 0
+    kvc_layer_prefetch_deadline_reject_count: int = 0
+    kvc_layer_prefetch_unmeasured_allow_count: int = 0
+    kvc_layer_prefetch_estimated_copy_ms: float = 0.0
+    kvc_layer_prefetch_overlap_window_ms: float = 0.0
+    # Lightweight decode-forward samples used by the physical successor
+    # prefetch gate. These are collected only after that path is reached; they
+    # do not enable detailed LayerKV profiling or add CUDA synchronization.
+    kvc_layer_prefetch_model_forward_ms: float = 0.0
+    kvc_layer_prefetch_model_forward_count: int = 0
     kvc_workspace_pack_ms: float = 0.0
     kvc_workspace_reuse_count: int = 0
     kvc_workspace_invalidated_count: int = 0
@@ -415,6 +631,12 @@ class LayerKVStats:
     expert_topk_rewrite_count: int = 0
     expert_topk_range_calibrated_count: int = 0
     expert_topk_range_fastpath_count: int = 0
+    expert_cpu_known_prepare_count: int = 0
+    expert_cpu_known_remap_guard_count: int = 0
+    expert_cpu_known_remap_guard_elided_count: int = 0
+    expert_remap_batch_count: int = 0
+    expert_remap_batch_entries: int = 0
+    expert_cpu_known_prepare_fallback_count: int = 0
     expert_topk_range_invalid_count: int = 0
     expert_topk_gpu_remap_count: int = 0
     expert_topk_gpu_remap_fallback_count: int = 0
@@ -433,9 +655,14 @@ class LayerKVStats:
     expert_hotness_snapshot_deferred_count: int = 0
     expert_hotness_snapshot_forced_count: int = 0
     expert_hotness_ones_reuse_count: int = 0
+    expert_hotness_snapshot_batch_count: int = 0
+    expert_hotness_snapshot_batch_tensor_count: int = 0
+    expert_hotness_snapshot_batch_bytes: int = 0
+    expert_hotness_snapshot_transfer_fallback_count: int = 0
     expert_candidate_snapshot_issue_count: int = 0
     expert_candidate_snapshot_ready_count: int = 0
     expert_candidate_snapshot_drop_count: int = 0
+    expert_candidate_snapshot_deferred_count: int = 0
     expert_candidate_order_hit_count: int = 0
     expert_candidate_order_miss_count: int = 0
     expert_copy_descriptor_count: int = 0
@@ -451,11 +678,23 @@ class LayerKVStats:
     expert_d2h_gather_batch_count: int = 0
     expert_d2h_gather_expert_count: int = 0
     expert_cpu_backing_pool_alloc_count: int = 0
+    expert_cuda_batch_h2d_count: int = 0
+    expert_cuda_batch_d2h_count: int = 0
+    expert_cuda_batch_copy_count: int = 0
+    expert_cuda_batch_bytes: int = 0
+    expert_cuda_batch_pending: int = 0
+    expert_cuda_batch_deferred_release_count: int = 0
+    expert_demand_d2h_stream_batch_count: int = 0
+    expert_demand_h2d_dependency_count: int = 0
+    expert_d2h_h2d_dependency_count: int = 0
     expert_cpu_backing_pool_reuse_count: int = 0
     expert_cpu_backing_pool_release_count: int = 0
     expert_cpu_backing_pool_drop_count: int = 0
     expert_cpu_backing_pool_bytes: int = 0
     expert_cpu_backing_pool_limit_bytes: int = 0
+    expert_cpu_backing_batch_view_register_count: int = 0
+    expert_cpu_backing_batch_view_release_count: int = 0
+    expert_cpu_backing_batch_owner_reclaim_count: int = 0
     expert_materialize_mb_total: float = 0.0
     expert_materialize_ms: float = 0.0
     expert_materialize_async_count: int = 0
@@ -481,8 +720,22 @@ class LayerKVStats:
     expert_prefetch_skipped_capacity_count: int = 0
     expert_prefetch_useful_count: int = 0
     expert_prefetch_wasted_count: int = 0
+    expert_prefetch_policy_skip_count: int = 0
+    expert_prefetch_context_skip_count: int = 0
+    expert_prefetch_pressure_skip_count: int = 0
+    expert_prefetch_last_gate: str = ""
     expert_on_demand_materialize_count: int = 0
     expert_prefetch_mb_total: float = 0.0
+    expert_prefetch_exact_group_count: int = 0
+    expert_prefetch_exact_id_count: int = 0
+    expert_prefetch_lookahead_group_count: int = 0
+    expert_prefetch_lookahead_id_count: int = 0
+    expert_prefetch_exact_skip_capacity_count: int = 0
+    expert_prefetch_exact_policy_skip_count: int = 0
+    expert_prefetch_post_moe_count: int = 0
+    expert_prefetch_post_moe_id_count: int = 0
+    expert_prefetch_post_moe_dead_slot_skip_count: int = 0
+    expert_prefetch_post_moe_capacity_skip_count: int = 0
     expert_prepared_backing_mb: float = 0.0
     expert_prepare_extend_count: int = 0
     expert_prepare_decode_fallback_count: int = 0
@@ -499,6 +752,12 @@ class LayerKVStats:
     expert_prepare_actual_mb: float = 0.0
     expert_prefetch_ready_before_use_count: int = 0
     expert_prefetch_blocked_by_copy_stream_count: int = 0
+    expert_prefetch_cross_layer_issue_count: int = 0
+    expert_prefetch_cross_layer_layer_count: int = 0
+    expert_prefetch_cross_layer_skip_count: int = 0
+    expert_prefetch_route_mismatch_skip_count: int = 0
+    expert_prefetch_route_unstable_skip_count: int = 0
+    expert_prefetch_route_fallback_count: int = 0
     expert_install_state: str = ""
     expert_install_pending_layers: int = 0
     expert_install_completed_layers: int = 0
@@ -567,6 +826,10 @@ class LayerKVStats:
     expert_backing_cache_hit_count: int = 0
     expert_backing_cache_miss_count: int = 0
     expert_backing_cache_evict_count: int = 0
+    expert_backing_cache_accounting_init_count: int = 0
+    expert_backing_cache_accounting_update_count: int = 0
+    expert_backing_cache_accounting_check_count: int = 0
+    expert_backing_cache_fast_return_count: int = 0
     expert_cpu_backing_mode: str = ""
     expert_cpu_backing_preload_count: int = 0
     expert_cpu_backing_preload_mb: float = 0.0
@@ -751,6 +1014,7 @@ class LayerKVStats:
     profile_recovery_task_build_ms: float = 0.0
     profile_recovery_task_schedule_ms: float = 0.0
     profile_kvc_reload_required_ms: float = 0.0
+    profile_kvc_layer_prefetch_ms: float = 0.0
     profile_kvc_evict_to_target_ms: float = 0.0
     profile_kvc_select_required_ms: float = 0.0
     profile_kvc_select_evict_ms: float = 0.0
@@ -883,6 +1147,17 @@ class LayerKVStats:
     native_schedule_kv_available_tokens: int = -1
     native_schedule_overlap_enabled: bool = False
     observed_batch_size: int = 0
+    shared_expert_admission_recall_count: int = 0
+    shared_expert_admission_recovered_tokens: int = 0
+    shared_expert_admission_recall_ms: float = 0.0
+    shared_expert_admission_overflow_count: int = 0
+    shared_expert_admission_overflow_tokens: int = 0
+    observed_decode_forward_count: int = 0
+    observed_decode_request_steps: int = 0
+    observed_decode_batch_size_max: int = 0
+    observed_decode_batch_histogram: Dict[int, int] = dataclasses.field(
+        default_factory=dict
+    )
     avg_prefix_len: float = 0.0
     decode_steps: int = 0
     kvc_bytes_per_token_all_layers: int = 0

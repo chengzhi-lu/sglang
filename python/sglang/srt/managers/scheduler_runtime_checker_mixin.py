@@ -189,6 +189,35 @@ class SchedulerRuntimeCheckerMixin:
             return 0
         return int(reserved_fn())
 
+    def _layerkv_full_pool_total(self: Scheduler) -> int:
+        """Return the physical full-KV capacity used by accounting checks.
+
+        LayerKV can expose a sparse KV tail after model initialization.  The
+        scheduler's ``max_total_num_tokens`` remains the admission/configured
+        base, while the allocator size is the physical pool total during the
+        overflow window.  Keep the ordinary scheduler value for all other
+        configurations so this helper does not change their accounting.
+        """
+        base_total = int(self.max_total_num_tokens)
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        allocator_total = getattr(allocator, "size", None)
+        try:
+            allocator_total = int(
+                allocator_total() if callable(allocator_total) else allocator_total
+            )
+        except (TypeError, ValueError):
+            allocator_total = base_total
+        if allocator_total <= base_total:
+            return base_total
+
+        layerkv_runtime = None
+        if hasattr(self, "_get_layerkv_runtime"):
+            layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None:
+            model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+            layerkv_runtime = getattr(model_runner, "layerkv_runtime", None)
+        return allocator_total if layerkv_runtime is not None else base_total
+
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
@@ -214,8 +243,9 @@ class SchedulerRuntimeCheckerMixin:
     def _get_token_info(self: Scheduler) -> PoolStats:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        total = self._layerkv_full_pool_total()
+        num_used = total - (available_size + evictable_size)
+        token_usage = num_used / total
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,
@@ -335,7 +365,7 @@ class SchedulerRuntimeCheckerMixin:
         else:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
-            total = self.max_total_num_tokens
+            total = self._layerkv_full_pool_total()
         return self._check_pool_invariant(
             "full",
             ps.full_available_size,
