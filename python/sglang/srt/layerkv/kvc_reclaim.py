@@ -51,7 +51,40 @@ class LayerKVKvcReclaimMixin:
         )
         self._current_forward_req_lens_batch_id = id(forward_batch)
         self._current_forward_req_lens = list(pairs)
+        # Expert route predictions are only reused for the same request
+        # generation and a nearby context length.  A 256-token bucket is
+        # coarse enough to survive normal decode growth, while rejecting a
+        # short-to-long workload transition before it can trigger speculative
+        # H2D traffic for a stale route.
+        generation_lookup = getattr(self, "_per_layer_req_generation", None)
+        signature_pairs = self._batch_req_indices_and_lens(forward_batch)
+        if not signature_pairs:
+            signature_pairs = pairs
+        self._current_forward_expert_request_signature = tuple(
+            sorted(
+                (
+                    int(req_idx),
+                    int(generation_lookup(int(req_idx)))
+                    if callable(generation_lookup)
+                    else 0,
+                    max(0, int(seq_len)) // 256,
+                )
+                for req_idx, seq_len in signature_pairs
+            )
+        )
         self.stats.observed_batch_size = len(pairs)
+        if self._current_forward_mode == "decode":
+            # CPU metadata from the executed ForwardBatch, not admission limits
+            # or cached scheduler request lengths. No device read/synchronization.
+            batch_size = int(forward_batch.batch_size)
+            if batch_size > 0:
+                self.stats.observed_decode_forward_count += 1
+                self.stats.observed_decode_request_steps += batch_size
+                self.stats.observed_decode_batch_size_max = max(
+                    self.stats.observed_decode_batch_size_max, batch_size
+                )
+                histogram = self.stats.observed_decode_batch_histogram
+                histogram[batch_size] = histogram.get(batch_size, 0) + 1
         if pairs:
             self.stats.avg_prefix_len = sum(
                 max(0, seq_len - 1) for _, seq_len in pairs
@@ -211,7 +244,9 @@ class LayerKVKvcReclaimMixin:
                     if self.config.kvc_backend == "per-layer-arena":
                         host_slots = entry.host_slot_list()
                         if host_slots:
-                            self._remove_per_layer_cleanup_host_slots(entry, host_slots)
+                            # Per-layer reload retains its immutable CPU backing
+                            # for the next eviction; request cleanup still owns it.
+                            self._add_per_layer_cleanup_host_slots(entry, host_slots)
                         reload_locs = entry.device_loc_list() or (
                             [int(loc) for loc in entry.evicted_device_locs]
                             if entry.evicted_device_locs
@@ -245,7 +280,7 @@ class LayerKVKvcReclaimMixin:
                     if self.config.kvc_backend == "per-layer-arena":
                         host_slots = entry.host_slot_list()
                         if host_slots:
-                            self._remove_per_layer_cleanup_host_slots(entry, host_slots)
+                            self._add_per_layer_cleanup_host_slots(entry, host_slots)
                         reload_locs = entry.device_loc_list() or (
                             [int(loc) for loc in entry.evicted_device_locs]
                             if entry.evicted_device_locs
@@ -782,16 +817,16 @@ class LayerKVKvcReclaimMixin:
                     entry.host_slot = (
                         int(page_host_slots[0]) if page_host_slots else None
                     )
+                    if page_host_slots:
+                        self._add_per_layer_cleanup_host_slots(
+                            entry, [int(slot) for slot in page_host_slots]
+                        )
                     if self.config.kvc_backend != "per-layer-arena":
                         entry.device_loc = None
                         entry.device_locs = None
                         entry.ready_event = None
                         entry.ready_start_event = None
                         entry.ready_waited = False
-                        if page_host_slots:
-                            self._add_per_layer_cleanup_host_slots(
-                                entry, [int(slot) for slot in page_host_slots]
-                            )
                     entry.last_access_step = self._decode_step
                     self._sync_kvc_group_if_needed(entry)
                 if self.config.kvc_backend == "per-layer-arena":
@@ -809,6 +844,11 @@ class LayerKVKvcReclaimMixin:
                 if per_layer_overwrite_bits:
                     with self._profile("profile_kvc_free_locs_ms"):
                         for layer_id, bits in per_layer_overwrite_bits.items():
+                            # Backup is complete: release arena ownership before
+                            # publishing these locations for overwrite reuse.
+                            self._per_layer_arena_allocated_locs.setdefault(
+                                int(layer_id), set()
+                            ).difference_update(self._bitset_to_locs(int(bits)))
                             self._push_per_layer_overwrite_bits(
                                 int(layer_id),
                                 int(bits),
@@ -1076,7 +1116,7 @@ class LayerKVKvcReclaimMixin:
         ):
             if getattr(self._host_store, "track_layer_used_sets", True):
                 host_used_slots = {
-                    (self._host_store.start_layer + layer_offset, int(slot))
+                    (self._host_store.layer_ids[layer_offset], int(slot))
                     for layer_offset, slots in enumerate(
                         self._host_store.layer_used_slots
                     )
@@ -1519,6 +1559,10 @@ class LayerKVKvcReclaimMixin:
         total_t0 = time.perf_counter() if self.config.profile_detail else 0.0
         t0 = time.perf_counter()
         req_indices = set(int(x) for x in req_pool_indices.detach().cpu().tolist())
+        if self.config.kvc_backend == "per-layer-arena":
+            # Extension allocation already registered the live generation.
+            # Do not recycle fresh prefill slots before the forward uses them.
+            req_indices.difference_update(self._native_kvc_runs_by_req)
         self._add_profile(
             "profile_cleanup_req_indices_ms", (time.perf_counter() - t0) * 1000.0
         )
@@ -1745,6 +1789,11 @@ class LayerKVKvcReclaimMixin:
         before the request pool index is cleared by release_kv_cache.
         """
 
+        if (
+            self._shared_expert is not None
+            and not self.config.shared_expert_retain_across_requests
+        ):
+            self._shared_expert.recall()
         req_pool_idx = getattr(req, "req_pool_idx", None)
         if req_pool_idx is None:
             return
@@ -1936,6 +1985,11 @@ class LayerKVKvcReclaimMixin:
             self._per_layer_cleanup_token_count_by_req.pop(req_idx, None)
             return 0
 
+        # Host slot numbers are reused by later requests. Cached scratch and
+        # materialization plans cannot identify their contents by slot alone.
+        self._finalize_reloaded_entries(block=True)
+        self._finalize_virtual_materialize_events(block=True)
+        self._invalidate_virtual_caches_for_layers(layers)
         loop_t0 = time.perf_counter()
         self._release_per_layer_req_generation(req_idx)
         token_count = int(
@@ -2111,6 +2165,11 @@ class LayerKVKvcReclaimMixin:
 
         t0 = time.perf_counter()
         for layer_id, loc_bits in free_loc_bits_by_layer.items():
+            # Finished-request slots must no longer be owned by the arena
+            # allocator when they become available for overwrite reuse.
+            allocated = self._per_layer_arena_allocated_locs.get(int(layer_id))
+            if allocated:
+                allocated.difference_update(self._bitset_to_locs(int(loc_bits)))
             self._push_per_layer_overwrite_bits(
                 int(layer_id),
                 int(loc_bits),
@@ -2341,6 +2400,20 @@ class LayerKVKvcReclaimMixin:
         loop_t0 = time.perf_counter()
         collect_t0 = time.perf_counter()
         for key in keys:
+            entry = self._per_layer_residency.get(key)
+            if (
+                entry is not None
+                and int(entry.generation)
+                in self._per_layer_released_req_generations.get(int(entry.req_idx), ())
+            ):
+                # Indexed completion already freed this generation's storage.
+                # A lazy tombstone must not free slots (or unindex a new
+                # generation) when pruning or an explicit summary visits it.
+                self._per_layer_residency.pop(key, None)
+                self._per_layer_residency_tombstone_count = max(
+                    0, self._per_layer_residency_tombstone_count - 1
+                )
+                continue
             self._untrack_per_layer_offloaded_key(key)
             entry = self._per_layer_residency.pop(key, None)
             if entry is not None:

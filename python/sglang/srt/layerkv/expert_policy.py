@@ -3,35 +3,18 @@
 from __future__ import annotations
 
 import functools
-import heapq
 import json
 import logging
 import math
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
 if __package__:
-    from .common_types import (
-        _LayerKVExpertCopyDescriptor,
-        _LayerKVExpertInstallBuild,
-        _LayerKVExpertInstallD2HJob,
-        _LayerKVExpertInstallItem,
-        _LayerKVExpertLayerState,
-        _LayerKVPendingExpertCopy,
-        _LayerKVPendingExpertD2H,
-    )
+    pass
 else:  # pragma: no cover - direct file-loading smoke tests.
-    from common_types import (
-        _LayerKVExpertCopyDescriptor,
-        _LayerKVExpertInstallBuild,
-        _LayerKVExpertInstallD2HJob,
-        _LayerKVExpertInstallItem,
-        _LayerKVExpertLayerState,
-        _LayerKVPendingExpertCopy,
-        _LayerKVPendingExpertD2H,
-    )
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +68,7 @@ class LayerKVExpertPolicyMixin:
             if not self.unsupported_reason:
                 self.unsupported_reason = "expert collector-only mode"
             return
-        if self.config.expert_cpu_backing_mode == "all":
+        if self.config.expert_cpu_backing_mode in ("all", "selected"):
             self._preload_all_expert_cpu_backing()
 
     def _preload_all_expert_cpu_backing(self) -> None:
@@ -94,25 +77,36 @@ class LayerKVExpertPolicyMixin:
         t0 = time.perf_counter()
         copied = 0
         copied_bytes = 0
-        for layer_id, module in self._expert_modules:
+        selected = self.config.expert_cpu_backing_mode == "selected"
+        modules = self._expert_modules
+        if selected:
+            modules = [
+                (layer, module)
+                for layer, module in modules
+                if layer == self.config.shared_expert_layer
+            ]
+            if len(modules) != 1:
+                raise ValueError(
+                    "selected CPU backing requires exactly one discovered shared expert layer"
+                )
+        for layer_id, module in modules:
             param_names = self._expert_param_names(module)
             full_num_experts = int(module.w13_weight.data.shape[0])
-            for expert_id in range(full_num_experts):
-                params = self._copy_expert_to_cpu_backing_no_account(
-                    module,
-                    param_names,
-                    expert_id,
-                    non_blocking=True,
-                    pin_memory=False,
-                )
+            copied_params = self._copy_experts_to_cpu_for_install_batched(
+                module,
+                param_names,
+                list(range(full_num_experts)),
+                layer_id=int(layer_id),
+                account_host_backing=False,
+                pin_memory=selected,
+                reason="install_preload",
+            )
+            for expert_id, params in copied_params.items():
                 self._expert_global_cpu_backing[(int(layer_id), int(expert_id))] = (
                     params
                 )
                 copied += 1
                 copied_bytes += self._expert_backing_bytes(params)
-            device = module.w13_weight.data.device
-            if device.type == "cuda":
-                torch.cuda.current_stream(device=device).synchronize()
         self._expert_global_cpu_backing_bytes = copied_bytes
         self.stats.expert_cpu_backing_preload_count = copied
         self.stats.expert_cpu_backing_preload_ms += (time.perf_counter() - t0) * 1000.0
@@ -125,6 +119,19 @@ class LayerKVExpertPolicyMixin:
             return
         full_num_experts = int(module.w13_weight.data.shape[0])
         orig_run_moe_core = module.run_moe_core
+        native_graph = None
+        if getattr(self.config, "native_moe_graph_max_batch_size", 0):
+            from .native_moe_graph import NativeMoEGraph, resident_core_eligible
+
+            if resident_core_eligible(
+                module, layer_id, self.config.shared_expert_layer
+            ):
+                native_graph = NativeMoEGraph(
+                    orig_run_moe_core,
+                    lambda: (module.w13_weight, module.w2_weight),
+                    max_batch_size=self.config.native_moe_graph_max_batch_size,
+                )
+                self._native_moe_graphs[layer_id] = native_graph
 
         @functools.wraps(orig_run_moe_core)
         def wrapped_run_moe_core(dispatch_output: Any, *args, **kwargs):
@@ -140,6 +147,15 @@ class LayerKVExpertPolicyMixin:
                 )
             elif topk_ids is not None:
                 self._expert_hotness_sample_skip_pending += 1
+            if (
+                native_graph is not None
+                and self._current_forward_mode == "decode"
+                and layer_id not in self._expert_layers
+                and not getattr(module, "_layerkv_expert_wrapped", False)
+                and not args
+                and not kwargs
+            ):
+                return native_graph(dispatch_output)
             return orig_run_moe_core(dispatch_output, *args, **kwargs)
 
         module._layerkv_hotness_orig_run_moe_core = orig_run_moe_core
@@ -287,7 +303,7 @@ class LayerKVExpertPolicyMixin:
     ) -> Tuple[float, float, bool, str]:
         self.stats.planner_apply_count += 1
         target_mb = self._refresh_reclaim_target_stats(forward_batch)
-        self.stats.planner_version = "deadline-dp-v1"
+        self.stats.planner_version = "deadline-dp-v2-layerwise-benefit"
         if not self.physical_expert_supported:
             reason = self._expert_support_reason()
             self._set_joint_planner_choice(
@@ -301,9 +317,7 @@ class LayerKVExpertPolicyMixin:
             return 1.0, 0.0, False, reason
         if self.config.dynamic_pressure_from_kvc and target_mb > 1e-3:
             reason = "dynamic_kvc_pressure_requires_kvc_reclaim"
-            kvc_cost = self._estimate_planner_kvc_reclaim_cost(
-                target_mb, forward_batch
-            )
+            kvc_cost = self._estimate_planner_kvc_reclaim_cost(target_mb, forward_batch)
             self._set_joint_planner_choice(
                 kvc_fraction=1.0,
                 expert_fraction=0.0,
@@ -427,6 +441,7 @@ class LayerKVExpertPolicyMixin:
             self.stats.planner_estimated_kvc_controller_cost = 0.0
             self.stats.planner_estimated_kvc_overlap_ms = 0.0
             self.stats.planner_estimated_kvc_exposed_ms = 0.0
+            self.stats.planner_estimated_kvc_capacity_benefit = 0.0
             self.stats.planner_estimated_expert_backing_miss_cost = 0.0
             self.stats.planner_estimated_expert_materialize_cost = 0.0
             self.stats.planner_selected_kvc_reclaim_mb = 0.0
@@ -484,23 +499,24 @@ class LayerKVExpertPolicyMixin:
             float, Tuple[float, float, float, float, float, float]
         ] = {}
         expert_plan_cache: Dict[float, Tuple[Dict[int, int], Dict[int, float]]] = {}
+        layerwise_expert_plan = self._layerwise_expert_plan_enabled()
         coresid_expert_plan_inputs = (
             self._build_coresid_expert_plan_inputs(forward_batch)
-            if self.config.policy == "coresid"
+            if layerwise_expert_plan
             else None
         )
-        if self.config.policy == "coresid":
+        if layerwise_expert_plan:
             expert_layer_items: List[Tuple[int, int, int]] = []
             expert_candidates: List[Tuple[float, int]] = []
         else:
             expert_layer_items, expert_candidates = self._build_expert_cost_inputs()
-        if self.config.policy == "coresid" and coresid_expert_plan_inputs is not None:
+        if layerwise_expert_plan and coresid_expert_plan_inputs is not None:
             expert_prefix_candidates = coresid_expert_plan_inputs[3]
         else:
             expert_prefix_candidates = expert_candidates
         expert_prefix_table = (
             {}
-            if self.config.policy == "coresid"
+            if layerwise_expert_plan
             else self._build_expert_prefix_table(expert_prefix_candidates)
         )
         expert_layerwise_table = (
@@ -508,8 +524,7 @@ class LayerKVExpertPolicyMixin:
                 coresid_expert_plan_inputs,
                 max_reclaim_mb=target_mb,
             )
-            if self.config.policy == "coresid"
-            and coresid_expert_plan_inputs is not None
+            if layerwise_expert_plan and coresid_expert_plan_inputs is not None
             else None
         )
         (
@@ -518,7 +533,12 @@ class LayerKVExpertPolicyMixin:
             kvc_block_tokens_for_plan,
         ) = self._layer_aware_kvc_plan_context(forward_batch)
         kvc_avg_prefix = max(1.0, self._avg_prefix_len(forward_batch))
-        kvc_batch_size = max(1, int(getattr(self.stats, "observed_batch_size", 0) or 1))
+        current_batch_size = len(self._batch_req_indices_and_lens(forward_batch))
+        kvc_batch_size = max(
+            1,
+            int(current_batch_size or 0),
+            int(getattr(self.stats, "observed_batch_size", 0) or 0),
+        )
         kvc_recovery_steps = self._expected_kvc_recovery_steps()
         kvc_cost_cache: Dict[float, Tuple[float, int]] = {}
         kvc_controller_cost_cache: Dict[float, float] = {}
@@ -575,6 +595,28 @@ class LayerKVExpertPolicyMixin:
             ) * 1000.0
             return cached
 
+        # This is the value of retaining KVC capacity instead of moving that
+        # capacity to CPU.  It is measured in the same modeled critical-path
+        # units as ``kvc_cost`` and already reflects the current context,
+        # batch, overlap window and decode recovery horizon.  Using the
+        # maximum feasible KVC point as the reference makes the expert choice
+        # an explicit "expert transfer cost minus saved KVC cost" decision.
+        kvc_baseline_point = 0.0
+        if limit > 0.0:
+            feasible_points = [
+                float(point)
+                for point in kvc_points
+                if float(point) <= float(limit) + 1e-6
+            ]
+            if feasible_points:
+                kvc_baseline_point = max(feasible_points)
+        kvc_baseline_cost = 0.0
+        if kvc_baseline_point > 0.0:
+            kvc_baseline_cost, _baseline_tokens = cached_kvc_cost(kvc_baseline_point)
+            if kvc_baseline_cost >= 1.0e29:
+                kvc_baseline_cost = 0.0
+        has_kvc_benefit_reference = kvc_baseline_point > 0.0
+
         def cached_expert_cost(
             expert_mb: float,
         ) -> Tuple[float, float, float, float, float, float]:
@@ -587,7 +629,7 @@ class LayerKVExpertPolicyMixin:
                 ) * 1000.0
                 return cached
             with self._profile("profile_planner_dp_expert_cost_ms"):
-                if self.config.policy == "coresid":
+                if layerwise_expert_plan:
                     (
                         value,
                         churn_count,
@@ -645,12 +687,20 @@ class LayerKVExpertPolicyMixin:
             expert_only_backing_cost,
             expert_only_materialize_cost,
         ) = cached_expert_cost(target_mb)
-        best: Optional[Tuple[float, float, float, float, float]] = (
-            expert_only_cost,
+        expert_only_saved_kvc_cost = (
+            kvc_baseline_cost if has_kvc_benefit_reference else 0.0
+        )
+        best: Optional[
+            Tuple[float, float, float, float, float, float, float, float]
+        ] = (
+            float(expert_only_cost - expert_only_saved_kvc_cost),
+            float(expert_only_cost),
+            float(-max(0.0, expert_only_saved_kvc_cost)),
             0.0,
             1.0,
             0.0,
-            expert_only_cost,
+            float(expert_only_cost),
+            float(expert_only_saved_kvc_cost),
         )
         best_expert_stats = (
             expert_only_churn,
@@ -661,6 +711,7 @@ class LayerKVExpertPolicyMixin:
         )
         best_kvc_tokens = 0
         best_kvc_controller_cost = 0.0
+        best_kvc_saved_cost = kvc_baseline_cost if has_kvc_benefit_reference else 0.0
         infeasible_expert = 0
         if expert_only_cost >= 1.0e29:
             infeasible_expert += 1
@@ -671,9 +722,7 @@ class LayerKVExpertPolicyMixin:
                 with self._profile("profile_planner_dp_candidate_eval_ms"):
                     kvc_cost, kvc_tokens = cached_kvc_cost(kvc_mb)
                     actual_kvc_mb = (
-                        float(kvc_tokens)
-                        * float(kvc_token_bytes)
-                        / float(1024 * 1024)
+                        float(kvc_tokens) * float(kvc_token_bytes) / float(1024 * 1024)
                     )
                     actual_kvc_mb = min(float(target_mb), max(0.0, actual_kvc_mb))
                     if actual_kvc_mb <= 0.0:
@@ -682,8 +731,6 @@ class LayerKVExpertPolicyMixin:
                     expert_mb = max(0.0, target_mb - actual_kvc_mb)
                     kvc_fraction = actual_kvc_mb / target_mb
                     expert_fraction = expert_mb / target_mb
-                    if kvc_cost >= best[0]:
-                        continue
                     (
                         expert_cost,
                         churn_count,
@@ -696,12 +743,24 @@ class LayerKVExpertPolicyMixin:
                         infeasible_expert += 1
                         continue
                     total_cost = kvc_cost + expert_cost
+                    saved_kvc_cost = (
+                        kvc_baseline_cost - kvc_cost
+                        if has_kvc_benefit_reference
+                        else 0.0
+                    )
                     candidate = (
-                        total_cost,
+                        float(
+                            expert_cost - saved_kvc_cost
+                            if has_kvc_benefit_reference
+                            else total_cost
+                        ),
+                        float(total_cost),
+                        float(-max(0.0, saved_kvc_cost)),
                         kvc_fraction,
                         expert_fraction,
                         kvc_cost,
                         expert_cost,
+                        float(saved_kvc_cost),
                     )
                 if best is None or candidate < best:
                     best = candidate
@@ -716,8 +775,18 @@ class LayerKVExpertPolicyMixin:
                     best_kvc_controller_cost = float(
                         kvc_controller_cost_cache.get(round(kvc_mb, 6), 0.0)
                     )
+                    best_kvc_saved_cost = float(saved_kvc_cost)
         assert best is not None
-        _total_cost, kvc_fraction, expert_fraction, kvc_cost, expert_cost = best
+        (
+            _objective_cost,
+            _total_cost,
+            _negative_benefit_tiebreak,
+            kvc_fraction,
+            expert_fraction,
+            kvc_cost,
+            expert_cost,
+            _selected_saved_kvc_cost,
+        ) = best
         self.stats.planner_dp_candidate_count = len(kvc_points)
         self.stats.planner_dp_selected_kvc_candidates = 1 if kvc_fraction > 0.0 else 0
         self.stats.planner_dp_selected_expert_candidates = (
@@ -728,6 +797,9 @@ class LayerKVExpertPolicyMixin:
         self.stats.planner_dp_selected_total_cost = float(_total_cost)
         self.stats.planner_dp_selected_kvc_cost = float(kvc_cost)
         self.stats.planner_dp_selected_expert_cost = float(expert_cost)
+        self.stats.planner_estimated_kvc_capacity_benefit = max(
+            0.0, float(best_kvc_saved_cost)
+        )
         self.stats.planner_estimated_kvc_controller_cost = best_kvc_controller_cost
         self.stats.planner_estimated_expert_churn_count = float(best_expert_stats[0])
         self.stats.planner_estimated_expert_churn_mb = float(best_expert_stats[1])
@@ -738,7 +810,7 @@ class LayerKVExpertPolicyMixin:
         self.stats.planner_estimated_expert_materialize_cost = float(
             best_expert_stats[4]
         )
-        if self.config.policy == "coresid":
+        if layerwise_expert_plan:
             expert_mb = round(target_mb * expert_fraction, 6)
             capacities, layer_costs = expert_plan_cache.get(expert_mb, ({}, {}))
             current_expert_target = float(target_mb * expert_fraction)
@@ -1203,9 +1275,7 @@ class LayerKVExpertPolicyMixin:
         )
         capacities = (capacities // int(block_tokens)) * int(block_tokens)
 
-        plan = torch.zeros(
-            (len(points), layer_count), dtype=torch.int64, device="cpu"
-        )
+        plan = torch.zeros((len(points), layer_count), dtype=torch.int64, device="cpu")
         remaining = (token_counts // int(block_tokens)) * int(block_tokens)
         for idx in range(layer_count - 1, -1, -1):
             positive = remaining > 0

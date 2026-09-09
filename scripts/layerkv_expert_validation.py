@@ -16,12 +16,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from sglang.srt.layerkv.runtime import LayerKVConfig, LayerKVRuntime
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
@@ -220,12 +223,13 @@ def _exercise_policy(
     )
     # First decode pass records routing hotness. The runtime intentionally waits
     # for one decode sample before physically shrinking expert slots.
-    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    forward_batch = SimpleNamespace(batch_size=2, out_cache_loc=[])
+    rt.on_forward_begin(mode="decode", forward_batch=forward_batch)
     for layer in runner.model.layers:
         layer(torch.zeros((2, 2), dtype=torch.float32), topk)
 
     # Second decode pass applies the expert plan and exercises materialization.
-    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    rt.on_forward_begin(mode="decode", forward_batch=forward_batch)
     for layer in runner.model.layers:
         state = rt._expert_layers.get(int(layer.layer_id))
         offloaded = [
@@ -321,7 +325,9 @@ def _exercise_unsupported(
     )
     rt = _runtime("kv-first", reclaim_limit_mb, runtime_profile)
     rt.install_on_runner(runner)
-    rt.on_forward_begin(mode="decode", forward_batch=SimpleNamespace())
+    rt.on_forward_begin(
+        mode="decode", forward_batch=SimpleNamespace(batch_size=1, out_cache_loc=[])
+    )
     summary = rt.summary()
     reasons = []
     if bool(summary["layerkv_physical_expert_supported"]):
@@ -353,7 +359,11 @@ def write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="outputs/layerkv")
-    parser.add_argument("--reclaim-limit-mb", type=float, default=0.00035)
+    # Keep the synthetic validation target below the next discrete expert-row
+    # boundary.  The generic planner may reclaim whole rows, so a target just
+    # above the boundary can otherwise report a harmless plan/execution
+    # rounding mismatch.
+    parser.add_argument("--reclaim-limit-mb", type=float, default=0.0002)
     parser.add_argument(
         "--runtime-profile",
         choices=["simple", "optimized"],

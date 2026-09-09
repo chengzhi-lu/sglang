@@ -22,6 +22,7 @@ if __package__:
         _LayerKVResidentTensorGroup,
     )
     from .host_store import _LayerKVHostKVStore
+    from .kv_pool_view import HybridKVCStorageView
 else:  # pragma: no cover - direct file-loading smoke tests.
     from config_stats import LayerKVConfig
     from common_types import (
@@ -32,6 +33,7 @@ else:  # pragma: no cover - direct file-loading smoke tests.
         _LayerKVResidentTensorGroup,
     )
     from host_store import _LayerKVHostKVStore
+    from kv_pool_view import HybridKVCStorageView
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,15 @@ class LayerKVPlannerMixin:
         policy = str(self.config.policy)
         return "layer-aware-joint-dp" if policy == "coresid" else policy
 
+    def _shared_expert_controller_for_state(self, state):
+        controller = getattr(self, "_shared_expert", None)
+        if controller is None:
+            return None
+        lookup = getattr(controller, "controller_for_state", None)
+        if callable(lookup):
+            return lookup(state)
+        return controller if getattr(controller, "state", None) is state else None
+
     def _coresid_optimized_policy_enabled(self) -> bool:
         return (
             self.config.mode == "kvc-expert"
@@ -172,10 +183,19 @@ class LayerKVPlannerMixin:
         # group bookkeeping is too expensive for the optimized online path.
         # Keep aggregate stats there and reserve detailed group maps for debug /
         # validation modes.
-        return not (
-            self._coresid_optimized_policy_enabled()
-            and self.config.dynamic_pressure_from_kvc
-        )
+        if self._coresid_optimized_policy_enabled() and self.config.dynamic_pressure_from_kvc:
+            return False
+        if (
+            self.config.runtime_profile == "optimized"
+            and self.config.mode == "kvc-expert"
+            and self.config.kvc_backend == "per-layer-arena"
+            and self.config.shared_expert_enabled
+            and not self.config.debug_stats
+            and not self.config.profile_detail
+            and not self.config.shared_expert_trace_waits
+        ):
+            return False
+        return True
 
     def _refresh_profile_derived(self) -> None:
         self.stats.profile_detail_enabled = bool(self.config.profile_detail)
@@ -238,6 +258,58 @@ class LayerKVPlannerMixin:
         self.stats.native_schedule_waiting_queue_len = int(
             context.get("waiting_queue_len", 0) or 0
         )
+        self._last_scheduler_waiting_context_tokens = max(
+            0, int(context.get("waiting_max_context_tokens", 0) or 0)
+        )
+        self._prefill_admission_probe = {
+            key: context.get(key)
+            for key in (
+                "prefill_adder_remaining_input_tokens",
+                "prefill_adder_credit_tokens",
+                "prefill_adder_can_run",
+                "prefill_adder_rem_total_tokens",
+                "prefill_adder_cur_rem_tokens",
+                "req_pool_available_size",
+            )
+        }
+        remaining_input = context.get("prefill_adder_remaining_input_tokens")
+        if remaining_input is not None:
+            remaining_input = int(remaining_input)
+            if self._prefill_admission_probe_min_remaining_input is None:
+                self._prefill_admission_probe_min_remaining_input = remaining_input
+            else:
+                self._prefill_admission_probe_min_remaining_input = min(
+                    self._prefill_admission_probe_min_remaining_input,
+                    remaining_input,
+                )
+        self._prefill_admission_probe_max_credit = max(
+            self._prefill_admission_probe_max_credit,
+            int(context.get("prefill_adder_credit_tokens", 0) or 0),
+        )
+        self._prefill_admission_probe_max_can_run = max(
+            self._prefill_admission_probe_max_can_run,
+            int(context.get("prefill_adder_can_run", 0) or 0),
+        )
+        req_pool_available = context.get("req_pool_available_size")
+        if req_pool_available is not None:
+            req_pool_available = int(req_pool_available)
+            if self._prefill_admission_probe_min_req_pool is None:
+                self._prefill_admission_probe_min_req_pool = req_pool_available
+            else:
+                self._prefill_admission_probe_min_req_pool = min(
+                    self._prefill_admission_probe_min_req_pool,
+                    req_pool_available,
+                )
+        self._shared_expert_remaining_decode_steps = None
+        if (
+            self.config.shared_expert_benefit_horizon_steps
+            and self.stats.native_schedule_forward_mode.lower() == "decode"
+        ):
+            from .residency_budget import remaining_fixed_decode_steps
+
+            self._shared_expert_remaining_decode_steps = (
+                remaining_fixed_decode_steps(getattr(schedule_batch, "reqs", None))
+            )
         self.stats.native_schedule_running_batch_size = int(
             context.get("running_batch_size", 0) or 0
         )
@@ -340,8 +412,7 @@ class LayerKVPlannerMixin:
             self.config.kvc_backend == "per-layer-arena"
             and reason == "decode_prealloc_admission"
         ):
-            self._ensure_per_layer_common_free_current()
-            credit = int(len(self._per_layer_arena_common_free_locs))
+            credit = self._common_per_layer_reusable_token_count()
             self.stats.kvc_per_layer_physical_arena_common_free_tokens = credit
             return max(0, credit), raw_offloaded, "per_layer_arena_physical_allocator"
         planner_credit = self._planner_scheduler_credit_tokens()
@@ -386,6 +457,66 @@ class LayerKVPlannerMixin:
             self._per_layer_allocator_enabled()
         )
 
+    def recall_shared_expert_for_admission(
+        self,
+        *,
+        shortage_tokens: int,
+        context_tokens: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        allow_kv_overflow: bool = True,
+    ) -> int:
+        """Return physically restored or activated common KV tokens.
+
+        Called only by an explicit admission decision, not read-only capacity
+        queries. Shared mode disables overlap, so recall completes before the
+        scheduler can allocate a new request's KV addresses.  When a real
+        admission shortage is caused by a long-context, small-batch request,
+        an explicitly enabled expert-to-KV overflow tail may be activated at
+        this point, before the scheduler rejects the request.
+        """
+        controller = self._shared_expert
+        if (
+            int(shortage_tokens) <= 0
+            or controller is None
+            or self.config.shared_expert_admission_policy == "retain"
+        ):
+            return 0
+        # ``free_kv_donors`` controls whether completely unused KV pages may
+        # fund new expert growth.  It must not disable returning an existing
+        # expert loan when admission is short: backed-offloaded donors are
+        # valid in the default mode and their pages are precisely the KV
+        # capacity that admission needs under pressure.
+        controller.admission_shortage_tokens = max(
+            controller.admission_shortage_tokens, int(shortage_tokens)
+        )
+        recovered = 0
+        if controller.arena.loans:
+            before = len(self._common_per_layer_reusable_locs())
+            started = time.perf_counter()
+            controller.recall()
+            recovered = max(0, len(self._common_per_layer_reusable_locs()) - before)
+            self.stats.shared_expert_admission_recall_count += 1
+            self.stats.shared_expert_admission_recovered_tokens += recovered
+            self.stats.shared_expert_admission_recall_ms += (
+                time.perf_counter() - started
+            ) * 1000.0
+        if (
+            allow_kv_overflow
+            and context_tokens is not None
+            and batch_size is not None
+            and recovered < int(shortage_tokens)
+        ):
+            overflow_tokens = controller.prepare_kv_overflow_for_admission(
+                context_tokens=int(context_tokens),
+                batch_size=int(batch_size),
+                shortage_tokens=max(0, int(shortage_tokens) - recovered),
+            )
+            if overflow_tokens > 0:
+                recovered += overflow_tokens
+                self.stats.shared_expert_admission_overflow_count += 1
+                self.stats.shared_expert_admission_overflow_tokens += overflow_tokens
+        return recovered
+
     def get_scheduler_admission_credit_tokens(
         self,
         *,
@@ -415,6 +546,31 @@ class LayerKVPlannerMixin:
         if shortage > credit and reason:
             self.stats.scheduler_budget_credit_denied_count += 1
         return credit
+
+    def release_scheduler_admission_credit_tokens(
+        self, *, required_tokens: int, available_tokens: int
+    ) -> int:
+        """Publish common-free per-layer KVC addresses to native admission.
+
+        The per-layer arena can own valid, currently unused locations that are
+        intentionally absent from the native allocator's free-page tensor.
+        A read-only scheduler credit is enough for a decode feasibility query,
+        but ``PrefillAdder`` must receive real native addresses before it can
+        allocate a new request.  Release only the residual deficit; active or
+        protected KVC locations remain owned by the arena.
+        """
+        required = max(0, int(required_tokens or 0))
+        available = max(0, int(available_tokens or 0))
+        if (
+            required <= available
+            or self.config.kvc_backend != "per-layer-arena"
+            or not self._per_layer_allocator_enabled()
+        ):
+            return 0
+        release_fn = getattr(self, "_release_common_per_layer_locs_to_native", None)
+        if not callable(release_fn):
+            return 0
+        return max(0, int(release_fn(required - available) or 0))
 
     def get_scheduler_allocatable_tokens(
         self,
@@ -839,9 +995,33 @@ class LayerKVPlannerMixin:
             and self.config.reclaim_limit_mb > 0
         ):
             self._ensure_host_store()
-        if self.config.kvc_backend in ("virtual-arena", "per-layer-arena"):
+        if self.physical_kvc_supported and self.config.kvc_backend in (
+            "virtual-arena",
+            "per-layer-arena",
+        ):
             self._ensure_virtual_scratch()
         self._discover_expert_support(runner)
+        if self.config.shared_expert_enabled:
+            from .shared_expert import SharedExpertController, SharedExpertManager
+
+            arena = getattr(runner, "layerkv_shared_vmm", None)
+            if (
+                arena is None
+                or not self.physical_kvc_supported
+                or not self.physical_expert_supported
+            ):
+                raise ValueError("LayerKV shared VMM needs supported KV/expert pools")
+            if self.config.shared_expert_all_layers:
+                layer_ids = [
+                    int(layer_id) for layer_id, _module in self._expert_modules
+                ]
+                if not layer_ids:
+                    raise ValueError(
+                        "all-layer SharedVMM found no supported expert layers"
+                    )
+                self._shared_expert = SharedExpertManager(self, arena, layer_ids)
+            else:
+                self._shared_expert = SharedExpertController(self, arena)
         self.installed = True
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self.stats.layerkv_python_overhead_ms += elapsed_ms
@@ -979,14 +1159,20 @@ class LayerKVPlannerMixin:
 
     def _can_support_kvc_pool(self, kv_pool: Any) -> bool:
         try:
-            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            from sglang.srt.mem_cache.memory_pool import (
+                HybridLinearKVPool,
+                MHATokenToKVPool,
+            )
         except Exception:
             return False
 
         page_size = int(getattr(kv_pool, "page_size", 1) or 1)
-        if type(kv_pool) is not MHATokenToKVPool:
+        storage_pool = kv_pool
+        if type(kv_pool) is HybridLinearKVPool and not kv_pool.use_mla:
+            storage_pool = kv_pool.full_kv_pool
+        if type(storage_pool) is not MHATokenToKVPool:
             self.unsupported_reason = (
-                f"KVC physical offload supports non-FP4 MHATokenToKVPool only, got "
+                f"KVC physical offload requires non-FP4 MHA storage, got "
                 f"{type(kv_pool).__name__}"
             )
             return False
@@ -995,6 +1181,8 @@ class LayerKVPlannerMixin:
             return False
 
         try:
+            if storage_pool is not kv_pool:
+                kv_pool = HybridKVCStorageView(kv_pool)
             self._page_size = max(1, page_size)
             self.stats.kvc_page_size = self._page_size
             one_k = kv_pool._get_key_buffer(kv_pool.start_layer)[0].nbytes
@@ -1003,6 +1191,7 @@ class LayerKVPlannerMixin:
         except Exception as exc:
             self.unsupported_reason = f"failed to inspect KV token size: {exc}"
             return False
+        self._kv_pool = kv_pool
         return self._bytes_per_token_all_layers > 0
 
     def _ensure_host_store(self) -> None:
@@ -1060,6 +1249,9 @@ class LayerKVPlannerMixin:
             )
             return False
         self._virtual_scratch_locs = locs.to(dtype=torch.int64)
+        self._virtual_scratch_locs_host = {
+            int(value) for value in self._virtual_scratch_locs.detach().cpu().tolist()
+        }
         self._virtual_scratch_capacity = int(locs.numel())
         self._virtual_scratch_cache_by_layer.clear()
         self._virtual_materialize_plan_reuse_cache.clear()

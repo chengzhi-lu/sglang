@@ -147,7 +147,12 @@ class _LayerKVExpertResidencyBackend(_LayerKVResidencyBackend):
         for layer_id, logical_ids in by_layer.items():
             state = self.runtime._expert_layers.get(int(layer_id))
             if state is not None:
-                self.runtime._materialize_experts(state, logical_ids, reason="prefetch")
+                self.runtime._materialize_experts(
+                    state,
+                    logical_ids,
+                    reason="prefetch",
+                    transfer_stream=stream,
+                )
 
 
 class LayerKVRuntime(
@@ -281,6 +286,8 @@ class LayerKVRuntime(
         self._kvc_evict_cursors_by_layer: Dict[Tuple[int, int], int] = {}
         self._expert_layers: Dict[int, _LayerKVExpertLayerState] = {}
         self._expert_modules: List[Tuple[int, Any]] = []
+        self._shared_expert = None
+        self._native_moe_graphs = {}
         self._expert_hotness_prefill: Dict[int, Dict[int, int]] = {}
         self._expert_hotness_decode: Dict[int, Dict[int, int]] = {}
         self._expert_hotness_version: int = 0
@@ -289,6 +296,9 @@ class LayerKVRuntime(
         self._expert_hotness_pending_snapshots: List[
             Tuple[str, int, torch.Tensor, Any, Optional[torch.Tensor]]
         ] = []
+        # GPU hotness snapshots are accumulated through one forward and
+        # submitted as a single tensor-copy batch at a safe boundary.
+        self._expert_hotness_snapshot_submit_queue: List[Dict[str, Any]] = []
         self._expert_candidate_order_by_layer: Dict[int, List[int]] = {}
         self._expert_candidate_pending_snapshots: List[
             Tuple[int, torch.Tensor, Any, Optional[torch.Tensor]]
@@ -324,7 +334,15 @@ class LayerKVRuntime(
             Tuple[torch.dtype, Tuple[int, ...]], List[torch.Tensor]
         ] = {}
         self._expert_cpu_backing_pool_bytes: int = 0
-        self._expert_cpu_backing_pool_limit_bytes: int = 256 * 1024 * 1024
+        self._expert_cpu_backing_pool_limit_bytes: int = int(
+            self.config.expert_cpu_backing_pool_mb * 1024 * 1024
+        )
+        # Batch D2H backing stores are exposed to the residency map as row
+        # views. Keep an owner record until every view is released; otherwise
+        # the pool must reject the view and the whole pinned batch is leaked
+        # from reuse even though its CUDA transfer has completed.
+        self._expert_cpu_backing_batch_owners = {}
+        self._expert_cpu_backing_batch_view_ids = {}
         self.stats.expert_cpu_backing_pool_limit_bytes = int(
             self._expert_cpu_backing_pool_limit_bytes
         )
@@ -343,11 +361,20 @@ class LayerKVRuntime(
         self._expert_prepare_done: bool = False
         self._last_scheduler_context: Dict[str, Any] = {}
         self._last_scheduled_req_lens: List[Tuple[int, int]] = []
+        self._last_scheduler_waiting_context_tokens: int = 0
+        self._prefill_admission_probe: Dict[str, Any] = {}
+        self._prefill_admission_probe_min_remaining_input: Optional[int] = None
+        self._prefill_admission_probe_max_credit: int = 0
+        self._prefill_admission_probe_max_can_run: int = 0
+        self._prefill_admission_probe_min_req_pool: Optional[int] = None
         self._scheduler_pressure_tokens: int = 0
         self._scheduler_pressure_kvc_blocked: bool = False
         self._force_common_kvc_evict_tokens: int = 0
         self._current_forward_req_lens_batch_id: Optional[int] = None
         self._current_forward_req_lens: List[Tuple[int, int]] = []
+        self._current_forward_expert_request_signature: Tuple[
+            Tuple[int, int, int], ...
+        ] = ()
         self._planned_kvc_token_target: int = 0
         self._planned_kvc_tokens_by_layer: Dict[int, int] = {}
         self._planned_expert_slot_capacities_by_layer: Dict[int, int] = {}
@@ -368,6 +395,15 @@ class LayerKVRuntime(
         self._cached_kvc_layer_ids_key: Optional[Tuple[int, int]] = None
         self._cached_kvc_layer_ids: List[int] = []
         self._pending_expert_copy_events: List[_LayerKVPendingExpertCopy] = []
+        # Pending expert copies are queried once per routed chunk. Keep
+        # logical-ID and destination-slot postings so ready checks and slot
+        # protection do not rescan every outstanding H2D batch.
+        self._pending_expert_copy_by_logical = {}
+        self._pending_expert_copy_by_slot = {}
+        self._pending_expert_copy_index_token = None
+        self._pending_expert_copy_sequence = {}
+        self._next_pending_expert_copy_sequence = 0
+        self._expert_batch_transfer = None
         self._pending_expert_d2h_events: List[_LayerKVPendingExpertD2H] = []
         self._pending_expert_d2h_by_key: Dict[
             Tuple[int, int], _LayerKVPendingExpertD2H
@@ -425,6 +461,9 @@ class LayerKVRuntime(
         self._per_layer_arena_overwrite_pending_bits: Dict[int, int] = {}
         self._per_layer_arena_overwrite_pending_bit_chunks: Dict[int, List[int]] = {}
         self._per_layer_arena_overwrite_pending_bit_counts: Dict[int, int] = {}
+        # Monotonic increases in shared-VMM donor eligibility. Ordinary KV
+        # consumption cannot turn an insufficient-donor result into success.
+        self._per_layer_donor_availability_version = 0
         self._per_layer_canonical_to_physical: Dict[int, Dict[int, int]] = {}
         self._per_layer_physical_to_canonical: Dict[int, Dict[int, int]] = {}
         self._per_layer_non_identity_mapping: Set[int] = set()
@@ -448,6 +487,7 @@ class LayerKVRuntime(
         self._per_layer_cleanup_token_count_by_req: Dict[int, int] = {}
         self._native_kvc_runs_by_req: Dict[int, List[_LayerKVNativeKvcRun]] = {}
         self._virtual_scratch_locs: Optional[torch.Tensor] = None
+        self._virtual_scratch_locs_host: Set[int] = set()
         self._virtual_scratch_buffers: List[torch.Tensor] = []
         self._virtual_scratch_buffer_slices: List[Tuple[int, int]] = []
         self._virtual_scratch_buffer_generations: List[int] = []
@@ -461,10 +501,16 @@ class LayerKVRuntime(
         self._expert_materialize_batch_sizes: List[int] = []
         self._expert_materialize_layers_touched: Set[int] = set()
         self._expert_prefetch_dirty_layers: Set[int] = set()
+        self._expert_cross_layer_prefetch_step: int = -1
+        self._expert_cross_layer_prefetch_layers: Set[int] = set()
         self._per_layer_resident_token_count_fast: int = 0
         self._per_layer_offloaded_token_count_fast: int = 0
         self._kvc_reload_ms_per_mb_ewma_by_layer: Dict[int, float] = {}
         self._kvc_evict_ms_per_mb_ewma_by_layer: Dict[int, float] = {}
+        # Enable lightweight decode-window samples lazily after a physical
+        # successor prefetch is actually attempted. This keeps an extra timer
+        # out of unrelated decode workloads.
+        self._kvc_prefetch_window_measurement_enabled = False
         self._current_forward_mode: str = ""
         self._last_forward_batch: Any = None
         self._decode_step: int = 0
@@ -501,6 +547,10 @@ class LayerKVRuntime(
         )
 
     def on_forward_end(self, *, mode: str, forward_batch: Any) -> None:
+        if mode != "decode" and self._expert_hotness_snapshot_submit_queue:
+            with self._profile("profile_finalize_expert_ms"):
+                self._finalize_expert_hotness_snapshots(block=False)
+                self._finalize_expert_candidate_snapshots(block=False)
         if mode == "decode":
             t0 = time.perf_counter()
             self._virtual_materialize_plan = None
@@ -508,7 +558,8 @@ class LayerKVRuntime(
             self._virtual_kvc_demands.clear()
             self._kvc_demand_signature_eval_step = None
             if (
-                self._expert_hotness_pending_snapshots
+                self._expert_hotness_snapshot_submit_queue
+                or self._expert_hotness_pending_snapshots
                 or self._expert_candidate_pending_snapshots
                 or self._pending_expert_d2h_events
                 or self._pending_expert_copy_events
@@ -582,6 +633,8 @@ class LayerKVRuntime(
                     self._evict_kvc_to_target(forward_batch)
                 self._refresh_physical_reclaim_peaks(record_step_sample=True)
                 self._refresh_resident_group_stats()
+            if self._shared_expert is not None:
+                self._shared_expert.after_decode()
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self.stats.layerkv_python_overhead_ms += elapsed_ms
             self._add_profile("profile_forward_end_ms", elapsed_ms)
@@ -758,6 +811,9 @@ class LayerKVRuntime(
                 "scheduler_kvc_task_count",
                 "scheduler_kvc_deferred_count",
                 "kvc_layerwise_scheduler_deadline_reject_count",
+                "kvc_layer_prefetch_pending_cap_skip_count",
+                "kvc_layer_prefetch_deadline_reject_count",
+                "kvc_layer_prefetch_unmeasured_allow_count",
                 "kvc_layer_evict_commit_count",
                 "kvc_layer_evict_commit_token_count",
                 "kvc_evict_host_prealloc_count",
@@ -1052,6 +1108,16 @@ class LayerKVRuntime(
     def summary(
         self, *, include_planner_inputs: bool = True, validate: bool = True
     ) -> Dict[str, Any]:
+        if self._expert_batch_transfer is not None:
+            self._expert_batch_transfer.collect()
+        if validate:
+            # A validated snapshot is also a transfer boundary.  In
+            # particular, benchmark warmups and request-boundary admission
+            # decisions call get_server_info() immediately before the next
+            # request.  Leaving expert D2H/H2D events in flight there can let
+            # a later slot reuse observe the previous request's copy window.
+            self._finalize_expert_d2h_events(block=True)
+            self._finalize_expert_materialize_events(block=True)
         t0 = time.perf_counter() if self.config.debug_stats else 0.0
         self._flush_expert_hotness_sample_skip_count()
         if (
@@ -1081,7 +1147,49 @@ class LayerKVRuntime(
             self._refresh_profile_derived()
         self._sync_coresid_expert_plan_stats(context="summary")
         out = self.stats.as_dict()
+        out["native_moe_graph"] = {
+            "max_batch_size": self.config.native_moe_graph_max_batch_size,
+            "installed_layers": sorted(self._native_moe_graphs),
+            **{
+                name: sum(
+                    getattr(graph, name) for graph in self._native_moe_graphs.values()
+                )
+                for name in (
+                    "captures",
+                    "replays",
+                    "fallbacks",
+                    "workspace_bytes",
+                    "recapture_count",
+                    "capture_wall_ms",
+                    "capture_sync_ms",
+                    "capture_context_ms",
+                )
+            },
+            "workspace_accounting": "torch_allocated_delta_not_total_physical_budget",
+        }
+        if self._shared_expert is not None:
+            out["shared_vmm"] = self._shared_expert.summary()
+            out["expert_host_budget"] = self._expert_host_budget_summary()
+        if self._native_moe_graphs:
+            graph = next(iter(self._native_moe_graphs.values()))
+            device = next(iter(graph.parameters())).device
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            out["native_moe_graph"]["memory_snapshot"] = {
+                "torch_allocated_bytes": torch.cuda.memory_allocated(device),
+                "torch_reserved_bytes": torch.cuda.memory_reserved(device),
+                "torch_peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+                "torch_peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                "device_used_bytes": total_bytes - free_bytes,
+                "device_total_bytes": total_bytes,
+            }
         out.update(planner_inputs)
+        out["scheduler_prefill_admission_probe"] = {
+            "last": dict(self._prefill_admission_probe),
+            "min_remaining_input_tokens": self._prefill_admission_probe_min_remaining_input,
+            "max_credit_tokens": self._prefill_admission_probe_max_credit,
+            "max_can_run": self._prefill_admission_probe_max_can_run,
+            "min_req_pool_available_size": self._prefill_admission_probe_min_req_pool,
+        }
         out.update(
             {
                 "layerkv_enabled": self.config.enabled,
@@ -1091,6 +1199,11 @@ class LayerKVRuntime(
                 "layerkv_kvc_backend": self.config.kvc_backend,
                 "layerkv_kvc_scheduler": self.config.kvc_scheduler,
                 "layerkv_runtime_profile": self.config.runtime_profile,
+                "layerkv_shared_expert_layer": self.config.shared_expert_layer,
+                "layerkv_shared_expert_all_layers": self.config.shared_expert_all_layers,
+                "layerkv_shared_expert_prefetch_groups": self.config.shared_expert_prefetch_groups,
+                "layerkv_expert_prefetch_lookahead_layers": self.config.expert_prefetch_lookahead_layers,
+                "layerkv_expert_prefetch_min_route_overlap": self.config.expert_prefetch_min_route_overlap,
                 "layerkv_worker_role": self.config.worker_role,
                 "expert_residency_budget_ratio": self.config.expert_residency_budget_ratio,
                 "layerkv_physical_kvc_supported": self.physical_kvc_supported,

@@ -1,0 +1,8 @@
+{
+  "venv_python": "/mnt/vdb/chengzhi/agent_bench_sglang_venv/bin/python",
+  "python_library_root": "/home/chengzhi/github/sglang-perf-layerkv/python",
+  "hub_root": "/mnt/vdb/hf_home/hub",
+  "model_cache_name": "models--Qwen--Qwen3.6-35B-A3B",
+  "model_revision": null,
+  "model_path": null
+}

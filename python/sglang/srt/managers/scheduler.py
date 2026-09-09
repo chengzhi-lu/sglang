@@ -166,6 +166,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CLIP_MAX_NEW_TOKENS,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -1408,6 +1409,90 @@ class Scheduler(
         model_runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
         return getattr(model_runner, "layerkv_runtime", None)
 
+    def _try_layerkv_prepare_waiting_prefill(self) -> bool:
+        """Prepare physical capacity for a queued long-context request.
+
+        This is a read-ahead admission probe.  It does not allocate a request
+        slot or schedule the request, so the native ``max_running_requests``
+        and request-pool guards must not suppress it while the running batch
+        is full.  Otherwise a queued long-context request cannot trigger the
+        SharedVMM overflow path until the current batch has already drained.
+        """
+        if not self.waiting_queue or self.running_batch.is_empty():
+            return False
+        running_bs = len(self.running_batch.reqs)
+        layerkv_runtime = self._get_layerkv_runtime()
+        recall = getattr(layerkv_runtime, "recall_shared_expert_for_admission", None)
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        available_fn = getattr(allocator, "available_size", None)
+        if not callable(recall) or not callable(available_fn):
+            return False
+        req = self.waiting_queue[0]
+        input_tokens = getattr(req, "extend_input_len", None)
+        if input_tokens is None:
+            input_tokens = len(getattr(req, "origin_input_ids", []) or [])
+        host_hit_length = int(getattr(req, "host_hit_length", 0) or 0)
+        context_tokens = max(0, int(input_tokens) - host_hit_length)
+        if context_tokens <= 2048:
+            return False
+        page_size = max(1, int(getattr(self, "page_size", 1) or 1))
+        required = -(-context_tokens // page_size) * page_size
+        sampling_params = getattr(req, "sampling_params", None)
+        if sampling_params is not None:
+            remaining_new_tokens = max(
+                0,
+                int(getattr(sampling_params, "max_new_tokens", 0) or 0)
+                - len(getattr(req, "output_ids", []) or []),
+            )
+            required += min(remaining_new_tokens, CLIP_MAX_NEW_TOKENS) + page_size
+        available = max(0, int(available_fn()))
+        released = 0
+        release_fn = getattr(
+            layerkv_runtime, "release_scheduler_admission_credit_tokens", None
+        )
+        if callable(release_fn):
+            released = max(
+                0,
+                int(
+                    release_fn(
+                        required_tokens=required,
+                        available_tokens=available,
+                    )
+                    or 0
+                ),
+            )
+            available += released
+        credit_fn = getattr(
+            layerkv_runtime, "get_scheduler_admission_credit_tokens", None
+        )
+        credit = 0
+        if callable(credit_fn):
+            credit = max(
+                0,
+                int(
+                    credit_fn(
+                        required_tokens=required,
+                        available_tokens=available,
+                        reason="decode_prealloc_admission",
+                    )
+                    or 0
+                ),
+            )
+        shortage = required - available - credit
+        if shortage <= 0:
+            # The per-layer arena may own valid common addresses that have
+            # not been returned to the native allocator. Those addresses are
+            # already sufficient for this prefill; do not recall experts just
+            # to make allocator.available_size() increase.
+            return credit > 0 or released > 0
+        recovered = recall(
+            shortage_tokens=shortage,
+            context_tokens=context_tokens,
+            batch_size=running_bs + 1,
+            allow_kv_overflow=True,
+        )
+        return int(recovered or 0) > 0
+
     def _layerkv_decode_profile_enabled(self, batch: Optional[ScheduleBatch]):
         if batch is None:
             return None
@@ -1419,6 +1504,24 @@ class Scheduler(
             return None
         config = getattr(layerkv_runtime, "config", None)
         if not bool(getattr(config, "profile_detail", False)):
+            return None
+        return layerkv_runtime
+
+    def _layerkv_decode_window_measurement_enabled(
+        self, batch: Optional[ScheduleBatch]
+    ):
+        """Return LayerKV when a physical KVC prefetch window needs sampling."""
+        if batch is None:
+            return None
+        forward_mode = getattr(batch, "forward_mode", None)
+        if forward_mode is None or not getattr(
+            forward_mode, "is_decode", lambda: False
+        )():
+            return None
+        layerkv_runtime = self._get_layerkv_runtime()
+        if layerkv_runtime is None or not bool(
+            getattr(layerkv_runtime, "_kvc_prefetch_window_measurement_enabled", False)
+        ):
             return None
         return layerkv_runtime
 
@@ -1454,6 +1557,36 @@ class Scheduler(
         except Exception:
             used_tokens = 0
             token_usage = 0.0
+        adder = getattr(self, "adder", None)
+        prefill_remaining_input_tokens = getattr(
+            adder, "rem_input_tokens", None
+        )
+        prefill_credit_tokens = getattr(adder, "layerkv_prefill_credit_tokens", 0)
+        prefill_can_run = len(getattr(adder, "can_run_list", []) or [])
+        prefill_rem_total_tokens = None
+        prefill_cur_rem_tokens = None
+        if adder is not None:
+            try:
+                prefill_rem_total_tokens = int(adder.rem_total_tokens)
+                prefill_cur_rem_tokens = int(adder.cur_rem_tokens)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        req_pool_available = None
+        if hasattr(getattr(self, "req_to_token_pool", None), "available_size"):
+            req_pool_available = int(self.req_to_token_pool.available_size())
+        waiting_context_tokens = 0
+        for req in getattr(self, "waiting_queue", []) or []:
+            extend_input_len = getattr(req, "extend_input_len", None)
+            if extend_input_len is None:
+                extend_input_len = len(getattr(req, "origin_input_ids", []) or [])
+            host_hit_length = getattr(req, "host_hit_length", 0) or 0
+            try:
+                waiting_context_tokens = max(
+                    waiting_context_tokens,
+                    max(0, int(extend_input_len) - int(host_hit_length)),
+                )
+            except (TypeError, ValueError):
+                continue
         layerkv_runtime.on_schedule_batch(
             schedule_batch=batch,
             scheduler_context={
@@ -1461,6 +1594,13 @@ class Scheduler(
                 "forward_mode": getattr(forward_mode, "name", str(forward_mode)),
                 "schedule_policy": str(getattr(self, "schedule_policy", "")),
                 "waiting_queue_len": len(getattr(self, "waiting_queue", []) or []),
+                "waiting_max_context_tokens": waiting_context_tokens,
+                "prefill_adder_remaining_input_tokens": prefill_remaining_input_tokens,
+                "prefill_adder_credit_tokens": int(prefill_credit_tokens or 0),
+                "prefill_adder_can_run": prefill_can_run,
+                "prefill_adder_rem_total_tokens": prefill_rem_total_tokens,
+                "prefill_adder_cur_rem_tokens": prefill_cur_rem_tokens,
+                "req_pool_available_size": req_pool_available,
                 "running_batch_size": len(
                     getattr(getattr(self, "running_batch", None), "reqs", []) or []
                 ),
@@ -2840,10 +2980,13 @@ class Scheduler(
         if self.running_batch.is_empty():
             self.running_batch.batch_is_full = False
 
-        if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None
+        if self.chunked_req is None:
+            if not self.waiting_queue:
+                return None
+            if self._try_layerkv_prepare_waiting_prefill():
+                self.running_batch.batch_is_full = False
+            elif self.running_batch.batch_is_full:
+                return None
 
         running_bs = len(self.running_batch.reqs)
 
@@ -3222,12 +3365,17 @@ class Scheduler(
         batch.forward_iter = self.forward_ct
         self._notify_layerkv_schedule_batch(batch)
         layerkv_decode_profile = self._layerkv_decode_profile_enabled(batch)
+        layerkv_window_runtime = self._layerkv_decode_window_measurement_enabled(batch)
         layerkv_decode_t0 = time.perf_counter() if layerkv_decode_profile is not None else 0.0
         layerkv_model_ms = 0.0
         if layerkv_decode_profile is not None:
             stats = getattr(layerkv_decode_profile, "stats", None)
             if stats is not None:
                 stats.profile_decode_batch_count += 1
+        elif layerkv_window_runtime is not None:
+            stats = getattr(layerkv_window_runtime, "stats", None)
+            if stats is not None:
+                stats.kvc_layer_prefetch_model_forward_count += 1
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
@@ -3266,19 +3414,27 @@ class Scheduler(
                     layerkv_model_t0 = (
                         time.perf_counter()
                         if layerkv_decode_profile is not None
+                        or layerkv_window_runtime is not None
                         else 0.0
                     )
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
-                    if layerkv_decode_profile is not None:
+                    if layerkv_decode_profile is not None or layerkv_window_runtime is not None:
                         layerkv_model_ms = (
                             time.perf_counter() - layerkv_model_t0
                         ) * 1000.0
+                    if layerkv_decode_profile is not None:
                         self._layerkv_add_profile_ms(
                             layerkv_decode_profile,
                             "profile_decode_model_forward_ms",
+                            layerkv_model_ms,
+                        )
+                    elif layerkv_window_runtime is not None:
+                        self._layerkv_add_profile_ms(
+                            layerkv_window_runtime,
+                            "kvc_layer_prefetch_model_forward_ms",
                             layerkv_model_ms,
                         )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
@@ -3315,18 +3471,28 @@ class Scheduler(
                     else {}
                 )
                 layerkv_model_t0 = (
-                    time.perf_counter() if layerkv_decode_profile is not None else 0.0
+                    time.perf_counter()
+                    if layerkv_decode_profile is not None
+                    or layerkv_window_runtime is not None
+                    else 0.0
                 )
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
-                if layerkv_decode_profile is not None:
+                if layerkv_decode_profile is not None or layerkv_window_runtime is not None:
                     layerkv_model_ms = (
                         time.perf_counter() - layerkv_model_t0
                     ) * 1000.0
+                if layerkv_decode_profile is not None:
                     self._layerkv_add_profile_ms(
                         layerkv_decode_profile,
                         "profile_decode_model_forward_ms",
+                        layerkv_model_ms,
+                    )
+                elif layerkv_window_runtime is not None:
+                    self._layerkv_add_profile_ms(
+                        layerkv_window_runtime,
+                        "kvc_layer_prefetch_model_forward_ms",
                         layerkv_model_ms,
                     )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
@@ -3770,6 +3936,12 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+
+        layerkv_runtime = getattr(self.tp_worker.model_runner, "layerkv_runtime", None)
+        if layerkv_runtime is not None:
+            # Explicit inspection validates ownership after asynchronous copies
+            # and finished-request cleanup, outside the decode critical path.
+            ret["layerkv"] = layerkv_runtime.summary(include_planner_inputs=False)
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (

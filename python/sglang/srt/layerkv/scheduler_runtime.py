@@ -14,6 +14,7 @@ import torch
 
 if __package__:
     from .common_types import (
+        _LayerKVExpertDemand,
         _LayerKVKvcDemand,
         _LayerKVMetadataPatchCacheEntry,
         _LayerKVNativeKvcRun,
@@ -27,6 +28,7 @@ if __package__:
     )
 else:  # pragma: no cover - direct file-loading smoke tests.
     from common_types import (
+        _LayerKVExpertDemand,
         _LayerKVKvcDemand,
         _LayerKVMetadataPatchCacheEntry,
         _LayerKVNativeKvcRun,
@@ -44,6 +46,12 @@ logger = logging.getLogger(__name__)
 
 class LayerKVSchedulerMixin:
     def on_forward_begin(self, *, mode: str, forward_batch: Any) -> None:
+        if (
+            mode != "decode"
+            and self._shared_expert is not None
+            and not self.config.shared_expert_retain_across_requests
+        ):
+            self._shared_expert.recall()
         t0 = time.perf_counter()
         phase_t0 = time.perf_counter()
         self._current_forward_mode = mode
@@ -76,7 +84,8 @@ class LayerKVSchedulerMixin:
             (time.perf_counter() - phase_t0) * 1000.0,
         )
         if (
-            self._expert_hotness_pending_snapshots
+            self._expert_hotness_snapshot_submit_queue
+            or self._expert_hotness_pending_snapshots
             or self._expert_candidate_pending_snapshots
             or self._pending_expert_d2h_events
             or self._pending_expert_copy_events
@@ -421,6 +430,18 @@ class LayerKVSchedulerMixin:
                 req.skip_radix_cache_insert = True
                 return
 
+    def _free_layerkv_request_slot(self, req: Any) -> None:
+        # LayerKV bypasses cache_finished_req, including its Mamba cleanup.
+        # No new prefix-cache entry is inserted, so the request's GDN state
+        # (including tracking buffers) must be released before its request slot.
+        pool = self._req_to_token_pool
+        if pool is None:
+            return
+        free_mamba = getattr(pool, "free_mamba_cache", None)
+        if free_mamba is not None and getattr(req, "mamba_pool_idx", None) is not None:
+            free_mamba(req)
+        pool.free(req)
+
     def release_virtualized_request(self, req: Any, tree_cache: Any) -> bool:
         if self.config.kvc_backend == "per-layer-arena":
             if not getattr(req, "layerkv_per_layer_allocated", False):
@@ -487,8 +508,7 @@ class LayerKVSchedulerMixin:
                 except Exception:
                     pass
             if getattr(req, "req_pool_idx", None) is not None:
-                if self._req_to_token_pool is not None:
-                    self._req_to_token_pool.free(req)
+                self._free_layerkv_request_slot(req)
             try:
                 req.layerkv_per_layer_allocated = False
                 req.layerkv_per_layer_cleaned = False
@@ -559,7 +579,7 @@ class LayerKVSchedulerMixin:
                 tree_cache.dec_lock_ref(req.last_node)
             except Exception:
                 pass
-        self._req_to_token_pool.free(req)
+        self._free_layerkv_request_slot(req)
         self.stats.virtual_kvc_release_count += 1
         self.stats.virtual_kvc_release_token_count += len(virtual_positions)
         self._refresh_kvc_residency_stats()
@@ -831,9 +851,31 @@ class LayerKVSchedulerMixin:
         tasks.extend(
             self._build_kvc_recovery_tasks(forward_batch, max_tasks=max_kvc_tasks)
         )
+        tasks.extend(self._build_expert_prefetch_tasks(forward_batch))
+        return tasks
+
+    def _build_expert_prefetch_tasks(
+        self,
+        forward_batch: Any,
+        *,
+        layer_ids: Optional[List[int]] = None,
+        allow_bounded_context: bool = False,
+    ) -> List[_LayerKVRecoveryTask]:
         if not self._expert_plan_applied or not self._expert_layers:
-            return tasks
-        if (
+            return []
+        if not self._expert_prefetch_allowed(
+            forward_batch, allow_bounded_context=allow_bounded_context
+        ):
+            return []
+        explicit_layers = layer_ids is not None
+        if explicit_layers:
+            requested_layers = {int(layer_id) for layer_id in layer_ids}
+            expert_items = [
+                (int(layer_id), self._expert_layers[int(layer_id)])
+                for layer_id in sorted(requested_layers)
+                if int(layer_id) in self._expert_layers
+            ]
+        elif (
             self._coresid_optimized_policy_enabled()
             and self._expert_prefetch_dirty_layers
         ):
@@ -846,9 +888,72 @@ class LayerKVSchedulerMixin:
             expert_items = []
         else:
             expert_items = sorted(self._expert_layers.items())
+        tasks: List[_LayerKVRecoveryTask] = []
         next_dirty_layers: Set[int] = set()
         expert_scan_t0 = time.perf_counter()
         for layer_id, state in expert_items:
+            route_compatible = self._expert_prefetch_route_compatible(
+                state, forward_batch
+            )
+            prediction_ids = list(state.last_decode_logical_ids)
+            route_based_prediction = bool(prediction_ids and route_compatible)
+            if not route_compatible:
+                current_signature = tuple(
+                    getattr(
+                        self, "_current_forward_expert_request_signature", ()
+                    )
+                    or ()
+                )
+                previous_signature = tuple(
+                    getattr(state, "last_decode_request_signature", ()) or ()
+                )
+                # A changed request generation/context must never reuse an old
+                # route.  For the same request, however, low token-to-token
+                # overlap is common at large batch sizes; use the online
+                # hotness order instead of disabling overlap completely.
+                if (
+                    not current_signature
+                    or not previous_signature
+                    or previous_signature != current_signature
+                ):
+                    if explicit_layers:
+                        self.stats.expert_prefetch_cross_layer_skip_count += 1
+                    continue
+                if not self._expert_prefetch_is_short_context_large_batch(
+                    forward_batch
+                ):
+                    if self._expert_prefetch_is_long_context_small_batch(
+                        forward_batch
+                    ):
+                        self.stats.expert_prefetch_context_skip_count += 1
+                        self.stats.expert_prefetch_last_gate = (
+                            "kv-priority-long-context-small-batch"
+                        )
+                    if explicit_layers:
+                        self.stats.expert_prefetch_cross_layer_skip_count += 1
+                    continue
+                prediction_ids = self._expert_prefetch_hotness_prediction(
+                    state, forward_batch
+                )
+                if not prediction_ids:
+                    if explicit_layers:
+                        self.stats.expert_prefetch_cross_layer_skip_count += 1
+                    continue
+                self.stats.expert_prefetch_route_fallback_count += 1
+            if explicit_layers:
+                current_batch = int(
+                    getattr(forward_batch, "batch_size", 0) or 0
+                )
+                previous_batch = int(
+                    getattr(state, "last_decode_batch_size", 0) or 0
+                )
+                if (
+                    current_batch > 0
+                    and previous_batch > 0
+                    and current_batch != previous_batch
+                ):
+                    self.stats.expert_prefetch_cross_layer_skip_count += 1
+                    continue
             if state.prefetched_logical_ids:
                 stale = [
                     int(expert_id)
@@ -858,7 +963,7 @@ class LayerKVSchedulerMixin:
                 if stale:
                     self.stats.expert_prefetch_wasted_count += len(stale)
                     state.prefetched_logical_ids.difference_update(stale)
-            if not state.last_decode_logical_ids:
+            if not prediction_ids:
                 self.stats.expert_prefetch_hit_count += 0
                 continue
             if (
@@ -867,26 +972,46 @@ class LayerKVSchedulerMixin:
                 and not state.prefetched_logical_ids
             ):
                 self.stats.expert_prefetch_hit_count += len(
-                    state.last_decode_logical_ids
+                    prediction_ids
                 )
                 continue
             missing = [
                 int(expert_id)
-                for expert_id in state.last_decode_logical_ids
+                for expert_id in prediction_ids
                 if int(expert_id) not in state.logical_to_slot
-                and int(expert_id) in state.cpu_params
+                and self._expert_prefetch_has_backing(state, int(expert_id))
             ]
             missing = list(dict.fromkeys(missing))
             self.stats.expert_prefetch_skipped_resident_count += max(
-                0, len(state.last_decode_logical_ids) - len(missing)
+                0, len(prediction_ids) - len(missing)
             )
             if not missing:
                 self.stats.expert_prefetch_hit_count += len(
-                    state.last_decode_logical_ids
+                    prediction_ids
                 )
                 continue
             next_dirty_layers.add(int(layer_id))
             self.stats.expert_prefetch_candidate_count += len(missing)
+            # Recovery protects every ID in a task simultaneously. A previous
+            # decode batch's expert union can exceed the physical slot budget;
+            # unlike demand execution, recovery does not run token chunks.
+            # Keep candidate accounting intact and leave the remainder to the
+            # normal demand path rather than constructing an impossible task.
+            # Long-context/small-batch work uses a smaller speculative window
+            # so KVC keeps the reclaimed capacity while the selected layer
+            # still gets useful route lookahead.
+            prefetch_limit = self._expert_prefetch_id_budget(
+                state,
+                forward_batch,
+                route_based=route_based_prediction and not explicit_layers,
+            )
+            candidate_count = len(missing)
+            missing = missing[:prefetch_limit]
+            self.stats.expert_prefetch_skipped_capacity_count += max(
+                0, candidate_count - len(missing)
+            )
+            if not missing:
+                continue
             group_keys = []
             if self._expert_group_tracking_enabled():
                 for expert_id in missing:
@@ -928,13 +1053,357 @@ class LayerKVSchedulerMixin:
                     benefit_score=float(expert_demand.benefit_score),
                 )
             )
-        if self._coresid_optimized_policy_enabled():
+        if self._coresid_optimized_policy_enabled() and not explicit_layers:
             self._expert_prefetch_dirty_layers = next_dirty_layers
         self._add_profile(
             "profile_expert_prefetch_scan_ms",
             (time.perf_counter() - expert_scan_t0) * 1000.0,
         )
         return tasks
+
+    def _expert_prefetch_hotness_prediction(
+        self, state: Any, forward_batch: Any
+    ) -> List[int]:
+        """Return an online, bounded prediction when exact route overlap is low."""
+        capacity = max(0, int(getattr(state, "slot_capacity", 0) or 0))
+        if capacity <= 0:
+            return []
+        try:
+            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+        except (TypeError, ValueError):
+            batch_size = 0
+        prediction_limit = min(
+            capacity,
+            max(1, batch_size or int(self.stats.observed_batch_size or 1)),
+        )
+        candidate_order = self._expert_candidate_order_by_layer.get(
+            int(state.layer_id), []
+        )
+        if candidate_order:
+            return [
+                int(expert_id) for expert_id in candidate_order[:prediction_limit]
+            ]
+        decode_hotness = (
+            getattr(state, "hotness_decode", None)
+            or self._expert_hotness_decode.get(int(state.layer_id), {})
+        )
+        prefill_hotness = (
+            getattr(state, "hotness_prefill", None)
+            or self._expert_hotness_prefill.get(int(state.layer_id), {})
+        )
+        if not decode_hotness and not prefill_hotness:
+            return []
+        full_num_experts = max(
+            0, int(getattr(state, "full_num_experts", 0) or 0)
+        )
+        return sorted(
+            range(full_num_experts),
+            key=lambda expert_id: (
+                -int(decode_hotness.get(expert_id, 0)),
+                -int(prefill_hotness.get(expert_id, 0)),
+                int(expert_id),
+            ),
+        )[0:prediction_limit]
+
+    def _expert_prefetch_has_backing(self, state: Any, expert_id: int) -> bool:
+        if int(expert_id) in getattr(state, "cpu_params", {}):
+            return True
+        if not self._expert_global_cpu_backing:
+            return False
+        return (
+            self._global_expert_backing(int(state.layer_id), int(expert_id))
+            is not None
+        )
+
+    def _expert_prefetch_route_compatible(
+        self, state: Any, forward_batch: Any
+    ) -> bool:
+        """Reject speculative copies when the previous route is not reusable.
+
+        Batch size alone is not enough: request-pool slots can be recycled and
+        the expert route can change after a long-context admission transition.
+        The signature is maintained once per forward from CPU metadata, so
+        this check does not read routing tensors or synchronize with the GPU.
+        """
+        current_signature = tuple(
+            getattr(self, "_current_forward_expert_request_signature", ()) or ()
+        )
+        if not current_signature:
+            # Lightweight unit doubles and older callers may not expose the
+            # optional signature; retain their previous behavior.
+            return True
+        previous_signature = tuple(
+            getattr(state, "last_decode_request_signature", ()) or ()
+        )
+        if not previous_signature or previous_signature != current_signature:
+            self.stats.expert_prefetch_route_mismatch_skip_count += 1
+            return False
+        route_overlap = float(
+            getattr(state, "last_decode_route_overlap", 0.0) or 0.0
+        )
+        min_overlap = float(
+            getattr(self.config, "expert_prefetch_min_route_overlap", 0.5)
+        )
+        if route_overlap < min_overlap:
+            self.stats.expert_prefetch_route_unstable_skip_count += 1
+            return False
+        return True
+
+    def _expert_prefetch_is_long_context_small_batch(self, forward_batch: Any) -> bool:
+        try:
+            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+        except (TypeError, ValueError):
+            batch_size = 0
+        batch_size = max(1, batch_size or int(self.stats.observed_batch_size or 1))
+        try:
+            avg_prefix = float(self._avg_prefix_len(forward_batch))
+        except Exception:
+            avg_prefix = float(getattr(self.stats, "avg_prefix_len", 0.0) or 0.0)
+        capacities = [
+            int(getattr(state, "slot_capacity", 0) or 0)
+            for state in self._expert_layers.values()
+        ]
+        capacities = [capacity for capacity in capacities if capacity > 0]
+        small_batch_cutoff = max(1, min(capacities) // 2) if capacities else 8
+        return avg_prefix > 2048.0 and batch_size <= small_batch_cutoff
+
+    def _expert_prefetch_is_short_context_large_batch(
+        self, forward_batch: Any
+    ) -> bool:
+        try:
+            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+        except (TypeError, ValueError):
+            batch_size = 0
+        batch_size = max(1, batch_size or int(self.stats.observed_batch_size or 1))
+        try:
+            avg_prefix = float(self._avg_prefix_len(forward_batch))
+        except Exception:
+            avg_prefix = float(getattr(self.stats, "avg_prefix_len", 0.0) or 0.0)
+        capacities = [
+            int(getattr(state, "slot_capacity", 0) or 0)
+            for state in self._expert_layers.values()
+        ]
+        capacities = [capacity for capacity in capacities if capacity > 0]
+        large_batch_cutoff = max(1, min(capacities) // 2) if capacities else 8
+        route_widths = []
+        for state in self._expert_layers.values():
+            module = getattr(state, "module", None)
+            top_k = int(getattr(module, "top_k", 0) or 0)
+            if top_k <= 0:
+                runner_config = getattr(module, "moe_runner_config", None)
+                top_k = int(getattr(runner_config, "top_k", 0) or 0)
+            if top_k > 0:
+                route_widths.append(top_k)
+        route_width = max(route_widths, default=1)
+        routed_rows = batch_size * route_width
+        routed_working_set = batch_size > 1 and routed_rows >= max(
+            1, (min(capacities) + 1) // 2
+        ) if capacities else False
+        # At exactly half the resident capacity, the batch is already wide
+        # enough to amortize an exact successor prefetch.  Keeping this
+        # boundary exclusive made the common B8/capacity16 short-context case
+        # fall through to the KVC-priority gate and disabled route-local
+        # overlap entirely.  A wide routed working set is equivalent even
+        # when request batch is smaller than the resident slot count: B8 with
+        # top-k=8 still exposes 64 expert rows against a 49-slot set.
+        return avg_prefix <= 2048.0 and (
+            batch_size >= large_batch_cutoff or routed_working_set
+        )
+
+    def _expert_prefetch_allowed(
+        self, forward_batch: Any, *, allow_bounded_context: bool = False
+    ) -> bool:
+        """Keep speculative expert H2D behind the current KV workload.
+
+        Previous-step routing is useful for short-context, large-batch decode,
+        where expert reuse can amortize one transfer across many rows.  For
+        long-context, small-batch decode cross-layer lookahead is admitted only
+        when the bounded KVC copy window has room and projected KV demand is
+        safe.  Use current forward metadata, not a dataset-specific expert set,
+        to make this decision.
+        """
+        bounded_long_small = (
+            allow_bounded_context
+            and self._expert_prefetch_is_long_context_small_batch(forward_batch)
+        )
+        if bounded_long_small and not self._expert_prefetch_kvc_window_available():
+            # Leave one bounded copy-window position for KVC.  Expert
+            # lookahead may use the same stream only when it will not extend
+            # the outstanding KV recovery queue.
+            self.stats.expert_prefetch_context_skip_count += 1
+            self.stats.expert_prefetch_last_gate = "kv-priority-kvc-window-full"
+            return False
+        try:
+            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+        except (TypeError, ValueError):
+            batch_size = 0
+        batch_size = max(1, batch_size or int(self.stats.observed_batch_size or 1))
+        if int(self.stats.native_schedule_waiting_queue_len or 0) > 0:
+            self.stats.expert_prefetch_policy_skip_count += 1
+            self.stats.expert_prefetch_pressure_skip_count += 1
+            self.stats.expert_prefetch_last_gate = "queued-admission"
+            return False
+
+        pairs = (
+            list(self._current_forward_req_lens)
+            if self._current_forward_req_lens_batch_id == id(forward_batch)
+            else self._batch_req_indices_and_lens(forward_batch)
+        )
+        total_tokens = self._allocator_total_size()
+        if pairs and total_tokens > 0:
+            live_tokens = sum(max(0, int(seq_len)) for _, seq_len in pairs)
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            if isinstance(out_cache_loc, torch.Tensor):
+                write_tokens = int(out_cache_loc.numel())
+            elif out_cache_loc is not None:
+                try:
+                    write_tokens = len(out_cache_loc)
+                except TypeError:
+                    write_tokens = 0
+            else:
+                write_tokens = 0
+            scratch_tokens = 0
+            scratch_locs = getattr(self, "_virtual_scratch_locs", None)
+            if isinstance(scratch_locs, torch.Tensor):
+                scratch_tokens = int(scratch_locs.numel())
+            headroom_steps = max(
+                1,
+                int(
+                    getattr(self.config, "shared_expert_headroom_steps", 16)
+                    or 16
+                ),
+            )
+            reserve_tokens = batch_size * headroom_steps
+            if live_tokens + write_tokens + reserve_tokens > max(
+                0, int(total_tokens) - scratch_tokens
+            ):
+                self.stats.expert_prefetch_policy_skip_count += 1
+                self.stats.expert_prefetch_pressure_skip_count += 1
+                self.stats.expert_prefetch_last_gate = "kv-pressure"
+                return False
+        if bounded_long_small:
+            self.stats.expert_prefetch_last_gate = "allow-bounded-context-kvc-window"
+        else:
+            self.stats.expert_prefetch_last_gate = "allow"
+        return True
+
+    def _expert_prefetch_kvc_window_available(self) -> bool:
+        """Return whether bounded cross-layer expert work fits beside KVC.
+
+        KVC and expert recovery are submitted through the scheduler copy
+        stream.  Count only recoveries that have not already been consumed by
+        the main stream; two outstanding KVC recoveries fill the bounded
+        lookahead window and an expert task would compete with the next KV
+        layer. Existing physical KVC offload also reserves this window even
+        when its current reload event has already been consumed: the next
+        layer still needs the reclaimed capacity and must retain priority.
+        """
+        if int(getattr(self, "_per_layer_offloaded_token_count_fast", 0) or 0) > 0:
+            return False
+        pending_count = sum(
+            1
+            for pending in getattr(self, "_pending_kvc_reload_events", ())
+            if not getattr(pending, "waited_on_main_stream", False)
+        )
+        virtual_pending = getattr(self, "_pending_virtual_kvc_materialize", {})
+        if isinstance(virtual_pending, dict):
+            pending_count += sum(
+                1
+                for pending in virtual_pending.values()
+                if not getattr(pending, "waited_on_main_stream", False)
+            )
+        return pending_count < 2
+
+    def _expert_prefetch_id_budget(
+        self, state: Any, forward_batch: Any, *, route_based: bool = False
+    ) -> int:
+        """Bound route lookahead without changing physical expert capacity.
+
+        A previous route is only a useful prediction to the extent that the
+        last two decode routes overlapped.  Apply that confidence cap to the
+        ordinary same-layer route prefetch; cross-layer lookahead keeps its
+        existing explicit-layer budget because its deadline is already bounded
+        by the layer scheduler.
+        """
+        capacity = max(0, int(getattr(state, "slot_capacity", 0) or 0))
+        if capacity <= 0:
+            return 0
+        try:
+            batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+        except (TypeError, ValueError):
+            batch_size = 0
+        batch_size = max(1, batch_size or int(self.stats.observed_batch_size or 1))
+        if self._expert_prefetch_is_long_context_small_batch(forward_batch):
+            budget = max(1, min(capacity, 2 * batch_size))
+        else:
+            budget = capacity
+        if route_based:
+            overlap = getattr(state, "last_decode_route_overlap", None)
+            if overlap is not None:
+                try:
+                    overlap = float(overlap)
+                except (TypeError, ValueError):
+                    overlap = None
+            if overlap is not None and math.isfinite(overlap):
+                confidence_budget = max(
+                    1, min(capacity, int(math.ceil(capacity * max(0.0, overlap))))
+                )
+                budget = min(budget, confidence_budget)
+        return int(budget)
+
+    def _maybe_issue_expert_prefetch_after_layer(self, layer_id: int) -> None:
+        """Prefetch a later offloaded expert while an earlier layer computes."""
+        if (
+            self._current_forward_mode != "decode"
+            or self._last_forward_batch is None
+            or self._expert_prefetch_transfer_stream() is None
+            or not self._expert_plan_applied
+            or not self._expert_layers
+        ):
+            return
+        if self._expert_cross_layer_prefetch_step != int(self._decode_step):
+            self._expert_cross_layer_prefetch_step = int(self._decode_step)
+            self._expert_cross_layer_prefetch_layers.clear()
+        lookahead = max(
+            1, int(getattr(self.config, "expert_prefetch_lookahead_layers", 1))
+        )
+        candidates = [
+            int(candidate)
+            for candidate in sorted(self._expert_layers)
+            if int(candidate) > int(layer_id)
+            and int(candidate) not in self._expert_cross_layer_prefetch_layers
+        ][:lookahead]
+        if not candidates:
+            return
+        self._expert_cross_layer_prefetch_layers.update(candidates)
+        cross_skip_count_before = int(
+            self.stats.expert_prefetch_cross_layer_skip_count
+        )
+        tasks = self._build_expert_prefetch_tasks(
+            self._last_forward_batch,
+            layer_ids=candidates,
+            allow_bounded_context=True,
+        )
+        if not tasks:
+            if (
+                self.stats.expert_prefetch_cross_layer_skip_count
+                == cross_skip_count_before
+            ):
+                self.stats.expert_prefetch_cross_layer_skip_count += 1
+            return
+        self._schedule_recovery_tasks(tasks)
+        self.stats.expert_prefetch_cross_layer_issue_count += 1
+        self.stats.expert_prefetch_cross_layer_layer_count += len(tasks)
+
+    def _expert_prefetch_transfer_stream(self) -> Any:
+        """Return the stream reserved for speculative expert H2D work.
+
+        KVC recovery owns ``_copy_stream``.  The planner creates a dedicated
+        expert H2D stream so cross-layer expert lookahead can be submitted
+        independently and overlap the KVC queue; fall back to the shared
+        stream for CPU/unit-test runtimes and older installations.
+        """
+        return getattr(self, "_expert_h2d_stream", None) or self._copy_stream
 
     def _schedule_recovery_tasks(self, tasks: List[_LayerKVRecoveryTask]) -> None:
         if not tasks:
@@ -1047,11 +1516,17 @@ class LayerKVSchedulerMixin:
                 for key in task.group_keys
                 if key in self._resident_groups
             ]
+            expert_transfer_stream = self._expert_prefetch_transfer_stream()
             backend = self._residency_backends.get("expert")
             if backend is not None and groups:
-                backend.recover(groups, stream=self._copy_stream)
+                backend.recover(groups, stream=expert_transfer_stream)
             else:
-                self._materialize_experts(state, logical_ids, reason="prefetch")
+                self._materialize_experts(
+                    state,
+                    logical_ids,
+                    reason="prefetch",
+                    transfer_stream=expert_transfer_stream,
+                )
             issued_expert_tasks += 1
 
     def _scheduler_copy_task_budgets(
@@ -1070,6 +1545,18 @@ class LayerKVSchedulerMixin:
                 - len(self._pending_virtual_kvc_materialize),
             )
             kvc_budget = max(1, min(available_buffers, 2))
+        expert_lookahead = max(
+            1, int(getattr(self.config, "expert_prefetch_lookahead_layers", 1))
+        )
+        expert_task_count = sum(1 for task in (tasks or []) if task.kind == "expert")
+        if expert_task_count > 0:
+            # Tasks are sorted by deadline_layer before this budget is applied.
+            # The copy stream therefore queues earlier expert layers first, and
+            # later layers can transfer while the main stream computes the
+            # earlier ones. Keep the window bounded because a larger window
+            # increases speculative H2D traffic when the previous-step route
+            # prediction is stale.
+            expert_budget = max(1, min(expert_lookahead, expert_task_count))
         return kvc_budget, expert_budget
 
     def _dynamic_per_layer_kvc_task_budget(

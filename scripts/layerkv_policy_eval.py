@@ -13,7 +13,6 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import statistics
@@ -21,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from urllib import request
 
@@ -100,6 +100,7 @@ CSV_FIELDS = [
     "planner_estimated_expert_churn_mb",
     "planner_estimated_expert_install_mb",
     "planner_estimated_kvc_controller_cost",
+    "planner_estimated_kvc_capacity_benefit",
     "planner_selected_kvc_reclaim_mb",
     "planner_selected_expert_reclaim_mb",
     "planner_dp_candidate_count",
@@ -1378,8 +1379,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     args._fig4_cli_batch_size = any(
-        arg == "--batch-size" or arg.startswith("--batch-size=")
-        for arg in sys.argv[1:]
+        arg == "--batch-size" or arg.startswith("--batch-size=") for arg in sys.argv[1:]
     )
     apply_fig4_workload(args)
 

@@ -145,6 +145,42 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
+    def activate_tail(self, count: int):
+        """Expose a contiguous, previously reserved KV tail to allocation."""
+        count = int(count)
+        if count < 0:
+            raise ValueError("tail activation count must be nonnegative")
+        if count == 0:
+            return
+        if self.page_size != 1:
+            raise ValueError("dynamic KV tail activation requires page_size=1")
+        if self.need_sort:
+            self.merge_and_sort_free()
+        start = self.size + 1
+        tail = torch.arange(
+            start, start + count, dtype=torch.int64, device=self.device
+        )
+        self.free_pages = torch.cat((self.free_pages, tail))
+        self.size += count
+
+    def deactivate_tail(self, count: int):
+        """Hide the last KV tail after the caller proves it is completely free."""
+        count = int(count)
+        if count < 0 or count > self.size:
+            raise ValueError("invalid KV tail deactivation count")
+        if count == 0:
+            return
+        if self.page_size != 1:
+            raise ValueError("dynamic KV tail deactivation requires page_size=1")
+        if self.need_sort:
+            self.merge_and_sort_free()
+        new_size = self.size - count
+        tail_count = int((self.free_pages > new_size).sum().item())
+        if tail_count != count:
+            raise ValueError("cannot deactivate KV tail with live allocations")
+        self.free_pages = self.free_pages[self.free_pages <= new_size]
+        self.size = new_size
+
     def alloc(self, need_size: int):
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()

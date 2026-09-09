@@ -806,6 +806,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        buffer_factory=None,
     ):
         super().__init__(
             size,
@@ -825,6 +826,7 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
+        self._buffer_factory = buffer_factory or torch.zeros
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -904,7 +906,7 @@ class MHATokenToKVPool(KVCache):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.k_buffer = [
-                    torch.zeros(
+                    self._buffer_factory(
                         (self.size + self.page_size, self.head_num, self.head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
@@ -912,7 +914,7 @@ class MHATokenToKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    torch.zeros(
+                    self._buffer_factory(
                         (self.size + self.page_size, self.head_num, self.v_head_dim),
                         dtype=self.store_dtype,
                         device=self.device,
@@ -1406,6 +1408,7 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        buffer_factory=None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1442,6 +1445,11 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                **(
+                    {"buffer_factory": buffer_factory}
+                    if buffer_factory is not None
+                    else {}
+                ),
             )
         else:
 

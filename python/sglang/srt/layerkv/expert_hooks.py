@@ -42,6 +42,36 @@ except Exception:  # pragma: no cover - optional JIT helper.
 
 
 class LayerKVExpertHooksMixin:
+    def _record_expert_decode_route(
+        self, state: _LayerKVExpertLayerState, logical_ids: List[int]
+    ) -> None:
+        """Record route metadata used by the next speculative prefetch.
+
+        The route is intentionally paired with CPU-side request identity and a
+        coarse context bucket.  This lets the scheduler reject stale previous
+        routes without adding a GPU readback to the decode hot path.
+        """
+        current_ids = list(
+            dict.fromkeys(int(expert_id) for expert_id in logical_ids)
+        )
+        previous_ids = set(
+            int(expert_id) for expert_id in state.last_decode_logical_ids
+        )
+        if previous_ids and current_ids:
+            state.last_decode_route_overlap = len(
+                previous_ids.intersection(current_ids)
+            ) / float(max(len(previous_ids), len(current_ids)))
+        else:
+            state.last_decode_route_overlap = 0.0
+        state.last_decode_logical_ids = current_ids
+        state.last_decode_batch_size = int(
+            getattr(self._last_forward_batch, "batch_size", 0) or 0
+        )
+        state.last_decode_request_signature = tuple(
+            getattr(self, "_current_forward_expert_request_signature", ()) or ()
+        )
+        self._expert_prefetch_dirty_layers.add(int(state.layer_id))
+
     def _maybe_prepare_expert_plan_during_extend(self, forward_batch: Any) -> None:
         if self._simple_profile_enabled():
             return
@@ -242,6 +272,73 @@ class LayerKVExpertHooksMixin:
     def _expert_chunked_core_required(
         self, state: _LayerKVExpertLayerState, topk_output: Any
     ) -> bool:
+        controller = self._shared_expert_controller_for_state(state)
+        if controller is not None:
+            # A prefill batch can route to many more experts than one token's
+            # top-k. Its fixed physical budget must not use the native growth
+            # fallback, even when the baseline policy is not dynamic churn.
+            topk_ids = getattr(topk_output, "topk_ids", None)
+            if topk_ids is None:
+                return False
+            controller._routing_snapshot = None
+            controller._gpu_group_snapshot = None
+            gpu_grouping_enabled = getattr(
+                controller, "_gpu_grouping_enabled", None
+            )
+            use_gpu_grouping = bool(
+                callable(gpu_grouping_enabled)
+                and gpu_grouping_enabled(topk_ids)
+            )
+            controller._gpu_grouping_decision = (
+                topk_ids,
+                use_gpu_grouping,
+            )
+            if self._current_forward_mode == "decode" and use_gpu_grouping:
+                try:
+                    groups, _routing_valid = (
+                        controller.prepare_gpu_decode_groups(
+                            state, topk_ids
+                        )
+                    )
+                    chunked = len(groups) > 1
+                    if chunked:
+                        controller._gpu_group_snapshot = (
+                            topk_ids,
+                            int(state.slot_capacity),
+                            groups,
+                            _routing_valid,
+                        )
+                    return chunked
+                except Exception:
+                    # Keep the existing CPU route path as a one-time
+                    # fallback for unsupported JIT/toolchain shapes.
+                    controller._gpu_grouping_disabled = True
+                    controller.token_chunk_gpu_group_fallbacks += 1
+                    controller._gpu_grouping_decision = (
+                        topk_ids,
+                        False,
+                    )
+            if self._current_forward_mode == "decode":
+                # Both policies use the same one-readback decode path. Keep
+                # token rows for grouping instead of discarding them in unique().
+                routing_rows = topk_ids.tolist()
+                logical_ids = {
+                    logical
+                    for row in routing_rows
+                    for logical in row
+                    if 0 <= logical < state.full_num_experts
+                }
+                budget = getattr(controller, "budget", None)
+                if budget is not None:
+                    budget.observe_rows(
+                        self._decode_step, routing_rows, state.full_num_experts
+                    )
+                chunked = len(logical_ids) > int(state.slot_capacity)
+                if chunked:
+                    controller._routing_snapshot = (topk_ids, routing_rows)
+                return chunked
+            logical_ids = self._unique_expert_ids(topk_ids, state.full_num_experts)
+            return len(logical_ids) > int(state.slot_capacity)
         if not self._dynamic_expert_churn_policy_enabled():
             return False
         if int(state.slot_capacity) >= int(state.full_num_experts):
@@ -328,7 +425,16 @@ class LayerKVExpertHooksMixin:
                 topk_ids=chunk_ids,
                 topk_weights=chunk_weights,
             )
-            chunk_dispatch = dispatch_output._replace(topk_output=chunk_topk)
+            # Triton may write its output in place. Each chunk must see the
+            # original activations, and later calls must not overwrite an
+            # earlier partial result retained by output_accum.
+            chunk_dispatch = dispatch_output._replace(
+                topk_output=chunk_topk,
+                hidden_states=dispatch_output.hidden_states.clone(),
+            )
+            controller = self._shared_expert_controller_for_state(state)
+            if controller is not None:
+                controller.record_use(state, chunk_dispatch)
             chunk_output = state.orig_run_moe_core(chunk_dispatch, *args, **kwargs)
             hidden = getattr(chunk_output, "hidden_states", None)
             if hidden is None:
@@ -340,8 +446,7 @@ class LayerKVExpertHooksMixin:
                 output_accum = output_accum + hidden
 
         if self._current_forward_mode == "decode":
-            state.last_decode_logical_ids = logical_ids
-            self._expert_prefetch_dirty_layers.add(int(state.layer_id))
+            self._record_expert_decode_route(state, logical_ids)
         self.stats.expert_topk_rewrite_count += 1
         self.stats.expert_core_hook_count += 1
         if first_output is not None and hasattr(first_output, "_replace"):
@@ -349,12 +454,28 @@ class LayerKVExpertHooksMixin:
         return first_output
 
     def _prepare_expert_dispatch_for_core(
-        self, state: _LayerKVExpertLayerState, dispatch_output: Any
+        self,
+        state: _LayerKVExpertLayerState,
+        dispatch_output: Any,
+        *,
+        known_logical_ids: Optional[List[int]] = None,
+        allow_decode_cpu_known: bool = False,
     ) -> Any:
         topk_output = getattr(dispatch_output, "topk_output", None)
         if topk_output is None:
             return dispatch_output
-        rewritten_topk = self._prepare_expert_layer_for_topk(state, topk_output)
+        rewritten_topk = None
+        if known_logical_ids is not None:
+            rewritten_topk = self._prepare_expert_layer_for_cpu_known_topk(
+                state,
+                topk_output,
+                known_logical_ids,
+                allow_decode=allow_decode_cpu_known,
+            )
+            if rewritten_topk is None:
+                self.stats.expert_cpu_known_prepare_fallback_count += 1
+        if rewritten_topk is None:
+            rewritten_topk = self._prepare_expert_layer_for_topk(state, topk_output)
         self.stats.expert_core_hook_count += 1
         if rewritten_topk is topk_output:
             return dispatch_output
@@ -364,6 +485,110 @@ class LayerKVExpertHooksMixin:
         self.stats.expert_guard_pass = False
         self.stats.expert_guard_reason = reason
         raise RuntimeError(reason)
+
+    def _prepare_expert_layer_for_cpu_known_topk(
+        self,
+        state: _LayerKVExpertLayerState,
+        topk_output: Any,
+        logical_ids: List[int],
+        *,
+        allow_decode: bool = False,
+    ) -> Optional[Any]:
+        """Trusted demand from the shared controller's CPU routing snapshot only.
+
+        Retain GPU mapping and its post-load guard. Only demand discovery moves
+        to CPU metadata; loading order, hotness and copy readiness stay intact.
+        """
+        ids = getattr(topk_output, "topk_ids", None)
+        controller = self._shared_expert_controller_for_state(state)
+        if (
+            self.config.shared_expert_prepare_path != "cpu-known"
+            or controller is None
+            or (
+                self._current_forward_mode == "decode"
+                and not allow_decode
+            )
+            or not self._expert_plan_applied
+            or not self._optimized_profile_enabled()
+            or state.slot_capacity >= state.full_num_experts
+            or not state.topk_ids_in_range_calibrated
+            or state.topk_ids_invalid_observed
+            or ids is None
+            or not ids.is_cuda
+            or ids.numel() == 0
+            or ids.dtype not in (torch.int32, torch.int64)
+            or state.remap_tensor is None
+            or not logical_ids
+            or len(logical_ids) > state.slot_capacity
+            or logical_ids != sorted(set(logical_ids))
+            or logical_ids[0] < 0
+            or logical_ids[-1] >= state.full_num_experts
+        ):
+            return None
+        # CPU maps must agree before using them to skip a materialization.
+        # Inconsistent metadata goes through the existing guarded path.
+        if any(
+            not 0 <= slot < state.slot_capacity
+            or state.slot_to_logical.get(slot) != logical
+            for logical, slot in state.logical_to_slot.items()
+        ) or any(
+            state.logical_to_slot.get(logical) != slot
+            for slot, logical in state.slot_to_logical.items()
+        ):
+            return None
+        # The CPU maps are checked before every call, while the GPU remap is
+        # published on this same producer stream by _materialize_experts.  A
+        # successful guard can therefore be reused for a stable remap tensor
+        # and slot capacity; this avoids one host scalar readback per chunk.
+        # Debug/wait-trace modes retain the old per-call guard for diagnosis.
+        remap_signature = (id(state.remap_tensor), int(state.slot_capacity))
+        guard_required = (
+            getattr(state, "_cpu_known_remap_guard_signature", None)
+            != remap_signature
+            or self.config.profile_detail
+            or self.config.shared_expert_trace_waits
+        )
+        with self._profile("profile_expert_topk_rewrite_ms"):
+            if any(logical not in state.logical_to_slot for logical in logical_ids):
+                # Match generic miss behavior: pass ALL sorted IDs, not only
+                # misses. Do not touch LRU/hotness on an all-hit group.
+                self._materialize_experts(state, logical_ids, reason="on_demand")
+            self._wait_for_expert_logical_ids_ready(state, logical_ids)
+            if guard_required or self.config.shared_expert_trace_waits:
+                if self.config.shared_expert_trace_waits:
+                    from .wait_trace import traced_remap_and_guard
+
+                    mapped, invalid = traced_remap_and_guard(state, ids)
+                else:
+                    mapped = state.remap_tensor[ids.long()]
+                    invalid = bool(
+                        ((mapped < 0) | (mapped >= state.slot_capacity)).any().item()
+                    )
+            else:
+                mapped = state.remap_tensor[ids.long()]
+                invalid = False
+            if invalid:
+                reason = f"layer {state.layer_id} invalid expert remap after CPU-known prepare"
+                self.stats.expert_guard_pass = False
+                self.stats.expert_guard_reason = reason
+                self.stats.comparable = False
+                self.stats.comparability_reason = reason
+                raise RuntimeError(reason)
+            if guard_required:
+                state._cpu_known_remap_guard_signature = remap_signature
+                self.stats.expert_cpu_known_remap_guard_count += 1
+            else:
+                self.stats.expert_cpu_known_remap_guard_elided_count += 1
+            self.stats.expert_cpu_known_prepare_count += 1
+            self.stats.expert_topk_range_fastpath_count += 1
+            self.stats.expert_topk_rewrite_count += 1
+            if self._current_forward_mode == "decode":
+                # ``logical_ids`` is already the CPU-side routing snapshot
+                # consumed by this fastpath.  Retain it for the next decode
+                # step's route-aware prefetch without reading activations or
+                # expert IDs back from CUDA.
+                self._record_expert_decode_route(state, logical_ids)
+            return topk_output._replace(topk_ids=mapped.to(ids.dtype))
 
     def _prepare_expert_layer_for_topk(
         self, state: _LayerKVExpertLayerState, topk_output: Any
@@ -442,8 +667,7 @@ class LayerKVExpertHooksMixin:
                     self.stats.comparability_reason = reason
                     raise RuntimeError(reason)
                 if self._current_forward_mode == "decode":
-                    state.last_decode_logical_ids = logical_ids
-                    self._expert_prefetch_dirty_layers.add(int(state.layer_id))
+                    self._record_expert_decode_route(state, logical_ids)
                 self.stats.expert_topk_rewrite_count += 1
                 return topk_output._replace(topk_ids=mapped_ids.to(topk_ids.dtype))
         mapped_ids = remap[safe_ids]
@@ -504,8 +728,7 @@ class LayerKVExpertHooksMixin:
             self.stats.comparability_reason = reason
             raise RuntimeError(reason)
         if self._current_forward_mode == "decode":
-            state.last_decode_logical_ids = logical_ids
-            self._expert_prefetch_dirty_layers.add(int(state.layer_id))
+            self._record_expert_decode_route(state, logical_ids)
         if fast_in_range or valid is None:
             rewritten_ids = mapped_ids.to(topk_ids.dtype)
         else:
@@ -659,6 +882,24 @@ class LayerKVExpertHooksMixin:
             return True
         return False
 
+    def _expert_candidate_cpu_snapshot_needed(self, mode: str) -> bool:
+        """Whether CPU needs a decoded candidate order at all.
+
+        Candidate order is only a cold-start/install hint.  Once the expert
+        plan is applied, route-aware prefetch can use the live route or the
+        already materialized CPU hotness map; copying a full sorted order every
+        sample is redundant.  Keep it enabled while an install queue still
+        needs candidate ordering, and keep collector-only mode GPU-resident.
+        """
+        if mode != "decode" or self.config.expert_collector_only:
+            return False
+        if not self._expert_hotness_cpu_snapshot_needed(mode):
+            return False
+        if self._expert_plan_applied and not self._expert_install_queue:
+            self.stats.expert_candidate_snapshot_deferred_count += 1
+            return False
+        return True
+
     def _decode_expert_hotness_collection_needed(self) -> bool:
         if self._current_forward_mode != "decode":
             return True
@@ -684,6 +925,212 @@ class LayerKVExpertHooksMixin:
         if self._has_prefill_expert_hotness():
             return False
         return True
+
+    def _maybe_issue_expert_hotness_snapshots(
+        self,
+        mode: str,
+        layer_id: int,
+        full_num_experts: int,
+        counts: torch.Tensor,
+    ) -> None:
+        """Queue only required CPU views and batch same-layer D2H snapshots.
+
+        GPU counters are the authoritative hotness state.  CPU copies are
+        bounded, stale planner views.  When both a count view and a cold-start
+        candidate order are needed, they have the same ``int32[num_experts]``
+        shape and are submitted through the existing CUDA batch copier as one
+        transfer batch, producing one copy submission/event instead of two.
+        """
+        if counts.device.type != "cuda":
+            return
+        count_needed = self._expert_hotness_cpu_snapshot_needed(mode)
+        candidate_needed = self._expert_candidate_cpu_snapshot_needed(mode)
+        if not count_needed and not candidate_needed:
+            if mode != "decode" or self._defer_expert_hotness_snapshot():
+                self.stats.expert_hotness_snapshot_deferred_count += 1
+            return
+        if count_needed and self._defer_expert_hotness_snapshot():
+            self.stats.expert_hotness_snapshot_deferred_count += 1
+            count_needed = False
+
+        step = max(0, int(self._decode_step))
+        count_key = (str(mode), int(layer_id))
+        count_ready = False
+        if count_needed:
+            if count_key in self._expert_hotness_pending_snapshot_keys:
+                count_needed = False
+            elif len(self._expert_hotness_pending_snapshots) + len(
+                self._expert_hotness_snapshot_submit_queue
+            ) >= max(
+                8, len(self._expert_modules) * 2
+            ):
+                self.stats.expert_hotness_snapshot_drop_count += 1
+                count_needed = False
+            else:
+                last = int(self._expert_hotness_last_snapshot_step.get(count_key, -1))
+                interval = max(4, int(self.config.expert_hotness_sample_interval) * 4)
+                count_ready = not (
+                    step > 4 and last >= 0 and step - last < interval
+                )
+
+        candidate_ready = False
+        if candidate_needed:
+            layer_id = int(layer_id)
+            if layer_id in self._expert_candidate_pending_layers:
+                candidate_needed = False
+            elif len(self._expert_candidate_pending_snapshots) + len(
+                self._expert_hotness_snapshot_submit_queue
+            ) >= max(
+                8, len(self._expert_modules) * 2
+            ):
+                self.stats.expert_candidate_snapshot_drop_count += 1
+                candidate_needed = False
+            else:
+                last = int(
+                    self._expert_candidate_last_snapshot_step.get(layer_id, -1)
+                )
+                interval = max(4, int(self.config.expert_hotness_sample_interval) * 4)
+                candidate_ready = not (
+                    step > 4 and last >= 0 and step - last < interval
+                )
+
+        if not count_ready and not candidate_ready:
+            return
+
+        snapshot_counts = None
+        cpu_counts = None
+        cpu_order = None
+        order = None
+        if count_ready:
+            snapshot_counts = counts.detach().clone()
+            try:
+                cpu_counts = torch.empty_like(
+                    snapshot_counts, device="cpu", pin_memory=True
+                )
+            except Exception:
+                cpu_counts = torch.empty_like(snapshot_counts, device="cpu")
+
+        if candidate_ready:
+            expert_ids = torch.arange(
+                int(full_num_experts), dtype=torch.long, device=counts.device
+            )
+            decode_counts = self._expert_hotness_gpu_decode.get(int(layer_id))
+            prefill_counts = self._expert_hotness_gpu_prefill.get(int(layer_id))
+            if decode_counts is None:
+                decode_counts = torch.zeros_like(counts)
+            if prefill_counts is None:
+                prefill_counts = torch.zeros_like(counts)
+            scale = 1_000_000_000
+            scores = (
+                decode_counts.to(torch.long) * scale
+                + prefill_counts.to(torch.long)
+            ) * (int(full_num_experts) + 1) + (
+                int(full_num_experts) - expert_ids
+            )
+            order = torch.argsort(scores, descending=True).to(torch.int32)
+            try:
+                cpu_order = torch.empty_like(order, device="cpu", pin_memory=True)
+            except Exception:
+                cpu_order = torch.empty_like(order, device="cpu")
+
+        pairs = [
+            (destination, source)
+            for destination, source in ((cpu_counts, snapshot_counts), (cpu_order, order))
+            if destination is not None and source is not None
+        ]
+        self._expert_hotness_snapshot_submit_queue.append(
+            {
+                "mode": str(mode),
+                "layer_id": int(layer_id),
+                "step": int(step),
+                "device": counts.device,
+                "count_key": count_key,
+                "count_ready": bool(count_ready),
+                "candidate_ready": bool(candidate_ready),
+                "cpu_counts": cpu_counts,
+                "snapshot_counts": snapshot_counts,
+                "cpu_order": cpu_order,
+                "order": order,
+            }
+        )
+        if count_ready:
+            self._expert_hotness_pending_snapshot_keys.add(count_key)
+            self._expert_hotness_last_snapshot_step[count_key] = step
+        if candidate_ready:
+            self._expert_candidate_pending_layers.add(int(layer_id))
+            self._expert_candidate_last_snapshot_step[int(layer_id)] = step
+
+    def _flush_expert_hotness_snapshot_submit_queue(self) -> None:
+        """Submit queued layer snapshots in one batch per CUDA device."""
+        queue = getattr(self, "_expert_hotness_snapshot_submit_queue", None)
+        if not queue:
+            return
+        self._expert_hotness_snapshot_submit_queue = []
+        by_device = {}
+        for entry in queue:
+            by_device.setdefault(str(entry["device"]), []).append(entry)
+
+        for entries in by_device.values():
+            device = entries[0]["device"]
+            stream = self._hotness_snapshot_stream(device)
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(device=device))
+            pairs = []
+            for entry in entries:
+                if entry["count_ready"]:
+                    pairs.append((entry["cpu_counts"], entry["snapshot_counts"]))
+                if entry["candidate_ready"]:
+                    pairs.append((entry["cpu_order"], entry["order"]))
+            transfer = self._get_expert_batch_transfer()
+            use_batch_transfer = bool(
+                transfer is not None
+                and pairs
+                and all(destination.is_pinned() for destination, _source in pairs)
+            )
+            with torch.cuda.stream(stream):
+                stream.wait_event(ready)
+                if use_batch_transfer:
+                    transfer.copy(pairs, stream)
+                    self.stats.expert_hotness_snapshot_batch_count += 1
+                    self.stats.expert_hotness_snapshot_batch_tensor_count += len(
+                        pairs
+                    )
+                    self.stats.expert_hotness_snapshot_batch_bytes += sum(
+                        int(source.nbytes) for _destination, source in pairs
+                    )
+                else:
+                    if transfer is not None:
+                        self.stats.expert_hotness_snapshot_transfer_fallback_count += 1
+                    for destination, source in pairs:
+                        destination.copy_(source, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(stream)
+            for entry in entries:
+                if entry["snapshot_counts"] is not None:
+                    entry["snapshot_counts"].record_stream(stream)
+                if entry["order"] is not None:
+                    entry["order"].record_stream(stream)
+                if entry["count_ready"]:
+                    self._expert_hotness_pending_snapshots.append(
+                        (
+                            entry["mode"],
+                            int(entry["layer_id"]),
+                            entry["cpu_counts"],
+                            event,
+                            entry["snapshot_counts"],
+                        )
+                    )
+                    self.stats.expert_hotness_snapshot_issue_count += 1
+                if entry["candidate_ready"]:
+                    self._expert_candidate_pending_snapshots.append(
+                        (
+                            int(entry["layer_id"]),
+                            entry["cpu_order"],
+                            event,
+                            entry["order"],
+                        )
+                    )
+                    self.stats.expert_candidate_snapshot_issue_count += 1
 
     def _flush_expert_hotness_sample_skip_count(self) -> None:
         pending = int(self._expert_hotness_sample_skip_pending)
@@ -889,6 +1336,7 @@ class LayerKVExpertHooksMixin:
         self._expert_candidate_pending_snapshots = remaining
 
     def _finalize_expert_hotness_snapshots(self, *, block: bool = False) -> None:
+        self._flush_expert_hotness_snapshot_submit_queue()
         if not self._expert_hotness_pending_snapshots:
             return
         t0 = time.perf_counter() if self.config.profile_detail else 0.0
@@ -1042,13 +1490,12 @@ class LayerKVExpertHooksMixin:
         self.stats.expert_hotness_observed = True
         self.stats.expert_hotness_record_fast_count += 1
         self.stats.expert_hotness_record_count += 1
-        if self._expert_hotness_cpu_snapshot_needed(mode):
-            self._maybe_issue_expert_hotness_snapshot(mode, int(layer_id), counts)
-            self._maybe_issue_expert_candidate_snapshot(
-                mode, int(layer_id), int(full_num_experts), ids.device
-            )
-        else:
-            self.stats.expert_hotness_snapshot_deferred_count += 1
+        self._maybe_issue_expert_hotness_snapshots(
+            mode,
+            int(layer_id),
+            int(full_num_experts),
+            counts,
+        )
 
     def _record_expert_hotness_for_layer(
         self, layer_id: int, full_num_experts: int, topk_ids: torch.Tensor
@@ -1112,6 +1559,85 @@ class LayerKVExpertHooksMixin:
         except Exception:
             return False
 
+    def _ensure_pending_expert_copy_index(self) -> None:
+        """Build postings for pending copies, including externally assigned lists."""
+        pending_events = self._pending_expert_copy_events
+        token = (id(pending_events), len(pending_events))
+        if getattr(self, "_pending_expert_copy_index_token", None) == token:
+            return
+        self._pending_expert_copy_by_logical.clear()
+        self._pending_expert_copy_by_slot.clear()
+        self._pending_expert_copy_sequence.clear()
+        self._next_pending_expert_copy_sequence = 0
+        for pending in pending_events:
+            self._index_pending_expert_copy(pending)
+        self._pending_expert_copy_index_token = token
+
+    def _index_pending_expert_copy(self, pending: _LayerKVPendingExpertCopy) -> None:
+        sequence = self._next_pending_expert_copy_sequence
+        self._next_pending_expert_copy_sequence += 1
+        self._pending_expert_copy_sequence[id(pending)] = sequence
+        layer_id = int(pending.layer_id)
+        for logical_id in pending.logical_ids:
+            self._pending_expert_copy_by_logical.setdefault(
+                (layer_id, int(logical_id)), []
+            ).append(pending)
+        for slot_id in pending.slot_by_logical.values():
+            self._pending_expert_copy_by_slot.setdefault(
+                (layer_id, int(slot_id)), []
+            ).append(pending)
+
+    def _unindex_pending_expert_copy(
+        self, pending: _LayerKVPendingExpertCopy
+    ) -> None:
+        layer_id = int(pending.layer_id)
+        for logical_id in pending.logical_ids:
+            key = (layer_id, int(logical_id))
+            bucket = self._pending_expert_copy_by_logical.get(key)
+            if bucket is not None:
+                bucket[:] = [item for item in bucket if item is not pending]
+                if not bucket:
+                    self._pending_expert_copy_by_logical.pop(key, None)
+        for slot_id in pending.slot_by_logical.values():
+            key = (layer_id, int(slot_id))
+            bucket = self._pending_expert_copy_by_slot.get(key)
+            if bucket is not None:
+                bucket[:] = [item for item in bucket if item is not pending]
+                if not bucket:
+                    self._pending_expert_copy_by_slot.pop(key, None)
+        self._pending_expert_copy_sequence.pop(id(pending), None)
+
+    def _pending_expert_copy_candidates(self, layer_id: int, logical_ids):
+        self._ensure_pending_expert_copy_index()
+        candidates = {}
+        for logical_id in logical_ids:
+            for pending in self._pending_expert_copy_by_logical.get(
+                (int(layer_id), int(logical_id)), ()
+            ):
+                candidates[id(pending)] = pending
+        return sorted(
+            candidates.values(),
+            key=lambda pending: self._pending_expert_copy_sequence.get(
+                id(pending), 0
+            ),
+        )
+
+    def _pending_expert_copy_logical_ids(self, layer_id: int):
+        """Return pending logical IDs without scanning all pending batches."""
+        self._ensure_pending_expert_copy_index()
+        result = set()
+        for (pending_layer, logical_id), bucket in (
+            self._pending_expert_copy_by_logical.items()
+        ):
+            if pending_layer != int(layer_id):
+                continue
+            if any(
+                int(logical_id) not in pending.invalidated_logical_ids
+                for pending in bucket
+            ):
+                result.add(int(logical_id))
+        return result
+
     def _wait_for_expert_logical_ids_ready(
         self, state: _LayerKVExpertLayerState, logical_ids: List[int]
     ) -> None:
@@ -1121,7 +1647,7 @@ class LayerKVExpertHooksMixin:
         if not needed:
             return
         stream = torch.cuda.current_stream(device=state.device)
-        for pending in self._pending_expert_copy_events:
+        for pending in self._pending_expert_copy_candidates(state.layer_id, needed):
             if pending.waited_on_main_stream or pending.layer_id != state.layer_id:
                 continue
             if not pending.logical_ids.intersection(needed):
@@ -1168,46 +1694,64 @@ class LayerKVExpertHooksMixin:
         self._refresh_expert_ready_before_use_ratio()
 
     def _finalize_expert_materialize_events(self, *, block: bool = False) -> None:
+        if self._expert_batch_transfer is not None:
+            self._expert_batch_transfer.collect(block=block)
         if not self._pending_expert_copy_events:
             return
         remaining = []
         for pending in self._pending_expert_copy_events:
             start = pending.start_event
             end = pending.ready_event
+            keep_pending = False
             try:
                 self._record_expert_wait_stall_if_ready(pending)
                 if block:
                     end.synchronize()
-                elif not end.query():
+                    ready = True
+                else:
+                    ready = end.query()
+                if not ready:
                     remaining.append(pending)
-                    continue
-                elapsed = float(start.elapsed_time(end))
-                self.stats.expert_materialize_ms += elapsed
-                self.stats.layerkv_copy_stream_busy_ms += elapsed
-                self.stats.expert_h2d_stream_busy_ms += elapsed
-                state = self._expert_layers.get(int(pending.layer_id))
-                if state is not None:
-                    for logical_id in pending.logical_ids:
-                        slot_id = state.logical_to_slot.get(int(logical_id))
-                        if slot_id is not None:
-                            group = self._get_or_create_resident_group(
-                                kind="expert",
-                                layer_id=state.layer_id,
-                                logical_id=int(logical_id),
-                                state="resident",
-                                bytes=state.expert_bytes,
+                    keep_pending = True
+                if ready:
+                    elapsed = float(start.elapsed_time(end))
+                    self.stats.expert_materialize_ms += elapsed
+                    self.stats.layerkv_copy_stream_busy_ms += elapsed
+                    self.stats.expert_h2d_stream_busy_ms += elapsed
+                    state = self._expert_layers.get(int(pending.layer_id))
+                    if state is not None:
+                        for logical_id in pending.logical_ids:
+                            if logical_id in pending.invalidated_logical_ids:
+                                continue
+                            slot_id = state.logical_to_slot.get(int(logical_id))
+                            expected_slot = pending.slot_by_logical.get(
+                                int(logical_id)
                             )
-                            self._mark_expert_group_state(
-                                state,
-                                int(logical_id),
-                                group_state="resident",
-                                slot_id=int(slot_id),
-                            )
-                            group.recover_count += 1
-                            self.stats.resident_group_recover_count += 1
+                            if expected_slot is not None and slot_id != expected_slot:
+                                continue
+                            if slot_id is not None:
+                                group = self._get_or_create_resident_group(
+                                    kind="expert",
+                                    layer_id=state.layer_id,
+                                    logical_id=int(logical_id),
+                                    state="resident",
+                                    bytes=state.expert_bytes,
+                                )
+                                self._mark_expert_group_state(
+                                    state,
+                                    int(logical_id),
+                                    group_state="resident",
+                                    slot_id=int(slot_id),
+                                )
+                                group.recover_count += 1
+                                self.stats.resident_group_recover_count += 1
             except Exception:
-                continue
+                pass
+            finally:
+                if not keep_pending:
+                    self._unindex_pending_expert_copy(pending)
         self._pending_expert_copy_events = remaining
+        self._pending_expert_copy_index_token = (id(remaining), len(remaining))
         self._refresh_resident_group_stats()
 
     def _unique_expert_ids(
@@ -1243,17 +1787,171 @@ class LayerKVExpertHooksMixin:
             values = torch.unique(ids).detach().cpu()
         return [int(x) for x in values.tolist()]
 
+    def _invalidate_pending_expert_slot(
+        self, state: _LayerKVExpertLayerState, logical_id: int, slot_id: int
+    ) -> None:
+        """Prevent a completed old copy from publishing into a reused slot."""
+        logical_id = int(logical_id)
+        slot_id = int(slot_id)
+        self._ensure_pending_expert_copy_index()
+        for pending in self._pending_expert_copy_by_slot.get(
+            (int(state.layer_id), slot_id), ()
+        ):
+            if pending.slot_by_logical.get(logical_id) == slot_id:
+                pending.invalidated_logical_ids.add(logical_id)
+
+    def _flush_expert_remap_updates(self, state, updates) -> None:
+        if not updates:
+            return
+        # One packed transfer instead of a pageable scalar copy/sync per entry.
+        # New tensors own their storage: no reusable host staging can be mutated
+        # while CUDA is reading it. Only touched IDs are changed, never the table
+        # pointer or unrelated entries. Dict assignment preserves last-write wins.
+        ids, slots = list(updates), list(updates.values())
+        updates.clear()  # Do not retry a failed CUDA submission in finally.
+        try:
+            packed = torch.tensor(
+                [ids, slots], dtype=torch.int64, device=state.remap_tensor.device
+            )
+            state.remap_tensor.index_copy_(
+                0, packed[0], packed[1].to(dtype=state.remap_tensor.dtype)
+            )
+        except Exception:
+            self.stats.expert_guard_pass = False
+            self.stats.expert_guard_reason = "batched expert remap publication failed"
+            self.stats.comparable = False
+            raise
+        self.stats.expert_remap_batch_count += 1
+        self.stats.expert_remap_batch_entries += len(ids)
+
+    def _evict_experts_batched(
+        self,
+        state: _LayerKVExpertLayerState,
+        logical_ids: List[int],
+        *,
+        protected_logical_ids: Optional[Set[int]] = None,
+        reason: str = "planned",
+    ) -> List[int]:
+        """Evict a preselected resident set in one backing/remap batch.
+
+        The normal materializer still owns the guarded fallback path.  This
+        helper is used only after a forward-local route planner has selected
+        victims.  Every ID and slot is revalidated here because exact-group
+        prefetch or an asynchronous H2D copy may have changed residency since
+        planning.
+        """
+        if not logical_ids:
+            return []
+        self._finalize_expert_materialize_events(block=False)
+        finalize_d2h = getattr(self, "_finalize_expert_d2h_events", None)
+        if callable(finalize_d2h):
+            finalize_d2h(block=False)
+        pending_slots = self._pending_expert_copy_slots(state)
+        protected = {
+            int(logical_id) for logical_id in (protected_logical_ids or ())
+        }
+        unique_ids = list(dict.fromkeys(int(logical_id) for logical_id in logical_ids))
+        evicted_pairs = []
+        for logical_id in unique_ids:
+            if logical_id in protected:
+                continue
+            slot_id = state.logical_to_slot.get(logical_id)
+            if slot_id is None:
+                continue
+            slot_id = int(slot_id)
+            if slot_id in pending_slots:
+                continue
+            if state.slot_to_logical.get(slot_id) != logical_id:
+                continue
+            evicted_pairs.append((logical_id, slot_id))
+        if not evicted_pairs:
+            return []
+
+        remap_updates = {} if self.config.expert_remap_update == "batch" else None
+        cache_accounting = self._get_expert_backing_cache_accounting(state)
+        evicted_to_copy = []
+        free_slots = {
+            int(slot_id) for slot_id in getattr(state, "free_slots", ())
+        }
+        try:
+            for logical_id, slot_id in evicted_pairs:
+                self._invalidate_pending_expert_slot(state, logical_id, slot_id)
+                global_backing = (
+                    self._global_expert_backing(state.layer_id, logical_id)
+                    if self._expert_global_cpu_backing
+                    else None
+                )
+                if global_backing is not None:
+                    state.cpu_params[logical_id] = global_backing
+                if logical_id in state.cpu_params:
+                    self.stats.expert_eviction_d2h_skip_count += 1
+                    self.stats.expert_backing_cache_hit_count += 1
+                else:
+                    self.stats.expert_eviction_d2h_copy_count += 1
+                    self.stats.expert_backing_cache_miss_count += 1
+                    evicted_to_copy.append((logical_id, slot_id))
+                state.backing_lru[logical_id] = self._decode_step
+                state.logical_to_slot.pop(logical_id, None)
+                state.slot_to_logical.pop(slot_id, None)
+                if cache_accounting is not None:
+                    self._update_expert_backing_cache_accounting(state, logical_id)
+                state.lru.pop(logical_id, None)
+                if state.remap_tensor is not None:
+                    if remap_updates is not None:
+                        remap_updates[logical_id] = -1
+                    else:
+                        state.remap_tensor[logical_id] = -1
+                if reason == "planned":
+                    self._mark_expert_group_state(
+                        state,
+                        logical_id,
+                        group_state="offloaded",
+                        cpu_params=state.cpu_params.get(logical_id),
+                    )
+                if slot_id not in free_slots:
+                    heapq.heappush(state.free_slots, slot_id)
+                    free_slots.add(slot_id)
+
+            if remap_updates:
+                self._flush_expert_remap_updates(state, remap_updates)
+            if evicted_to_copy:
+                wait_for_host = not (
+                    reason != "prefetch"
+                    and self.config.expert_demand_d2h_wait == "stream"
+                )
+                copied = self._copy_slots_to_cpu_batched(
+                    state,
+                    evicted_to_copy,
+                    wait_for_host=wait_for_host,
+                )
+                state.cpu_params.update(copied)
+            if reason != "prefetch":
+                self._expert_group_dirty_layers.add(int(state.layer_id))
+            return [int(logical_id) for logical_id, _slot_id in evicted_pairs]
+        finally:
+            if remap_updates:
+                self._flush_expert_remap_updates(state, remap_updates)
+
     def _materialize_experts(
         self,
         state: _LayerKVExpertLayerState,
         logical_ids: List[int],
         *,
         reason: str = "on_demand",
+        protected_logical_ids: Optional[Set[int]] = None,
+        transfer_stream: Optional[Any] = None,
     ) -> None:
         t_profile = time.perf_counter() if self.config.debug_stats else 0.0
         if not logical_ids:
             return
+        remap_updates = {} if self.config.expert_remap_update == "batch" else None
         try:
+            # A completed event is collected here when possible.  Any copy
+            # still pending owns its destination slot until the DMA finishes;
+            # the slot must not be reused merely because its logical mapping
+            # has already been replaced in the CPU bookkeeping.
+            self._finalize_expert_materialize_events(block=False)
+            cache_accounting = self._get_expert_backing_cache_accounting(state)
             unique_logical_ids = list(dict.fromkeys(int(x) for x in logical_ids))
             self.stats.expert_materialize_dedup_count += max(
                 0, len(logical_ids) - len(unique_logical_ids)
@@ -1269,24 +1967,40 @@ class LayerKVExpertHooksMixin:
                     )
                     state.prefetched_logical_ids.difference_update(used_prefetch)
             protected = set(unique_logical_ids)
+            if protected_logical_ids:
+                protected.update(int(x) for x in protected_logical_ids)
+            # Shared token-chunk execution may install a forward-local access
+            # clock.  Keep it separate from ``state.lru``: the latter is also
+            # used by the cross-forward planner as a decode-step age.
+            active_lru = getattr(self, "_layerkv_active_expert_lru", None)
             materialized: List[Tuple[int, int, Dict[str, torch.Tensor]]] = []
             evicted_to_copy: List[Tuple[int, int]] = []
             for logical_id in unique_logical_ids:
                 slot_id = state.logical_to_slot.get(int(logical_id))
                 if slot_id is not None:
                     state.lru[int(logical_id)] = self._decode_step
-                    if int(logical_id) in state.cpu_params:
-                        state.backing_lru[int(logical_id)] = self._decode_step
                     heapq.heappush(
                         state.lru_heap,
                         (self._decode_step, int(slot_id), int(logical_id)),
                     )
+                    if int(logical_id) in state.cpu_params:
+                        state.backing_lru[int(logical_id)] = self._decode_step
                     continue
 
-                slot_id = self._choose_expert_slot_for_materialize(state, protected)
+                try:
+                    slot_id = self._choose_expert_slot_for_materialize(
+                        state, protected
+                    )
+                except RuntimeError:
+                    if not self._wait_for_pending_expert_slot_reuse(state):
+                        raise
+                    slot_id = self._choose_expert_slot_for_materialize(
+                        state, protected
+                    )
                 evicted = state.slot_to_logical.get(slot_id)
                 if evicted is not None:
                     evicted = int(evicted)
+                    self._invalidate_pending_expert_slot(state, evicted, slot_id)
                     global_evicted = (
                         self._global_expert_backing(state.layer_id, evicted)
                         if self._expert_global_cpu_backing
@@ -1303,9 +2017,16 @@ class LayerKVExpertHooksMixin:
                         evicted_to_copy.append((evicted, int(slot_id)))
                     state.backing_lru[evicted] = self._decode_step
                     state.logical_to_slot.pop(evicted, None)
+                    if cache_accounting is not None:
+                        self._update_expert_backing_cache_accounting(state, evicted)
                     state.lru.pop(evicted, None)
+                    if active_lru is not None:
+                        active_lru.pop(evicted, None)
                     if state.remap_tensor is not None:
-                        state.remap_tensor[evicted] = -1
+                        if remap_updates is not None:
+                            remap_updates[evicted] = -1
+                        else:
+                            state.remap_tensor[evicted] = -1
                     if reason == "prefetch":
                         self._mark_expert_group_state(
                             state,
@@ -1331,11 +2052,18 @@ class LayerKVExpertHooksMixin:
                     raise RuntimeError(err)
                 materialized.append((int(logical_id), int(slot_id), source_params))
                 state.logical_to_slot[logical_id] = slot_id
+                if cache_accounting is not None:
+                    self._update_expert_backing_cache_accounting(state, logical_id)
                 state.slot_to_logical[slot_id] = logical_id
                 state.lru[logical_id] = self._decode_step
-                heapq.heappush(state.lru_heap, (self._decode_step, slot_id, logical_id))
+                heapq.heappush(
+                    state.lru_heap, (self._decode_step, slot_id, logical_id)
+                )
                 if state.remap_tensor is not None:
-                    state.remap_tensor[int(logical_id)] = int(slot_id)
+                    if remap_updates is not None:
+                        remap_updates[int(logical_id)] = int(slot_id)
+                    else:
+                        state.remap_tensor[int(logical_id)] = int(slot_id)
                 if reason == "prefetch":
                     self._mark_expert_group_state(
                         state,
@@ -1360,25 +2088,47 @@ class LayerKVExpertHooksMixin:
                 )
                 state.backing_lru[int(logical_id)] = self._decode_step
             if materialized:
+                if remap_updates:
+                    # Publish on the producer stream before its existing H2D
+                    # dependency is captured. Consumers still wait for weights
+                    # and validate GPU remapping before running the MoE core.
+                    self._flush_expert_remap_updates(state, remap_updates)
                 if reason != "prefetch":
                     self._expert_group_dirty_layers.add(int(state.layer_id))
                 if (
                     reason == "prefetch"
                     and self._optimized_profile_enabled()
-                    and self._copy_slots_to_cpu_batched_async(state, evicted_to_copy)
+                    and self._copy_slots_to_cpu_batched_async(
+                        state,
+                        evicted_to_copy,
+                        h2d_stream=transfer_stream,
+                    )
                 ):
                     pass
                 else:
-                    copied = self._copy_slots_to_cpu_batched(state, evicted_to_copy)
+                    if (
+                        reason == "on_demand"
+                        and self.config.expert_demand_d2h_wait == "stream"
+                    ):
+                        copied = self._copy_slots_to_cpu_batched(
+                            state, evicted_to_copy, wait_for_host=False
+                        )
+                    else:
+                        copied = self._copy_slots_to_cpu_batched(state, evicted_to_copy)
                     state.cpu_params.update(copied)
                 self._copy_materialized_experts_batched(
                     state,
                     materialized,
                     async_copy=self._expert_h2d_async_enabled(state),
                     reason=reason,
+                    transfer_stream=transfer_stream,
                 )
                 self._trim_expert_backing_cache(state)
         finally:
+            if remap_updates:
+                # Match scalar partial invalidations if CPU backing lookup or
+                # slot selection raises; do not leave evicted IDs GPU-visible.
+                self._flush_expert_remap_updates(state, remap_updates)
             if self.config.profile_detail:
                 self._add_profile(
                     "profile_expert_materialize_control_ms",
@@ -1392,6 +2142,7 @@ class LayerKVExpertHooksMixin:
         *,
         async_copy: bool,
         reason: str,
+        transfer_stream: Optional[Any] = None,
     ) -> None:
         if not materialized:
             return
@@ -1418,7 +2169,7 @@ class LayerKVExpertHooksMixin:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             active_stream = (
-                self._expert_h2d_copy_stream(state.device)
+                transfer_stream or self._expert_h2d_copy_stream(state.device)
                 if async_copy
                 else torch.cuda.current_stream(device=state.device)
             )
@@ -1426,12 +2177,38 @@ class LayerKVExpertHooksMixin:
         def issue_copy() -> None:
             if active_stream is not None:
                 start.record(active_stream)
-            for name in state.param_names:
-                for _logical_id, slot_id, source_params in materialized:
-                    dst = getattr(state.module, name).data[slot_id]
-                    dst.copy_(source_params[name], non_blocking=True)
+            transfer = self._get_expert_batch_transfer()
+            if transfer is not None:
+                pairs = []
+                for name in state.param_names:
+                    # Fetch the current parameter once per submission, not per
+                    # expert. Do not retain views across arena resize/recall.
+                    param = getattr(state.module, name).data
+                    pairs.extend(
+                        (param[slot_id], source_params[name])
+                        for _logical_id, slot_id, source_params in materialized
+                    )
+                transfer.copy(pairs, active_stream)
+            else:
+                for name in state.param_names:
+                    for _logical_id, slot_id, source_params in materialized:
+                        dst = getattr(state.module, name).data[slot_id]
+                        dst.copy_(source_params[name], non_blocking=True)
             if active_stream is not None:
                 end.record(active_stream)
+
+        if (
+            active_stream is not None
+            and reason == "on_demand"
+            and self.config.expert_demand_d2h_wait == "stream"
+        ):
+            # Capture the producer before switching to the H2D stream. The main
+            # stream is ordered after D2H (including the NULL-stream bridge),
+            # so overwriting a slot cannot race its backup. No host fence.
+            producer = torch.cuda.current_stream(device=state.device)
+            if active_stream.cuda_stream != producer.cuda_stream:
+                active_stream.wait_stream(producer)
+                self.stats.expert_demand_h2d_dependency_count += 1
 
         with torch.no_grad():
             if active_stream is not None:
@@ -1501,13 +2278,22 @@ class LayerKVExpertHooksMixin:
                             ready_start_event=start,
                             ready_event=end,
                         )
-                    self._pending_expert_copy_events.append(
-                        _LayerKVPendingExpertCopy(
-                            start_event=start,
-                            ready_event=end,
-                            layer_id=state.layer_id,
-                            logical_ids=set(int(x[0]) for x in materialized),
-                        )
+                    pending = _LayerKVPendingExpertCopy(
+                        start_event=start,
+                        ready_event=end,
+                        layer_id=state.layer_id,
+                        logical_ids=set(int(x[0]) for x in materialized),
+                        slot_by_logical={
+                            int(logical_id): int(slot_id)
+                            for logical_id, slot_id, _source_params in materialized
+                        },
+                    )
+                    self._ensure_pending_expert_copy_index()
+                    self._pending_expert_copy_events.append(pending)
+                    self._index_pending_expert_copy(pending)
+                    self._pending_expert_copy_index_token = (
+                        id(self._pending_expert_copy_events),
+                        len(self._pending_expert_copy_events),
                     )
                 else:
                     self.stats.expert_materialize_host_sync_count += batch_size
@@ -1528,6 +2314,8 @@ class LayerKVExpertHooksMixin:
         )
         if new_capacity <= state.slot_capacity:
             return
+        if self._shared_expert_controller_for_state(state) is not None:
+            raise RuntimeError("shared expert growth must be funded by KV pages")
         old_capacity = state.slot_capacity
         with torch.no_grad():
             for name in state.param_names:
@@ -1560,28 +2348,131 @@ class LayerKVExpertHooksMixin:
     def _choose_expert_slot_for_materialize(
         self, state: _LayerKVExpertLayerState, protected: Set[int]
     ) -> int:
+        pending_slots = self._pending_expert_copy_slots(state)
         while state.free_slots:
             slot_id = int(heapq.heappop(state.free_slots))
             if (
                 0 <= slot_id < state.slot_capacity
                 and slot_id not in state.slot_to_logical
+                and slot_id not in pending_slots
             ):
                 return slot_id
+
+        # A shared-expert forward may publish all of its route groups on the
+        # CPU before execution.  When that snapshot is installed, prefer a
+        # resident expert whose next use is farthest away (Belady-style),
+        # while retaining the existing pending-DMA and protected-ID guards.
+        # The caller clears this transient map after the current group is
+        # prepared, so it never becomes a dataset-specific residency cache.
+        future_use = getattr(self, "_layerkv_future_expert_use", None)
+        active_lru = getattr(self, "_layerkv_active_expert_lru", None)
+
+        def lru_value(logical_id: int) -> int:
+            if active_lru is not None and logical_id in active_lru:
+                return int(active_lru[logical_id])
+            return int(state.lru.get(logical_id, -1))
+
+        if future_use is not None:
+            candidates = []
+            for slot_id, logical_id in state.slot_to_logical.items():
+                slot_id = int(slot_id)
+                logical_id = int(logical_id)
+                if (
+                    slot_id in pending_slots
+                    or logical_id in protected
+                    or state.logical_to_slot.get(logical_id) != slot_id
+                ):
+                    continue
+                next_use = future_use.get(logical_id)
+                candidates.append(
+                    (
+                        math.inf if next_use is None else int(next_use),
+                        -lru_value(logical_id),
+                        -logical_id,
+                        -slot_id,
+                        slot_id,
+                )
+            )
+            if candidates:
+                controller = self._shared_expert_controller_for_state(state)
+                if controller is not None:
+                    controller.future_eviction_slot_count = (
+                        getattr(controller, "future_eviction_slot_count", 0) + 1
+                    )
+                return max(candidates)[-1]
+
+        # During a long prefill every route group shares one decode-step
+        # timestamp.  Prefer the forward-local access clock when available so
+        # the fallback is a real LRU instead of a slot/ID tie-break.  The
+        # normal heap remains the fallback for all other callers.
+        if active_lru is not None:
+            candidates = []
+            for slot_id, logical_id in state.slot_to_logical.items():
+                slot_id = int(slot_id)
+                logical_id = int(logical_id)
+                if (
+                    slot_id in pending_slots
+                    or logical_id in protected
+                    or state.logical_to_slot.get(logical_id) != slot_id
+                ):
+                    continue
+                candidates.append(
+                    (lru_value(logical_id), slot_id, logical_id, slot_id)
+                )
+            if candidates:
+                return min(candidates)[-1]
+
+        deferred = []
         while state.lru_heap:
             step, slot_id, logical_id = heapq.heappop(state.lru_heap)
+            if slot_id in pending_slots:
+                deferred.append((step, slot_id, logical_id))
+                continue
             if logical_id in protected:
                 continue
             if state.logical_to_slot.get(logical_id) != slot_id:
                 continue
             if state.lru.get(logical_id) != step:
                 continue
+            for item in deferred:
+                heapq.heappush(state.lru_heap, item)
             return int(slot_id)
+        for item in deferred:
+            heapq.heappush(state.lru_heap, item)
         for slot_id, logical_id in state.slot_to_logical.items():
-            if logical_id not in protected:
+            if slot_id not in pending_slots and logical_id not in protected:
                 return int(slot_id)
         raise RuntimeError(
             f"layer {state.layer_id} has no evictable expert slot for materialization"
         )
+
+    def _pending_expert_copy_slots(
+        self, state: _LayerKVExpertLayerState
+    ) -> Set[int]:
+        """Return destination slots still owned by unfinished H2D copies."""
+        self._ensure_pending_expert_copy_index()
+        return {
+            int(slot_id)
+            for layer_id, slot_id in self._pending_expert_copy_by_slot
+            if layer_id == int(state.layer_id)
+        }
+
+    def _wait_for_pending_expert_slot_reuse(
+        self, state: _LayerKVExpertLayerState
+    ) -> bool:
+        """Wait only when every otherwise-evictable slot is DMA-owned."""
+        pending = [
+            item
+            for item in self._pending_expert_copy_events
+            if int(getattr(item, "layer_id", -1)) == int(state.layer_id)
+            and item.slot_by_logical
+        ]
+        if not pending:
+            return False
+        for item in pending:
+            item.ready_event.synchronize()
+        self._finalize_expert_materialize_events(block=False)
+        return True
 
     def _expert_hotness_score(
         self, state: _LayerKVExpertLayerState, logical_id: int

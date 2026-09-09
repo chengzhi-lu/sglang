@@ -342,6 +342,49 @@ class LayerKVKvcResidencyMixin:
     ) -> bool:
         return str(entry.state) == "resident" and bool(entry.device_loc_list())
 
+    def _append_per_layer_resident_tail(
+        self,
+        *,
+        layer_id: int,
+        req_idx: int,
+        pos: int,
+        physical_loc: int,
+        generation: int,
+    ) -> Optional[_LayerKVResidencyEntry]:
+        layer_id = int(layer_id)
+        req_idx = int(req_idx)
+        pos = int(pos)
+        physical_loc = int(physical_loc)
+        if physical_loc <= 0:
+            return None
+        page_tokens = self._per_layer_virtual_page_tokens()
+        page_id = max(0, pos) // page_tokens
+        entry = self._per_layer_resident_span_by_req_layer_page.get(
+            (req_idx, layer_id, page_id)
+        )
+        if entry is None:
+            return None
+        token_count = int(entry.token_count)
+        if (
+            int(entry.req_idx) != req_idx
+            or int(entry.layer_id) != layer_id
+            or int(entry.generation) != int(generation)
+            or str(entry.state) != "resident"
+            or int(entry.pos) + token_count != pos
+            or int(entry.pos) // page_tokens != page_id
+        ):
+            return None
+        device_locs = entry.device_locs
+        if device_locs is None:
+            device_locs = entry.device_loc_list()
+            entry.device_locs = device_locs
+        if len(device_locs) != token_count or not device_locs:
+            return None
+        device_locs.append(physical_loc)
+        entry.page_size = token_count + 1
+        entry.last_access_step = self._decode_step
+        return entry
+
     def _per_layer_resident_span_key_for_entry(
         self, entry: _LayerKVResidencyEntry
     ) -> Tuple[int, int, int]:
@@ -674,6 +717,33 @@ class LayerKVKvcResidencyMixin:
             if req_idx is None or count <= 0 or len(req_locs) != count:
                 continue
             req_idx = int(req_idx)
+            # Only newly allocated extension slots are transferred; shared
+            # prefix-cache slots are not part of req_locs. Track every layer,
+            # including layers never selected for eviction, for final cleanup.
+            for layer_id in self._kvc_layer_ids():
+                if layer_id in self._per_layer_req_to_token_owned:
+                    # Request indices are reused. An owned table is a clone,
+                    # so the native prefill table write does not update it.
+                    override = self._per_layer_req_to_token_overrides[layer_id]
+                    override[req_idx, start:end] = locs[offset - count : offset].to(
+                        device=override.device, dtype=override.dtype
+                    )
+                    self._per_layer_req_to_token_versions[layer_id] = (
+                        self._per_layer_req_to_token_versions.get(layer_id, 0) + 1
+                    )
+                entry = _LayerKVResidencyEntry(
+                    req_idx=req_idx,
+                    pos=start,
+                    state="resident",
+                    layer_id=int(layer_id),
+                    device_locs=list(req_locs),
+                    page_size=count,
+                    generation=self._per_layer_req_generation(req_idx),
+                )
+                self._add_per_layer_cleanup_locs(entry, list(req_locs))
+            self._per_layer_owned_req_indices.add(req_idx)
+            req.layerkv_per_layer_allocated = True
+            req.skip_radix_cache_insert = True
             runs = self._native_kvc_runs_by_req.setdefault(req_idx, [])
             if runs and int(runs[-1].end) == start:
                 previous = runs[-1]
@@ -1127,9 +1197,10 @@ class LayerKVKvcResidencyMixin:
             layer_ids=layer_ids,
             require_common=bool(common_physical_locs),
         )
+        canonical_locs_shared = False
         if reused_locs_by_layer is not None:
             locs_by_layer = reused_locs_by_layer
-            canonical_locs = list(locs_by_layer[layer_ids[0]])
+            canonical_locs = locs_by_layer[layer_ids[0]]
             reused_invalid = True
             self.stats.kvc_per_layer_invalid_reuse_count += 1
             self.stats.kvc_per_layer_invalid_reuse_token_count += count
@@ -1137,7 +1208,8 @@ class LayerKVKvcResidencyMixin:
             canonical_locs = self._alloc_common_per_layer_locs(count)
             if canonical_locs is None:
                 return None
-            locs_by_layer = {layer_id: list(canonical_locs) for layer_id in layer_ids}
+            locs_by_layer = {layer_id: canonical_locs for layer_id in layer_ids}
+            canonical_locs_shared = True
         else:
             locs_by_layer: Dict[int, List[int]] = {}
             for layer_id in layer_ids:
@@ -1149,31 +1221,44 @@ class LayerKVKvcResidencyMixin:
                         )
                     return None
                 locs_by_layer[layer_id] = layer_locs
-            canonical_locs = list(locs_by_layer[layer_ids[0]])
+            canonical_locs = locs_by_layer[layer_ids[0]]
             self.stats.kvc_per_layer_independent_alloc_count += count
 
         owned_keys: List[Tuple[int, int, int]] = []
         device = self._allocator.device
         req_tensor = torch.full((count,), req_idx, dtype=torch.int64, device=device)
         pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+        canonical_tensor = torch.tensor(canonical_locs, dtype=torch.int64, device=device)
         page_tokens = self._per_layer_virtual_page_tokens()
         for layer_id in layer_ids:
             layer_locs = locs_by_layer[layer_id]
+            layer_locs_is_canonical = (
+                canonical_locs_shared
+                or layer_locs is canonical_locs
+                or layer_locs == canonical_locs
+            )
             if (
-                layer_locs != canonical_locs
+                not layer_locs_is_canonical
                 or int(layer_id) in self._per_layer_req_to_token_owned
             ):
                 self._set_per_layer_token_slots(
                     layer_id,
                     [req_idx] * count,
                     positions,
-                    torch.tensor(layer_locs, dtype=torch.int64, device=device),
+                    (
+                        canonical_tensor
+                        if layer_locs_is_canonical
+                        else torch.tensor(layer_locs, dtype=torch.int64, device=device)
+                    ),
                     req_tensor=req_tensor,
                     pos_tensor=pos_tensor,
                 )
-            mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
-            for canonical, physical in zip(canonical_locs, layer_locs):
-                self._record_per_layer_mapping(layer_id, int(canonical), int(physical))
+            if (
+                not layer_locs_is_canonical
+                or int(layer_id) in self._per_layer_non_identity_mapping
+            ):
+                for canonical, physical in zip(canonical_locs, layer_locs):
+                    self._record_per_layer_mapping(layer_id, int(canonical), int(physical))
             group_start = 0
             while group_start < count:
                 group_pos = int(positions[group_start])
@@ -1215,9 +1300,7 @@ class LayerKVKvcResidencyMixin:
         self.stats.kvc_per_layer_logical_token_count += count
         self._per_layer_resident_token_count_fast += count * len(layer_ids)
         self._refresh_kvc_residency_stats()
-        return torch.tensor(
-            canonical_locs, dtype=torch.int64, device=self._allocator.device
-        )
+        return canonical_tensor
 
     def _reuse_invalid_per_layer_request_locs(
         self,
@@ -1290,18 +1373,25 @@ class LayerKVKvcResidencyMixin:
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
             return None
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
         try:
-            positions = [int(x) for x in seq_lens.detach().cpu().tolist()]
+            if seq_lens_cpu is not None:
+                values = (
+                    seq_lens_cpu.tolist()
+                    if isinstance(seq_lens_cpu, torch.Tensor)
+                    else seq_lens_cpu
+                )
+                positions = [int(x) for x in values]
+            else:
+                positions = [int(x) for x in seq_lens.detach().cpu().tolist()]
         except Exception:
             return None
         req_indices: List[int] = []
-        valid_reqs: List[Any] = []
         for req in reqs:
             req_idx = getattr(req, "req_pool_idx", None)
             if req_idx is None:
                 return None
             req_indices.append(int(req_idx))
-            valid_reqs.append(req)
         if not req_indices:
             return torch.empty((0,), dtype=torch.int64, device=self._allocator.device)
         if len(req_indices) != len(positions):
@@ -1312,80 +1402,141 @@ class LayerKVKvcResidencyMixin:
 
         count = len(req_indices)
         locs_by_layer = self._alloc_per_layer_overwrite_locs_by_layer(layer_ids, count)
+        canonical_locs_shared = False
         if locs_by_layer is not None:
-            canonical_locs = list(locs_by_layer[layer_ids[0]])
+            canonical_locs = locs_by_layer[layer_ids[0]]
             self.stats.kvc_per_layer_overwrite_reuse_count += 1
             self.stats.kvc_per_layer_overwrite_reuse_token_count += count
         else:
             canonical_locs = self._alloc_common_per_layer_locs(count)
             if canonical_locs is not None:
                 locs_by_layer = {
-                    layer_id: list(canonical_locs) for layer_id in layer_ids
+                    layer_id: canonical_locs for layer_id in layer_ids
                 }
+                canonical_locs_shared = True
             else:
                 locs_by_layer = {}
                 for layer_id in layer_ids:
-                    layer_locs = self._alloc_per_layer_locs(layer_id, count)
+                    layer_locs = self._alloc_per_layer_locs(
+                        layer_id, count, refresh_stats=False
+                    )
                     if layer_locs is None:
                         for rollback_layer, rollback_locs in locs_by_layer.items():
                             self._push_per_layer_overwrite_locs(
                                 rollback_layer, rollback_locs
                             )
+                        self._refresh_per_layer_allocator_stats()
                         return None
                     locs_by_layer[layer_id] = layer_locs
-                canonical_locs = list(locs_by_layer[layer_ids[0]])
+                self._refresh_per_layer_allocator_stats()
+                canonical_locs = locs_by_layer[layer_ids[0]]
                 self.stats.kvc_per_layer_independent_alloc_count += count
 
-        owned_by_req: Dict[int, List[Tuple[int, int, int]]] = {
-            int(req_idx): [] for req_idx in req_indices
-        }
+        owned_keys_by_req: List[List[Tuple[int, int, int]]] = [[] for _ in req_indices]
+        generations = [
+            self._per_layer_req_generation(req_idx) for req_idx in req_indices
+        ]
         device = self._allocator.device
-        req_tensor = torch.tensor(req_indices, dtype=torch.int64, device=device)
-        pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+        batch_req_tensor = getattr(batch, "req_pool_indices", None)
+        if (
+            isinstance(batch_req_tensor, torch.Tensor)
+            and int(batch_req_tensor.numel()) == count
+            and batch_req_tensor.device == device
+        ):
+            req_tensor = batch_req_tensor.to(dtype=torch.int64)
+        else:
+            req_tensor = torch.tensor(req_indices, dtype=torch.int64, device=device)
+        if (
+            isinstance(seq_lens, torch.Tensor)
+            and int(seq_lens.numel()) == count
+            and seq_lens.device == device
+        ):
+            pos_tensor = seq_lens.to(dtype=torch.int64)
+        else:
+            pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+        canonical_tensor = torch.tensor(
+            canonical_locs, dtype=torch.int64, device=device
+        )
+        sync_resident_groups = not (
+            self.config.kvc_backend == "per-layer-arena"
+            and self.config.runtime_profile == "optimized"
+        )
         for layer_id in layer_ids:
             layer_locs = locs_by_layer[layer_id]
+            layer_locs_is_canonical = (
+                canonical_locs_shared
+                or layer_locs is canonical_locs
+                or layer_locs == canonical_locs
+            )
             if (
-                layer_locs != canonical_locs
+                not layer_locs_is_canonical
                 or int(layer_id) in self._per_layer_req_to_token_owned
             ):
                 self._set_per_layer_token_slots(
                     layer_id,
                     req_indices,
                     positions,
-                    torch.tensor(layer_locs, dtype=torch.int64, device=device),
+                    (
+                        canonical_tensor
+                        if layer_locs_is_canonical
+                        else torch.tensor(layer_locs, dtype=torch.int64, device=device)
+                    ),
                     req_tensor=req_tensor,
                     pos_tensor=pos_tensor,
                 )
-            mapping = self._per_layer_canonical_to_physical.setdefault(layer_id, {})
-            for canonical, physical in zip(canonical_locs, layer_locs):
-                self._record_per_layer_mapping(layer_id, int(canonical), int(physical))
-            for req_idx, pos, physical in zip(req_indices, positions, layer_locs):
-                key = (int(layer_id), int(req_idx), int(pos))
-                entry = _LayerKVResidencyEntry(
-                    req_idx=int(req_idx),
-                    pos=int(pos),
-                    state="resident",
-                    layer_id=int(layer_id),
-                    device_loc=int(physical),
-                    device_locs=[int(physical)],
-                    page_size=1,
-                    last_access_step=self._decode_step,
-                    generation=self._per_layer_req_generation(int(req_idx)),
+            if (
+                not layer_locs_is_canonical
+                or int(layer_id) in self._per_layer_non_identity_mapping
+            ):
+                for canonical, physical in zip(canonical_locs, layer_locs):
+                    self._record_per_layer_mapping(layer_id, canonical, physical)
+            for req_offset, (req_idx, pos, physical) in enumerate(
+                zip(req_indices, positions, layer_locs)
+            ):
+                entry = self._append_per_layer_resident_tail(
+                    layer_id=layer_id,
+                    req_idx=req_idx,
+                    pos=pos,
+                    physical_loc=physical,
+                    generation=generations[req_offset],
                 )
-                self._per_layer_residency[key] = entry
-                self._index_per_layer_page_entry(entry)
-                self._sync_kvc_group_if_needed(entry)
-                owned_by_req[int(req_idx)].append(key)
-        for req, req_idx in zip(valid_reqs, req_indices):
+                if entry is None:
+                    key = (int(layer_id), int(req_idx), int(pos))
+                    entry = _LayerKVResidencyEntry(
+                        req_idx=int(req_idx),
+                        pos=int(pos),
+                        state="resident",
+                        layer_id=int(layer_id),
+                        device_loc=int(physical),
+                        device_locs=[int(physical)],
+                        page_size=1,
+                        last_access_step=self._decode_step,
+                        generation=generations[req_offset],
+                    )
+                    self._per_layer_residency[key] = entry
+                    self._index_per_layer_page_entry(entry)
+                    owned_keys_by_req[req_offset].append(key)
+                else:
+                    self._track_per_layer_cleanup_append(entry, physical)
+                if sync_resident_groups:
+                    self._sync_kvc_group(entry)
+        for req, req_idx, owned_keys in zip(reqs, req_indices, owned_keys_by_req):
             setattr(req, "layerkv_per_layer_allocated", True)
             setattr(req, "skip_radix_cache_insert", True)
-            self._mark_req_layerkv_owned(int(req_idx), owned_by_req[int(req_idx)])
+            self._mark_req_layerkv_owned(int(req_idx), owned_keys)
         self.stats.kvc_per_layer_logical_token_count += count
         self._per_layer_resident_token_count_fast += count * len(layer_ids)
-        self._refresh_kvc_residency_stats()
-        return torch.tensor(
-            canonical_locs, dtype=torch.int64, device=self._allocator.device
-        )
+        if self._coresid_optimized_policy_enabled():
+            resident = int(max(0, self._per_layer_resident_token_count_fast))
+            entry_count = self._per_layer_page_table_entry_count()
+            self.stats.kvc_resident_token_count = resident
+            self.stats.kvc_per_layer_arena_resident_token_count = resident
+            self.stats.kvc_resident_page_count = resident
+            self.stats.kvc_residency_entry_count = entry_count
+            self.stats.kvc_per_layer_arena_entry_count = entry_count
+        else:
+            self._refresh_kvc_residency_stats()
+        return canonical_tensor
 
     def can_satisfy_decode_allocation(
         self, required_tokens: int, *, for_prefill: bool = False
@@ -1418,13 +1569,18 @@ class LayerKVKvcResidencyMixin:
         )
         return int(available) >= required
 
-    def _rewrite_attention_metadata_for_layer(
-        self, layer_id: int, req_to_token: torch.Tensor
-    ) -> bool:
+    def _kvc_attention_backend(self):
+        """Resolve the full-attention backend without changing GDN metadata."""
         forward_batch = self._last_forward_batch
         attn_backend = getattr(forward_batch, "attn_backend", None) or getattr(
             self._runner, "attn_backend", None
         )
+        return getattr(attn_backend, "full_attn_backend", attn_backend)
+
+    def _rewrite_attention_metadata_for_layer(
+        self, layer_id: int, req_to_token: torch.Tensor
+    ) -> bool:
+        attn_backend = self._kvc_attention_backend()
         if attn_backend is None:
             return False
         metadata = getattr(attn_backend, "forward_metadata", None)
@@ -1460,14 +1616,17 @@ class LayerKVKvcResidencyMixin:
         bs = int(getattr(forward_batch, "batch_size", 0) or 0)
         if bs <= 0:
             return False
-        seq_lens = getattr(forward_batch, "seq_lens", None)
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
-        if seq_lens is None or req_pool_indices is None:
+        if req_pool_indices is None:
             return False
+        # Extend attention indexes only cached prefix KV (possibly zero),
+        # while decode indexes the whole sequence. Respect the backend's
+        # actual packed buffer layout instead of writing full seq_lens into it.
+        kv_lens = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,
-            seq_lens,
+            kv_lens,
             kv_indptr,
             None,
             kv_indices,
@@ -2254,6 +2413,11 @@ class LayerKVKvcResidencyMixin:
                 if per_layer_overwrite_bits:
                     with self._profile("profile_kvc_free_locs_ms"):
                         for layer_id, bits in per_layer_overwrite_bits.items():
+                            # Backup is complete: release arena ownership before
+                            # publishing these locations for overwrite reuse.
+                            self._per_layer_arena_allocated_locs.setdefault(
+                                int(layer_id), set()
+                            ).difference_update(self._bitset_to_locs(int(bits)))
                             self._push_per_layer_overwrite_bits(
                                 int(layer_id),
                                 int(bits),

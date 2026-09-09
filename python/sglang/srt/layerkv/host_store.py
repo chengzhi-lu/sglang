@@ -123,6 +123,14 @@ class _LayerKVHostKVStore:
         self.used_slots = set()
         self.layer_num = int(kv_pool.layer_num)
         self.start_layer = int(kv_pool.start_layer)
+        self.layer_ids = tuple(
+            getattr(
+                kv_pool,
+                "layer_ids",
+                range(self.start_layer, self.start_layer + self.layer_num),
+            )
+        )
+        self.layer_offsets = {layer_id: i for i, layer_id in enumerate(self.layer_ids)}
         self.device = kv_pool.device
 
         k0 = kv_pool._get_key_buffer(self.start_layer)
@@ -153,7 +161,7 @@ class _LayerKVHostKVStore:
             self.v_buffers = [None for _ in range(self.layer_num)]
             return
         for layer_offset in range(self.layer_num):
-            layer_id = self.start_layer + layer_offset
+            layer_id = self.layer_ids[layer_offset]
             k_ref = kv_pool._get_key_buffer(layer_id)
             v_ref = kv_pool._get_value_buffer(layer_id)
             self.k_buffers.append(
@@ -257,7 +265,7 @@ class _LayerKVHostKVStore:
             self.layer_free_slots[layer_offset]
         ):
             return
-        layer_id = self.start_layer + layer_offset
+        layer_id = self.layer_ids[layer_offset]
         k_ref = self.kv_pool._get_key_buffer(layer_id)
         v_ref = self.kv_pool._get_value_buffer(layer_id)
         old_capacity = self.layer_capacities[layer_offset]
@@ -290,7 +298,7 @@ class _LayerKVHostKVStore:
         need_by_layer: Dict[int, int] = {}
         entry_layers: List[int] = []
         for entry in entries:
-            layer_offset = int(entry.layer_id) - self.start_layer
+            layer_offset = self.layer_offsets.get(int(entry.layer_id), -1)
             if layer_offset < 0 or layer_offset >= self.layer_num:
                 return None
             entry_layers.append(layer_offset)
@@ -361,7 +369,7 @@ class _LayerKVHostKVStore:
             return
         if not slots:
             return
-        layer_offset = int(layer_id) - self.start_layer
+        layer_offset = self.layer_offsets.get(int(layer_id), -1)
         if layer_offset < 0 or layer_offset >= self.layer_num:
             return
         free = self.layer_free_slots[layer_offset]
@@ -449,7 +457,7 @@ class _LayerKVHostKVStore:
         end = device_module.Event(enable_timing=True)
         start.record()
         for layer_offset in range(self.layer_num):
-            layer_id = self.start_layer + layer_offset
+            layer_id = self.layer_ids[layer_offset]
             k_src = (
                 self.kv_pool._get_key_buffer(layer_id)[device_locs]
                 .detach()
@@ -481,7 +489,7 @@ class _LayerKVHostKVStore:
         with torch.cuda.stream(stream):
             start.record(stream)
             for layer_offset in range(self.layer_num):
-                layer_id = self.start_layer + layer_offset
+                layer_id = self.layer_ids[layer_offset]
                 k_src = self.kv_pool._get_key_buffer(layer_id)[device_locs].detach()
                 v_src = self.kv_pool._get_value_buffer(layer_id)[device_locs].detach()
                 k_dst = self._empty_cpu(tuple(k_src.shape), k_src.dtype)
@@ -526,7 +534,7 @@ class _LayerKVHostKVStore:
         by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
         offset = 0
         for entry in entries:
-            layer_offset = int(entry.layer_id) - self.start_layer
+            layer_offset = self.layer_offsets.get(int(entry.layer_id), -1)
             if layer_offset < 0 or layer_offset >= self.layer_num:
                 raise RuntimeError(f"invalid per-layer KVC layer_id={entry.layer_id}")
             count = entry.token_count
@@ -540,7 +548,7 @@ class _LayerKVHostKVStore:
         for layer_offset, (device_loc_list, host_slot_list) in by_layer.items():
             if not device_loc_list or not host_slot_list:
                 continue
-            layer_id = self.start_layer + layer_offset
+            layer_id = self.layer_ids[layer_offset]
             device_locs = torch.tensor(
                 device_loc_list, dtype=torch.int64, device=self.device
             )
@@ -595,7 +603,7 @@ class _LayerKVHostKVStore:
                 int(entry.token_count) == 1 for entry in entries
             ):
                 for entry, slot in zip(entries, host_slots):
-                    layer_offset = int(entry.layer_id) - self.start_layer
+                    layer_offset = self.layer_offsets.get(int(entry.layer_id), -1)
                     if layer_offset < 0 or layer_offset >= self.layer_num:
                         raise RuntimeError(
                             f"invalid per-layer KVC layer_id={entry.layer_id}"
@@ -610,7 +618,7 @@ class _LayerKVHostKVStore:
                     layer_host_slots.append(int(slot))
             else:
                 for entry in entries:
-                    layer_offset = int(entry.layer_id) - self.start_layer
+                    layer_offset = self.layer_offsets.get(int(entry.layer_id), -1)
                     if layer_offset < 0 or layer_offset >= self.layer_num:
                         raise RuntimeError(
                             f"invalid per-layer KVC layer_id={entry.layer_id}"
@@ -644,7 +652,7 @@ class _LayerKVHostKVStore:
                     if len(device_loc_list) != len(host_slot_list):
                         span_rows = []
                         break
-                    layer_id = self.start_layer + int(layer_offset)
+                    layer_id = self.layer_ids[int(layer_offset)]
                     batch_id = len(src_ks)
                     src_ks.append(self.kv_pool._get_key_buffer(layer_id))
                     src_vs.append(self.kv_pool._get_value_buffer(layer_id))
@@ -692,7 +700,7 @@ class _LayerKVHostKVStore:
             for layer_offset, (device_loc_list, host_slot_list) in by_layer.items():
                 if not device_loc_list or not host_slot_list:
                     continue
-                layer_id = self.start_layer + layer_offset
+                layer_id = self.layer_ids[layer_offset]
                 device_locs = torch.tensor(
                     device_loc_list, dtype=torch.int64, device=self.device
                 )
@@ -757,7 +765,7 @@ class _LayerKVHostKVStore:
             requests
         ):
             layer_id = int(layer_id)
-            layer_offset = layer_id - self.start_layer
+            layer_offset = self.layer_offsets.get(layer_id, -1)
             if layer_offset < 0 or layer_offset >= self.layer_num:
                 return None, None, 0
             if int(device_slice[0]) < 0 or int(device_slice[1]) <= 0:
@@ -900,7 +908,7 @@ class _LayerKVHostKVStore:
             else:
                 start.record()
             for layer_offset in range(self.layer_num):
-                layer_id = self.start_layer + layer_offset
+                layer_id = self.layer_ids[layer_offset]
                 k_src = (
                     self.k_buffers[layer_offset]
                     .index_select(0, host_index)
@@ -951,7 +959,7 @@ class _LayerKVHostKVStore:
                 start.record()
             by_layer: Dict[int, Tuple[List[int], List[int]]] = {}
             for entry in entries:
-                layer_offset = int(entry.layer_id) - self.start_layer
+                layer_offset = self.layer_offsets.get(int(entry.layer_id), -1)
                 if layer_offset < 0 or layer_offset >= self.layer_num:
                     raise RuntimeError(
                         f"invalid per-layer KVC layer_id={entry.layer_id}"
@@ -968,7 +976,7 @@ class _LayerKVHostKVStore:
             for layer_offset, (host_slot_list, device_loc_list) in by_layer.items():
                 if not host_slot_list or not device_loc_list:
                     continue
-                layer_id = self.start_layer + layer_offset
+                layer_id = self.layer_ids[layer_offset]
                 host_index = torch.tensor(
                     host_slot_list, dtype=torch.int64, device="cpu"
                 )
@@ -1020,7 +1028,7 @@ class _LayerKVHostKVStore:
         if not entries or int(device_locs.numel()) == 0:
             return 0.0, None, None
         prepare_t0 = time.perf_counter()
-        layer_offset = int(layer_id) - self.start_layer
+        layer_offset = self.layer_offsets.get(int(layer_id), -1)
         if layer_offset < 0 or layer_offset >= self.layer_num:
             raise RuntimeError(f"invalid virtual KVC layer_id={layer_id}")
         host_slice_obj: Optional[slice] = None

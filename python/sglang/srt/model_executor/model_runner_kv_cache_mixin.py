@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +11,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_nsa,
     is_deepseek_v4,
 )
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -59,6 +61,15 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
+    def _mamba_cache_params_for_runtime(self, config):
+        params = config.mamba2_cache_params
+        if isinstance(config, Qwen3NextConfig):
+            # Qwen GDN convolution requires state and activation dtypes to
+            # agree. --dtype controls activations, not the checkpoint's dtype.
+            # Keep the independently configured SSM accumulation precision.
+            params = replace(params, dtype=replace(params.dtype, conv=self.dtype))
+        return params
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -89,7 +100,7 @@ class ModelRunnerKVCacheMixin:
                 self.dp_size if server_args.enable_dp_attention else 1
             )
             mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
+                self._mamba_cache_params_for_runtime(config).mamba_cache_per_req
                 * max_running_requests
                 * server_args.speculative_num_draft_tokens
             )
@@ -112,7 +123,7 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            assert self._mamba_cache_params_for_runtime(config).mamba_cache_per_req > 0
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
@@ -126,12 +137,12 @@ class ModelRunnerKVCacheMixin:
             # calculate the max_mamba_cache_size based on the given total mamba memory
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+                // self._mamba_cache_params_for_runtime(config).mamba_cache_per_req
             )
 
         mamba_state_memory = (
             server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * self._mamba_cache_params_for_runtime(config).mamba_cache_per_req
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
@@ -237,6 +248,15 @@ class ModelRunnerKVCacheMixin:
 
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
+        if (
+            getattr(self.server_args, "layerkv_shared_expert_all_layers", False)
+            or self.server_args.layerkv_shared_expert_layer >= 0
+        ) and (
+            not self.mambaish_config or self.page_size != 1 or self.device != "cuda"
+        ):
+            raise ValueError(
+                "LayerKV shared VMM currently requires CUDA hybrid MHA with page_size=1"
+            )
         max_num_reqs = self.max_running_requests
 
         # Initialize req_to_token_pool
@@ -266,7 +286,7 @@ class ModelRunnerKVCacheMixin:
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
+                        cache_params=self._mamba_cache_params_for_runtime(config),
                         mamba_layer_ids=(
                             [
                                 i
@@ -299,7 +319,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
+                    cache_params=self._mamba_cache_params_for_runtime(config),
                     mamba_layer_ids=(
                         [
                             i
@@ -581,6 +601,34 @@ class ModelRunnerKVCacheMixin:
                 )
             elif config := self.mambaish_config:
                 extra_args = {}
+                kv_pool_size = self.max_total_num_tokens
+                if (
+                    getattr(self.server_args, "layerkv_shared_expert_all_layers", False)
+                    or self.server_args.layerkv_shared_expert_layer >= 0
+                ):
+                    if self.use_mla_backend or self.kv_cache_dtype not in (
+                        torch.float16,
+                        torch.bfloat16,
+                    ):
+                        raise ValueError(
+                            "LayerKV shared VMM requires FP16/BF16 hybrid MHA KV"
+                        )
+                    from sglang.srt.layerkv.shared_vmm import SharedVMM
+
+                    overflow_tokens = int(
+                        getattr(
+                            self.server_args,
+                            "layerkv_shared_expert_kv_overflow_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                    kv_pool_size += overflow_tokens
+                    self.layerkv_shared_vmm = SharedVMM(
+                        self.device,
+                        initial_kv_tokens=self.max_total_num_tokens,
+                    )
+                    extra_args["buffer_factory"] = self.layerkv_shared_vmm.kv_zeros
                 if self.use_mla_backend:
                     extra_args = {
                         "kv_lora_rank": self.model_config.kv_lora_rank,
@@ -588,7 +636,7 @@ class ModelRunnerKVCacheMixin:
                     }
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
-                    size=self.max_total_num_tokens,
+                    size=kv_pool_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
